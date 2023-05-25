@@ -24,9 +24,11 @@ in our plugin:
 | 3.2.1 CDH       | com.nvidia.spark.rapids.spark321cdh.RapidsShuffleManager |
 | 3.2.2           | com.nvidia.spark.rapids.spark322.RapidsShuffleManager    |
 | 3.2.3           | com.nvidia.spark.rapids.spark323.RapidsShuffleManager    |
+| 3.2.4           | com.nvidia.spark.rapids.spark324.RapidsShuffleManager    |
 | 3.3.0           | com.nvidia.spark.rapids.spark330.RapidsShuffleManager    |
 | 3.3.1           | com.nvidia.spark.rapids.spark331.RapidsShuffleManager    |
 | 3.3.2           | com.nvidia.spark.rapids.spark332.RapidsShuffleManager    |
+| 3.4.0           | com.nvidia.spark.rapids.spark340.RapidsShuffleManager    |
 | Databricks 10.4 | com.nvidia.spark.rapids.spark321db.RapidsShuffleManager  |
 | Databricks 11.3 | com.nvidia.spark.rapids.spark330db.RapidsShuffleManager  |
 

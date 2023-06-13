@@ -1990,7 +1990,7 @@ object RapidsConf {
       // scalastyle:off line.size.limit
       println("""
         |For more advanced configs, please refer to the [RAPIDS Accelerator for Apache Spark Advanced 
-        |Configuration](https://nvidia.github.io/spark-rapids/docs/additional-functionality/advanced_configs.html) page.
+        |Configuration](additional-functionality/advanced_configs.md) page.
         |""".stripMargin)
       // scalastyle:on line.size.limit
     }

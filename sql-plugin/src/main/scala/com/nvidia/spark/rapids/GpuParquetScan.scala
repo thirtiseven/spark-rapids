@@ -2660,11 +2660,15 @@ case class ParquetTableReader(
 
   override def hasNext: Boolean = reader.hasNext
 
+  val testExec = Executors.newSingleThreadExecutor()
+
   override def next: Table = {
     val table = withResource(new NvtxWithMetrics("Parquet decode", NvtxColor.DARK_GREEN,
       metrics(GPU_DECODE_TIME))) { _ =>
       try {
-        reader.readChunk()
+        testExec.submit(() => {
+          reader.readChunk()
+        }).get(10000, TimeUnit.MILLISECONDS)
       } catch {
         case e: Exception =>
           val dumpMsg = debugDumpPrefix.map { prefix =>

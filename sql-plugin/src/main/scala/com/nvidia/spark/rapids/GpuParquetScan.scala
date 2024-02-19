@@ -24,12 +24,10 @@ import java.nio.charset.StandardCharsets
 import java.util
 import java.util.{Collections, Locale}
 import java.util.concurrent._
-
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 import scala.language.implicitConversions
-
 import ai.rapids.cudf._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.GpuMetric._
@@ -54,7 +52,6 @@ import org.apache.parquet.hadoop.metadata._
 import org.apache.parquet.io.{InputFile, SeekableInputStream}
 import org.apache.parquet.schema.{DecimalMetadata, GroupType, MessageType, OriginalType, PrimitiveType, Type}
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
-
 import org.apache.spark.TaskContext
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
@@ -2660,15 +2657,11 @@ case class ParquetTableReader(
 
   override def hasNext: Boolean = reader.hasNext
 
-  val testExec = Executors.newSingleThreadExecutor()
-
   override def next: Table = {
     val table = withResource(new NvtxWithMetrics("Parquet decode", NvtxColor.DARK_GREEN,
       metrics(GPU_DECODE_TIME))) { _ =>
       try {
-        testExec.submit(() => {
-          reader.readChunk()
-        }).get(10000, TimeUnit.MILLISECONDS)
+        reader.readChunk()
       } catch {
         case e: Exception =>
           val dumpMsg = debugDumpPrefix.map { prefix =>

@@ -338,6 +338,12 @@ object RapidsConf {
     .bytesConf(ByteUnit.BYTE)
     .createWithDefault(0)
 
+  val PINNED_POOL_SET_CUIO_DEFAULT = conf("spark.rapids.memory.pinnedPool.cuio.default")
+    .startupOnly()
+    .commonlyUsed()
+    .booleanConf
+    .createWithDefault(true)
+
   val OFF_HEAP_LIMIT_ENABLED = conf("spark.rapids.memory.host.offHeapLimit.enabled")
       .doc("Should the off heap limit be enforced or not.")
       .startupOnly()
@@ -2345,6 +2351,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val includeImprovedFloat: Boolean = get(IMPROVED_FLOAT_OPS)
 
   lazy val pinnedPoolSize: Long = get(PINNED_POOL_SIZE)
+
+  lazy val pinnedPoolCuioDefault: Long = get(PINNED_POOL_SET_CUIO_DEFAULT)
 
   lazy val offHeapLimitEnabled: Boolean = get(OFF_HEAP_LIMIT_ENABLED)
 

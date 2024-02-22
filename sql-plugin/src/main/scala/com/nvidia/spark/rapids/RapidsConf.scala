@@ -2352,7 +2352,7 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val pinnedPoolSize: Long = get(PINNED_POOL_SIZE)
 
-  lazy val pinnedPoolCuioDefault: Long = get(PINNED_POOL_SET_CUIO_DEFAULT)
+  lazy val pinnedPoolCuioDefault: Boolean = get(PINNED_POOL_SET_CUIO_DEFAULT)
 
   lazy val offHeapLimitEnabled: Boolean = get(OFF_HEAP_LIMIT_ENABLED)
 

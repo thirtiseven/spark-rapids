@@ -448,7 +448,7 @@ object GpuDeviceManager extends Logging {
     }
     if (!PinnedMemoryPool.isInitialized && pinnedSize > 0) {
       logInfo(s"Initializing pinned memory pool (${pinnedSize / 1024 / 1024.0} MiB)")
-      PinnedMemoryPool.initialize(pinnedSize, gpuId)
+      PinnedMemoryPool.initialize(pinnedSize, gpuId, /*setCuioDefaultResource*/ true)
     }
     // Host memory limits must be set after the pinned memory pool is initialized
     HostAlloc.initialize(nonPinnedLimit)

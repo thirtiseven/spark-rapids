@@ -22,7 +22,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 
-import ai.rapids.cudf.{HostColumnVector, HostMemoryBuffer, NvtxColor, PinnedMemoryPool, Table}
+import ai.rapids.cudf.{HostColumnVector, HostMemoryBuffer, NvtxColor, Table}
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.withResource
 import org.apache.hadoop.conf.Configuration
@@ -240,9 +240,9 @@ class VectorizedParquetGpuProducer(
       }
 
       val batchRows = hostCVs.head.getRowCount
-      logInfo(s"VectorizedParquetGpuProducer batches $batchRows rows; " +
-        s"PinnedPoolSize:${PinnedMemoryPool.getTotalPoolSizeBytes};" +
-        s" remain:${PinnedMemoryPool.getAvailableBytes}")
+//      logInfo(s"VectorizedParquetGpuProducer batches $batchRows rows; " +
+//        s"PinnedPoolSize:${PinnedMemoryPool.getTotalPoolSizeBytes};" +
+//        s" remain:${PinnedMemoryPool.getAvailableBytes}")
       metrics.get("cpuDecodeRows").foreach(_.+=(batchRows))
       metrics.get("cpuDecodeBatches").foreach(_.+=(1))
       metrics.get("numOutputBatches").foreach(_.+=(1))

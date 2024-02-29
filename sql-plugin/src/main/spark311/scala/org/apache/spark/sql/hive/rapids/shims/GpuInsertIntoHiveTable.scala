@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,6 @@
 {"spark": "320"}
 {"spark": "321"}
 {"spark": "321cdh"}
-{"spark": "321db"}
 {"spark": "322"}
 {"spark": "323"}
 {"spark": "324"}
@@ -58,7 +57,7 @@ import org.apache.spark.sql.hive.HiveShim.{ShimFileSinkDesc => FileSinkDesc}
 import org.apache.spark.sql.hive.client.HiveClientImpl
 import org.apache.spark.sql.hive.client.hive._
 import org.apache.spark.sql.hive.execution.InsertIntoHiveTable
-import org.apache.spark.sql.hive.rapids.{GpuHiveTextFileFormat, GpuSaveAsHiveFile, RapidsHiveErrors}
+import org.apache.spark.sql.hive.rapids.{GpuHiveFileFormat, GpuSaveAsHiveFile, RapidsHiveErrors}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 final class GpuInsertIntoHiveTableMeta(cmd: InsertIntoHiveTable,
@@ -70,16 +69,17 @@ final class GpuInsertIntoHiveTableMeta(cmd: InsertIntoHiveTable,
   private var fileFormat: Option[ColumnarFileFormat] = None
 
   override def tagSelfForGpuInternal(): Unit = {
-    // Only Hive delimited text writes are currently supported.
-    // Check whether that is the format currently in play.
-    fileFormat = GpuHiveTextFileFormat.tagGpuSupport(this)
+    fileFormat = GpuHiveFileFormat.tagGpuSupport(this)
   }
 
   override def convertToGpu(): GpuDataWritingCommand = {
+    val format = fileFormat.getOrElse(
+      throw new IllegalStateException("fileFormat missing, tagSelfForGpu not called?"))
+
     GpuInsertIntoHiveTable(
       table = wrapped.table,
       partition = wrapped.partition,
-      fileFormat = this.fileFormat.get,
+      fileFormat = format,
       query = wrapped.query,
       overwrite = wrapped.overwrite,
       ifPartitionNotExists = wrapped.ifPartitionNotExists,

@@ -235,7 +235,10 @@ class HostParquetProducer(
     withResource(hostBatches.dequeue()) { hostCVs =>
       if (firstBatch) {
         // About to start using the GPU
-        GpuSemaphore.acquireIfNecessary(TaskContext.get())
+        withResource(new NvtxWithMetrics(
+          "hybridWaitGpuTime", NvtxColor.WHITE, metrics("hybridWaitGpuTime"))) { _ =>
+          GpuSemaphore.acquireIfNecessary(TaskContext.get())
+        }
         firstBatch = false
       }
 

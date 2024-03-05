@@ -1988,16 +1988,20 @@ class MultiFileParquetPartitionReader(
         true
       } else {
         var ret: Option[Boolean] = None
-        while (ret.isEmpty) {
-          GpuSemaphore.tryAcquire(TaskContext.get()) match {
-            case SemaphoreAcquired =>
-              ret = Option(false)
-            case AcquireFailed(_) =>
-              if (HostParquetProducer.acquireSlot(hybridOpts.hostCurrentBound)) {
-                ret = Option(true)
-              }
+        withResource(new NvtxWithMetrics(
+          "hybridPollTime", NvtxColor.WHITE, metrics("hybridPollTime"))) { _ =>
+
+          while (ret.isEmpty) {
+            GpuSemaphore.tryAcquire(TaskContext.get()) match {
+              case SemaphoreAcquired =>
+                ret = Option(false)
+              case AcquireFailed(_) =>
+                if (HostParquetProducer.acquireSlot(hybridOpts.hostCurrentBound)) {
+                  ret = Option(true)
+                }
+            }
+            if (ret.isEmpty) Thread.sleep(hybridOpts.pollInterval)
           }
-          if (ret.isEmpty) Thread.sleep(hybridOpts.pollInterval)
         }
         ret.get
       }
@@ -2593,16 +2597,20 @@ class MultiFileCloudParquetPartitionReader(
         true
       } else {
         var ret: Option[Boolean] = None
-        while (ret.isEmpty) {
-          GpuSemaphore.tryAcquire(TaskContext.get()) match {
-            case SemaphoreAcquired =>
-              ret = Option(false)
-            case AcquireFailed(_) =>
-              if (HostParquetProducer.acquireSlot(hybridOpts.hostCurrentBound)) {
-                ret = Option(true)
-              }
+        withResource(new NvtxWithMetrics(
+          "hybridPollTime", NvtxColor.WHITE, metrics("hybridPollTime"))) { _ =>
+
+          while (ret.isEmpty) {
+            GpuSemaphore.tryAcquire(TaskContext.get()) match {
+              case SemaphoreAcquired =>
+                ret = Option(false)
+              case AcquireFailed(_) =>
+                if (HostParquetProducer.acquireSlot(hybridOpts.hostCurrentBound)) {
+                  ret = Option(true)
+                }
+            }
+            if (ret.isEmpty) Thread.sleep(hybridOpts.pollInterval)
           }
-          if (ret.isEmpty) Thread.sleep(hybridOpts.pollInterval)
         }
         ret.get
       }

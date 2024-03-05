@@ -463,7 +463,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		rowGroupIndex++;
 		rowId += rowGroupOffset;
 
-		int result = arrayData().appendBytes(length, value, offset) + rowGroupStringOffset;
+		int result = childColumns[0].appendBytes(length, value, offset) + rowGroupStringOffset;
 
 		for (int i = lastCharRowId + 1; i < rowId; ++i) {
 			charOffsets.setInt((i + 1) * 4L, result);
@@ -472,6 +472,18 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		lastCharRowId = rowId;
 
 		return result;
+	}
+
+	public void commitStringAppend(int rowId, int prevOffset, int curLength) {
+		rowGroupIndex++;
+		rowId += rowGroupOffset;
+		prevOffset += rowGroupStringOffset;
+
+		for (int i = lastCharRowId + 1; i < rowId; ++i) {
+			charOffsets.setInt((i + 1) * 4L, prevOffset);
+		}
+		charOffsets.setInt((rowId + 1) * 4L, prevOffset + curLength);
+		lastCharRowId = rowId;
 	}
 
 	@Override

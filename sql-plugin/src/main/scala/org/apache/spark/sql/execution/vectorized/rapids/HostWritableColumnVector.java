@@ -50,14 +50,12 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		resetAllBuffers(capacity, false);
 	}
 
-	public HostColumnVector build() {
+	public HostColumnVector build(long[] sizeCounter) {
 		assert rowGroupIndex == 0 && rowGroupArrayIndex == 0;
-
-		return (HostColumnVector) buildImpl(true,
-				new Random().nextInt(Integer.MAX_VALUE - 1));
+		return (HostColumnVector) buildImpl(true, sizeCounter);
 	}
 
-	private HostColumnVectorCore buildImpl(boolean topLevel, int rdSeed) {
+	private HostColumnVectorCore buildImpl(boolean topLevel, long[] sizeCounter) {
 		// Make sure all subVectors are fully "flushed" before the materialization.
 		assert rowGroupIndex == 0 && rowGroupArrayIndex == 0;
 
@@ -74,6 +72,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		if (type instanceof MapType || type instanceof ArrayType) {
 			offsetBuffer = arrayOffsets;
 			arrayOffsets = null;
+			sizeCounter[0] += offsetBuffer.getLength();
 		} else if (type instanceof StringType) {
 			// padding tail offsets
 			if (lastCharRowId + 1 < rowGroupOffset) {
@@ -85,11 +84,14 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			charOffsets = null;
 			dataBuffer = ((HostWritableColumnVector)childColumns[0]).data;
 			((HostWritableColumnVector)childColumns[0]).data = null;
+			sizeCounter[0] += offsetBuffer.getLength();
+			sizeCounter[0] += dataBuffer.getLength();
 		} else if (type instanceof StructType) {
 
 		} else {
 			dataBuffer = data;
 			data = null;
+			sizeCounter[0] += dataBuffer.getLength();
 		}
 
 		// Build bitwise validity mask
@@ -97,13 +99,14 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			validBuffer = buildNullMask(valids, rowGroupOffset);
 			 valids.close();
 			 valids = null;
+			sizeCounter[0] += validBuffer.getLength();
 		}
 
 		// Build child columns of "real" nested types recursively (StringType is NOT even it contains childColumns)
 		List<HostColumnVectorCore> children = new ArrayList<>();
 		if (childColumns != null && !(type instanceof StringType)) {
 			for (WritableColumnVector ch : childColumns) {
-				children.add(((HostWritableColumnVector) ch).buildImpl(false, rdSeed));
+				children.add(((HostWritableColumnVector) ch).buildImpl(false, sizeCounter));
 			}
 		}
 

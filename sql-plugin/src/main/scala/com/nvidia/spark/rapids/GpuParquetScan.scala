@@ -24,12 +24,10 @@ import java.nio.charset.StandardCharsets
 import java.util
 import java.util.{Collections, Locale}
 import java.util.concurrent._
-
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 import scala.language.implicitConversions
-
 import ai.rapids.cudf._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.GpuMetric._
@@ -54,7 +52,6 @@ import org.apache.parquet.hadoop.metadata._
 import org.apache.parquet.io.{InputFile, SeekableInputStream}
 import org.apache.parquet.schema.{DecimalMetadata, GroupType, MessageType, OriginalType, PrimitiveType, Type}
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
-
 import org.apache.spark.TaskContext
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
@@ -65,7 +62,7 @@ import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, PartitionReaderFactory}
 import org.apache.spark.sql.execution.QueryExecutionException
 import org.apache.spark.sql.execution.datasources.{DataSourceUtils, PartitionedFile, PartitioningAwareFileIndex, SchemaColumnConvertNotSupportedException}
-import org.apache.spark.sql.execution.datasources.parquet.rapids.{DeviceOnly, HostOnly, HostParquetProducer}
+import org.apache.spark.sql.execution.datasources.parquet.rapids.{DeviceOnly, HostOnly, HostParquetProducer, HybridParquetOpts}
 import org.apache.spark.sql.execution.datasources.v2.FileScan
 import org.apache.spark.sql.execution.datasources.v2.parquet.ParquetScan
 import org.apache.spark.sql.internal.SQLConf
@@ -1890,6 +1887,12 @@ class MultiFileParquetPartitionReader(
     numThreads, execMetrics)
   with ParquetPartitionReaderBase {
 
+  private val hybridOpts: HybridParquetOpts = {
+    val opts = HostParquetProducer.parseHybridParquetOpts(readOnHostOpts)
+    HostParquetProducer.initialize(opts)
+    opts
+  }
+
   // Some implicits to convert the base class to the sub-class and vice versa
   implicit def toMessageType(schema: SchemaBase): MessageType =
     schema.asInstanceOf[ParquetSchemaWrapper].schema
@@ -1979,7 +1982,6 @@ class MultiFileParquetPartitionReader(
       clippedSchema: SchemaBase, readDataSchema: StructType,
       extraInfo: ExtraInfo): GpuDataProducer[Table] = {
 
-    val hybridOpts = HostParquetProducer.parseHybridParquetOpts(readOnHostOpts)
     val canReadOnHost = hybridOpts.mode != DeviceOnly &&
       HostParquetProducer.schemaSupportCheck(readDataSchema.fields.map(_.dataType))
 
@@ -1996,7 +1998,7 @@ class MultiFileParquetPartitionReader(
               case SemaphoreAcquired =>
                 ret = Option(false)
               case AcquireFailed(_) =>
-                if (HostParquetProducer.acquireSlot(hybridOpts.hostCurrentBound)) {
+                if (HostParquetProducer.acquireCpuSlot()) {
                   ret = Option(true)
                 }
             }
@@ -2014,7 +2016,8 @@ class MultiFileParquetPartitionReader(
       new HostParquetProducer(conf, currentTargetBatchSize.toInt,
         dataBuffer, 0, dataSize, metrics,
         extraInfo.dateRebaseMode, extraInfo.timestampRebaseMode, extraInfo.hasInt96Timestamps,
-        clippedSchema, readDataSchema)
+        clippedSchema, readDataSchema,
+        hybridOpts.maxDevicePreloadBytes > 0L)
     } else {
       val parseOpts = getParquetOptions(readDataSchema, clippedSchema, useFieldId)
 
@@ -2122,6 +2125,12 @@ class MultiFileCloudParquetPartitionReader(
     execMetrics, maxReadBatchSizeRows, maxReadBatchSizeBytes, ignoreCorruptFiles,
     alluxioPathReplacementMap, alluxioReplacementTaskTime, keepReadsInOrder, combineConf)
   with ParquetPartitionReaderBase {
+
+  private val hybridOpts: HybridParquetOpts = {
+    val opts = HostParquetProducer.parseHybridParquetOpts(readOnHostOpts)
+    HostParquetProducer.initialize(opts)
+    opts
+  }
 
   def checkIfNeedToSplit(current: HostMemoryBuffersWithMetaData,
       next: HostMemoryBuffersWithMetaData): Boolean = {
@@ -2560,7 +2569,7 @@ class MultiFileCloudParquetPartitionReader(
       val batchIter = readBufferToBatches(buffer.dateRebaseMode,
         buffer.timestampRebaseMode, buffer.hasInt96Timestamps, buffer.clippedSchema,
         buffer.readSchema, buffer.partitionedFile, hmbAndInfo.hmb, hmbAndInfo.bytes,
-        buffer.allPartValues, readOnHostOpts)
+        buffer.allPartValues)
       if (memBuffersAndSize.length > 1) {
         val updatedBuffers = memBuffersAndSize.drop(1)
         currentFileHostBuffers = Some(buffer.copy(memBuffersAndSizes = updatedBuffers))
@@ -2580,15 +2589,13 @@ class MultiFileCloudParquetPartitionReader(
       partedFile: PartitionedFile,
       hostBuffer: HostMemoryBuffer,
       dataSize: Long,
-      allPartValues: Option[Array[(Long, InternalRow)]],
-      readOnHostOpts: String): Iterator[ColumnarBatch] = {
+      allPartValues: Option[Array[(Long, InternalRow)]]): Iterator[ColumnarBatch] = {
 
     val parseOpts = closeOnExcept(hostBuffer) { _ =>
       getParquetOptions(readDataSchema, clippedSchema, useFieldId)
     }
     val colTypes = readDataSchema.fields.map(f => f.dataType)
 
-    val hybridOpts = HostParquetProducer.parseHybridParquetOpts(readOnHostOpts)
     val canReadOnHost = hybridOpts.mode != DeviceOnly &&
       HostParquetProducer.schemaSupportCheck(readDataSchema.fields.map(_.dataType))
 
@@ -2605,7 +2612,7 @@ class MultiFileCloudParquetPartitionReader(
               case SemaphoreAcquired =>
                 ret = Option(false)
               case AcquireFailed(_) =>
-                if (HostParquetProducer.acquireSlot(hybridOpts.hostCurrentBound)) {
+                if (HostParquetProducer.acquireCpuSlot()) {
                   ret = Option(true)
                 }
             }
@@ -2628,7 +2635,8 @@ class MultiFileCloudParquetPartitionReader(
         new HostParquetProducer(conf, targetBatchSizeBytes.toInt,
           hostBuffer, 0, dataSize, metrics,
           dateRebaseMode, timestampRebaseMode, hasInt96Timestamps,
-          clippedSchema, readDataSchema)
+          clippedSchema, readDataSchema,
+          hybridOpts.maxDevicePreloadBytes > 0)
       } else {
         MakeParquetTableProducer(useChunkedReader, subPageChunked,
           conf, targetBatchSizeBytes,

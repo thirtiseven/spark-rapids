@@ -17,7 +17,7 @@
 package org.apache.spark.sql.execution.datasources.parquet.rapids
 
 import java.util.TimeZone
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -34,6 +34,7 @@ import org.apache.parquet.schema.MessageType
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.execution.datasources.parquet.rapids.HostParquetProducer.acquireH2DSlot
 import org.apache.spark.sql.execution.vectorized.rapids.HostWritableColumnVector
 import org.apache.spark.sql.types.{ArrayType, BinaryType, DataType, DecimalType, MapType, StructType}
 
@@ -49,13 +50,18 @@ class HostParquetProducer(
     timestampRebaseMode: DateTimeRebaseMode,
     hasInt96Timestamps: Boolean,
     clippedSchema: MessageType,
-    readDataSchema: StructType) extends GpuDataProducer[Table] with Logging {
+    readDataSchema: StructType,
+    enableH2DSoftBarrier: Boolean) extends GpuDataProducer[Table] with Logging {
 
   logDebug(s"ColumnDescriptors ${clippedSchema.getColumns.asScala.mkString(" | ")}")
   logDebug(s"ColumnFieldTypes ${clippedSchema.asGroupType().getFields.asScala.mkString(" | ")}")
   logDebug(s"ReadDataSchema ${readDataSchema.sql}")
 
   private var readerClosed = false
+
+  private val sizeCounter: Array[Long] = Array.fill(1)(0L)
+
+  private var useH2DSoftBarrier: Boolean = _
 
   private val pageReader: ParquetFileReader = {
     val options = HadoopReadOptions.builder(conf)
@@ -189,7 +195,7 @@ class HostParquetProducer(
         if (remainBatchRows == 0) {
           metrics("hostVecBuildTime").ns {
             // materialize current batch in the memory layout of cuDF column vector
-            buffer.enqueue(hostColumnBuilders.map(_.build()))
+            buffer.enqueue(hostColumnBuilders.map(_.build(sizeCounter)))
             // update batch size and remaining
             remainBatchRows = rowBatchSize min remainTotalRows
             // Reset all the HostColumnBuffers for the upcoming batch
@@ -209,7 +215,7 @@ class HostParquetProducer(
     readerClosed = true
 
     // release host resource slot if allocated
-    HostParquetProducer.hostResourceSemaphore.foreach(_.getAndIncrement())
+    HostParquetProducer.releaseCpuSlot()
 
     buffer
   }
@@ -223,6 +229,8 @@ class HostParquetProducer(
           metrics("cpuDecodeTime"))) { _ =>
           hostBatches
         }
+        logInfo(
+          s"HostParqetProducer decoded ${sizeCounter.head} bytes(in ${hostBatches.size} batches)")
       } catch {
         case _: Throwable =>
           hostBatches.foreach(batch => batch.foreach(_.close()))
@@ -234,10 +242,14 @@ class HostParquetProducer(
   override def next: Table = {
     withResource(hostBatches.dequeue()) { hostCVs =>
       if (firstBatch) {
-        // About to start using the GPU
         withResource(new NvtxWithMetrics(
-          "hybridWaitGpuTime", NvtxColor.WHITE, metrics("hybridWaitGpuTime"))) { _ =>
-          GpuSemaphore.acquireIfNecessary(TaskContext.get())
+          "waitForH2DTime", NvtxColor.WHITE, metrics("waitForH2DTime"))) { _ =>
+          useH2DSoftBarrier = enableH2DSoftBarrier && acquireH2DSlot(sizeCounter.head)
+          if (!useH2DSoftBarrier) {
+            GpuSemaphore.acquireIfNecessary(TaskContext.get())
+          } else {
+            metrics("preloadH2DBatches") += hostBatches.size + 1
+          }
         }
         firstBatch = false
       }
@@ -267,6 +279,10 @@ class HostParquetProducer(
       pageReader.close()
       fileBuffer.close()
     }
+    if (useH2DSoftBarrier) {
+      GpuSemaphore.acquireIfNecessary(TaskContext.get())
+      HostParquetProducer.releaseH2DSlot(sizeCounter.head)
+    }
   }
 }
 
@@ -275,14 +291,17 @@ object HostParquetProducer {
   def parseHybridParquetOpts(str: String): HybridParquetOpts = {
     str match {
       case "" =>
-        HybridParquetOpts(DeviceOnly, 0, 0)
+        HybridParquetOpts(DeviceOnly, 0, 0, 0L)
       case "GPU_ONLY" =>
-        HybridParquetOpts(DeviceOnly, 0, 0)
+        HybridParquetOpts(DeviceOnly, 0, 0, 0L)
       case "CPU_ONLY" =>
-        HybridParquetOpts(HostOnly, 0, 0)
+        HybridParquetOpts(HostOnly, 0, 0, 0L)
       case s if s.startsWith("DeviceFirst(") && s.endsWith(")") =>
-        val args = s.slice(12, str.length -1).split(",").map(_.toInt)
-        HybridParquetOpts(DeviceFirst, args(0), args(1))
+        val args = s.slice(12, str.length -1).split(",")
+        val maxHostThreads = args(0).toInt
+        val pollInterval = args(1).toInt
+        val maxDevicePreloadBytes = if (args.length > 1) args(2).toLong else 0L
+        HybridParquetOpts(DeviceFirst, maxHostThreads, pollInterval, maxDevicePreloadBytes)
       case _ =>
         throw new IllegalArgumentException(s"illegal HybridParquetOpts $str")
     }
@@ -304,22 +323,44 @@ object HostParquetProducer {
     }.getOrElse(true)
   }
 
-  private var hostResourceSemaphore: Option[AtomicInteger] = None
-
-  def acquireSlot(totalSize: Int): Boolean = {
-    if (hostResourceSemaphore.isEmpty) {
-      synchronized {
-        if (hostResourceSemaphore.isEmpty) {
-          hostResourceSemaphore = Some(new AtomicInteger(totalSize))
-        }
+  def initialize(opts: HybridParquetOpts): Unit = {
+    if (!initialized.get()) synchronized {
+      if (!initialized.get()) {
+        hostResourceSemaphore = Some(new AtomicInteger(opts.maxHostThreads))
+        devicePreloadTracker = new AtomicLong(opts.maxDevicePreloadBytes)
+        initialized.set(true)
       }
     }
+  }
+
+  private var hostResourceSemaphore: Option[AtomicInteger] = None
+  private var devicePreloadTracker: AtomicLong = _
+  private val initialized: AtomicBoolean = new AtomicBoolean(false)
+
+  def acquireCpuSlot(): Boolean = {
     if (hostResourceSemaphore.get.getAndDecrement() < 1) {
       hostResourceSemaphore.get.getAndIncrement()
       false
     } else {
       true
     }
+  }
+
+  private def releaseCpuSlot(): Unit = {
+    hostResourceSemaphore.foreach(_.getAndIncrement())
+  }
+
+  def acquireH2DSlot(batchSize: Long): Boolean = synchronized {
+    if (devicePreloadTracker.addAndGet(-batchSize) < 0) {
+      devicePreloadTracker.addAndGet(batchSize)
+      false
+    } else {
+      true
+    }
+  }
+
+  private def releaseH2DSlot(batchSize: Long): Unit = {
+    devicePreloadTracker.addAndGet(batchSize)
   }
 
 }
@@ -329,4 +370,7 @@ object HostOnly extends ReadMode
 object DeviceOnly extends ReadMode
 object DeviceFirst extends ReadMode
 
-case class HybridParquetOpts(mode: ReadMode, hostCurrentBound: Int, pollInterval: Int)
+case class HybridParquetOpts(mode: ReadMode,
+                             maxHostThreads: Int,
+                             pollInterval: Int,
+                             maxDevicePreloadBytes: Long)

@@ -431,6 +431,7 @@ case class GpuFileSourceScanExec(
         Map(READ_FS_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_READ_FS_TIME),
           WRITE_BUFFER_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_WRITE_BUFFER_TIME),
           "cpuDecodeBatches" -> createMetric(DEBUG_LEVEL, "CPU decode batches"),
+          "preloadH2DBatches" -> createMetric(DEBUG_LEVEL, "preload batches"),
           "cpuDecodeRows" -> createMetric(DEBUG_LEVEL, "CPU decode rows"),
           "cpuDecodeTime" -> createNanoTimingMetric(DEBUG_LEVEL, "CPU decode time"),
           "cpuDecodeDictTime" -> createNanoTimingMetric(DEBUG_LEVEL, "CPU dict decode time"),
@@ -438,7 +439,7 @@ case class GpuFileSourceScanExec(
           "hostVecBuildTime" -> createNanoTimingMetric(DEBUG_LEVEL, "host vector build time"),
           "hostVecToDeviceTime" -> createNanoTimingMetric(DEBUG_LEVEL, "host To device Time"),
           "hybridPollTime" -> createNanoTimingMetric(DEBUG_LEVEL, "hybridPollTime"),
-          "hybridWaitGpuTime" -> createNanoTimingMetric(DEBUG_LEVEL, "hybridWaitGpuTime"),
+          "waitForH2DTime" -> createNanoTimingMetric(DEBUG_LEVEL, "waitForH2DTime"),
         )
       case _: GpuReadParquetFileFormat | _: GpuOrcFileFormat =>
         Map(READ_FS_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_READ_FS_TIME),

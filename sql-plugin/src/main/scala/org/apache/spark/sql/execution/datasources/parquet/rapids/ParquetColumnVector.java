@@ -251,6 +251,9 @@ final class ParquetColumnVector {
 		if (!isPrimitive) {
 			throw new IllegalStateException("Can't set reader for non-primitive column");
 		}
+		if (this.columnReader != null) {
+			this.columnReader.close();
+		}
 		this.columnReader = reader;
 	}
 

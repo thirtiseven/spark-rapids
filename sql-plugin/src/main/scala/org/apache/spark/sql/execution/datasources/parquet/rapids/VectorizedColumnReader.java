@@ -1,12 +1,11 @@
 /*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Copyright (c) 2024, NVIDIA CORPORATION.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -17,6 +16,7 @@
 
 package org.apache.spark.sql.execution.datasources.parquet.rapids;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.time.ZoneId;
 
@@ -31,21 +31,23 @@ import org.apache.parquet.column.Encoding;
 import org.apache.parquet.column.page.*;
 import org.apache.parquet.column.values.RequiresPreviousReader;
 import org.apache.parquet.column.values.ValuesReader;
+import org.apache.parquet.column.values.dictionary.PlainValuesDictionary;
 import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.PrimitiveType;
 
 import org.apache.spark.sql.execution.vectorized.rapids.WritableColumnVector;
+import org.apache.spark.sql.types.DataTypes;
 
 import static org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BOOLEAN;
 
 /**
  * Decoder to return values from a single column.
  */
-public class VectorizedColumnReader {
+public class VectorizedColumnReader implements Closeable {
   /**
    * The dictionary, if this column has dictionary encoding.
    */
-  private final Dictionary dictionary;
+  private Dictionary dictionary;
 
   /**
    * If true, the current page is dictionary encoded.
@@ -137,6 +139,10 @@ public class VectorizedColumnReader {
     this.writerVersion = writerVersion;
   }
 
+  public Dictionary getDictionary() {
+    return dictionary;
+  }
+
   /**
    * Reads `total` rows from this columnReader into column.
    */
@@ -153,6 +159,13 @@ public class VectorizedColumnReader {
       // decode all previous dictionary encoded pages if we ever encounter a non-dictionary encoded
       // page.
       dictionaryIds = column.reserveDictionaryIds(total);
+
+      // When decoding String from BinaryDictionary, we can leverage ZerocopyStringUpdater to get rid of
+      // the overhead of Java wrappers of on heap data.
+      if (dictionary instanceof PlainValuesDictionary.PlainBinaryDictionary &&
+          column.dataType() == DataTypes.StringType) {
+        dictionary = new OffHeapBinaryDictionary((PlainValuesDictionary.PlainBinaryDictionary) dictionary);
+      }
     }
     readState.resetForNewBatch(total);
     while (readState.rowsToReadInBatch > 0 || !readState.lastListCompleted) {
@@ -327,6 +340,13 @@ public class VectorizedColumnReader {
       return pageValueCount;
     } catch (IOException e) {
       throw new IOException("could not read page " + page + " in col " + descriptor, e);
+    }
+  }
+
+  @Override
+  public void close() {
+    if (dictionary != null && dictionary instanceof OffHeapBinaryDictionary) {
+      ((OffHeapBinaryDictionary) dictionary).close();
     }
   }
 }

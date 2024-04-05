@@ -20,11 +20,11 @@ import java.io.Closeable;
 
 import ai.rapids.cudf.HostMemoryBuffer;
 import org.apache.parquet.column.Dictionary;
-import org.apache.parquet.column.values.dictionary.PlainValuesDictionary;
+import org.apache.parquet.column.values.dictionary.PlainValuesDictionary.PlainBinaryDictionary;
 
 public class OffHeapBinaryDictionary extends Dictionary implements Closeable {
 
-	public OffHeapBinaryDictionary(PlainValuesDictionary.PlainBinaryDictionary binDict) {
+	public OffHeapBinaryDictionary(PlainBinaryDictionary binDict) {
 		super(binDict.getEncoding());
 		this.size = binDict.getMaxId() + 1;
 		offsets = new int[this.size + 1];

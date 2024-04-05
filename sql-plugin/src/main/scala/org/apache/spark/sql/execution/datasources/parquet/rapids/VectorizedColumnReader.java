@@ -31,7 +31,7 @@ import org.apache.parquet.column.Encoding;
 import org.apache.parquet.column.page.*;
 import org.apache.parquet.column.values.RequiresPreviousReader;
 import org.apache.parquet.column.values.ValuesReader;
-import org.apache.parquet.column.values.dictionary.PlainValuesDictionary;
+import org.apache.parquet.column.values.dictionary.PlainValuesDictionary.PlainBinaryDictionary;
 import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.PrimitiveType;
 
@@ -91,6 +91,10 @@ public class VectorizedColumnReader implements Closeable {
   private final String datetimeRebaseMode;
   private final ParsedVersion writerVersion;
 
+  private final boolean dictLateMaterialize;
+
+  private int pageIndex = 0;
+
   public VectorizedColumnReader(
       ColumnDescriptor descriptor,
       boolean isRequired,
@@ -101,7 +105,8 @@ public class VectorizedColumnReader implements Closeable {
       String datetimeRebaseTz,
       String int96RebaseMode,
       String int96RebaseTz,
-      ParsedVersion writerVersion) throws IOException {
+      ParsedVersion writerVersion,
+      boolean supportDictLateMaterialize) throws IOException {
     this.descriptor = descriptor;
     this.pageReader = pageReadStore.getPageReader(descriptor);
     this.readState = new ParquetReadState(descriptor, isRequired,
@@ -115,19 +120,23 @@ public class VectorizedColumnReader implements Closeable {
       datetimeRebaseTz,
       int96RebaseMode,
       int96RebaseTz);
+    this.dictLateMaterialize = supportDictLateMaterialize;
 
-    DictionaryPage dictionaryPage = pageReader.readDictionaryPage();
-    if (dictionaryPage != null) {
-      try {
-        this.dictionary = dictionaryPage.getEncoding().initDictionary(descriptor, dictionaryPage);
-        this.isCurrentPageDictionaryEncoded = true;
-      } catch (IOException e) {
-        throw new IOException("could not decode the dictionary for " + descriptor, e);
+    if (!this.dictLateMaterialize) {
+      DictionaryPage dictionaryPage = pageReader.readDictionaryPage();
+      if (dictionaryPage != null) {
+        try {
+          this.dictionary = dictionaryPage.getEncoding().initDictionary(descriptor, dictionaryPage);
+          this.isCurrentPageDictionaryEncoded = true;
+        } catch (IOException e) {
+          throw new IOException("could not decode the dictionary for " + descriptor, e);
+        }
+      } else {
+        this.dictionary = null;
+        this.isCurrentPageDictionaryEncoded = false;
       }
-    } else {
-      this.dictionary = null;
-      this.isCurrentPageDictionaryEncoded = false;
     }
+
     if (pageReader.getTotalValueCount() == 0) {
       throw new IOException("totalValueCount == 0");
     }
@@ -151,10 +160,19 @@ public class VectorizedColumnReader implements Closeable {
       WritableColumnVector column,
       WritableColumnVector repetitionLevels,
       WritableColumnVector definitionLevels) throws IOException {
-    WritableColumnVector dictionaryIds = null;
-    ParquetVectorUpdater updater = updaterFactory.getUpdater(descriptor, column.dataType());
 
-    if (dictionary != null) {
+    ParquetVectorUpdater updater;
+    if (!dictLateMaterialize) {
+      updater = updaterFactory.getUpdater(descriptor, column.dataType());
+    } else {
+      updater = new ParquetVectorUpdaterFactory.IntegerUpdater();
+    }
+
+    WritableColumnVector dictionaryIds = null;
+
+    if (dictLateMaterialize) {
+      column.reserveAdditional(total);
+    } else if (dictionary != null) {
       // SPARK-16334: We only maintain a single dictionary per row batch, so that it can be used to
       // decode all previous dictionary encoded pages if we ever encounter a non-dictionary encoded
       // page.
@@ -162,15 +180,17 @@ public class VectorizedColumnReader implements Closeable {
 
       // When decoding String from BinaryDictionary, we can leverage ZerocopyStringUpdater to get rid of
       // the overhead of Java wrappers of on heap data.
-      if (dictionary instanceof PlainValuesDictionary.PlainBinaryDictionary &&
+      if (dictionary instanceof PlainBinaryDictionary &&
           column.dataType() == DataTypes.StringType) {
-        dictionary = new OffHeapBinaryDictionary((PlainValuesDictionary.PlainBinaryDictionary) dictionary);
+        dictionary = new OffHeapBinaryDictionary((PlainBinaryDictionary) dictionary);
       }
     }
+
     readState.resetForNewBatch(total);
     while (readState.rowsToReadInBatch > 0 || !readState.lastListCompleted) {
       if (readState.valuesToReadInPage == 0) {
         int pageValueCount = readPage();
+        pageIndex++;
         if (pageValueCount < 0) {
           // we've read all the pages; this could happen when we're reading a repeated list and we
           // don't know where the list will end until we've seen all the pages.
@@ -178,7 +198,8 @@ public class VectorizedColumnReader implements Closeable {
         }
         readState.resetForNewPage(pageValueCount, pageFirstRowIndex);
       }
-      if (isCurrentPageDictionaryEncoded) {
+
+      if (!dictLateMaterialize && isCurrentPageDictionaryEncoded) {
         // Save starting offset in case we need to decode dictionary IDs.
         int startOffset = readState.valueOffset;
 
@@ -241,7 +262,7 @@ public class VectorizedColumnReader implements Closeable {
     ValuesReader previousReader = this.dataColumn;
     if (dataEncoding.usesDictionary()) {
       this.dataColumn = null;
-      if (dictionary == null) {
+      if (!dictLateMaterialize && dictionary == null) {
         throw new IOException(
             "could not read page in col " + descriptor +
                 " as the dictionary was missing for encoding " + dataEncoding);
@@ -254,6 +275,14 @@ public class VectorizedColumnReader implements Closeable {
       this.dataColumn = new VectorizedRleValuesReader();
       this.isCurrentPageDictionaryEncoded = true;
     } else {
+      if (dictLateMaterialize) {
+        StringBuilder sb = new StringBuilder();
+        for (String p : descriptor.getPath()) {
+          sb.append(p).append('.');
+        }
+        throw new RuntimeException("DictLatMat failed: Column(" + sb + ") Page_NO(" +
+            pageIndex + ") Encoding(" + dataEncoding + ") is not dictionary encoded");
+      }
       this.dataColumn = getValuesReader(dataEncoding);
       this.isCurrentPageDictionaryEncoded = false;
     }

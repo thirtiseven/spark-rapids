@@ -1102,7 +1102,6 @@ case class GpuParquetMultiFilePartitionReaderFactory(
   private val useSubPageChunked = rapidsConf.chunkedSubPageReaderEnabled
   private val debugDumpPrefix = rapidsConf.parquetDebugDumpPrefix
   private val debugDumpAlways = rapidsConf.parquetDebugDumpAlways
-  private val readOnHost = rapidsConf.parquetReadOnHost
   private val numThreads = rapidsConf.multiThreadReadNumThreads
   private val maxNumFileProcessed = rapidsConf.maxNumParquetFilesParallel
   private val ignoreMissingFiles = sqlConf.ignoreMissingFiles
@@ -1139,6 +1138,14 @@ case class GpuParquetMultiFilePartitionReaderFactory(
   private val alluxioReplacementTaskTime =
     AlluxioCfgUtils.enabledAlluxioReplacementAlgoTaskTime(rapidsConf)
 
+  private val hybridScanOpts = HybridParquetOpts(
+    rapidsConf.parquetScanHybridMode,
+    rapidsConf.parquetScanHostParallelism,
+    rapidsConf.parquetScanHostBatchSizeBytes,
+    3,
+    rapidsConf.parquetScanEnableDictLateMat,
+    rapidsConf.parquetScanHostAsync)
+
   // We can't use the coalescing files reader when InputFileName, InputFileBlockStart,
   // or InputFileBlockLength because we are combining all the files into a single buffer
   // and we don't know which file is associated with each row. If this changes we need to
@@ -1164,12 +1171,15 @@ case class GpuParquetMultiFilePartitionReaderFactory(
         filters, readDataSchema)
     }
     val combineConf = CombineConf(combineThresholdSize, combineWaitTime)
+    HostParquetIterator.initialize(hybridScanOpts)
+
     new MultiFileCloudParquetPartitionReader(conf, files, filterFunc, isCaseSensitive,
       debugDumpPrefix, debugDumpAlways, maxReadBatchSizeRows, maxReadBatchSizeBytes,
       targetBatchSizeBytes, maxGpuColumnSizeBytes, useChunkedReader, subPageChunked, metrics,
       partitionSchema, numThreads, maxNumFileProcessed, ignoreMissingFiles, ignoreCorruptFiles,
       readUseFieldId, alluxioPathReplacementMap.getOrElse(Map.empty), alluxioReplacementTaskTime,
-      queryUsesInputFile, keepReadsInOrderFromConf, combineConf, readOnHost)
+      queryUsesInputFile, keepReadsInOrderFromConf, combineConf,
+      hybridScanOpts)
   }
 
   private def filterBlocksForCoalescingReader(
@@ -1283,7 +1293,7 @@ case class GpuParquetMultiFilePartitionReaderFactory(
     new MultiFileParquetPartitionReader(conf, files, clippedBlocks.toSeq, isCaseSensitive,
       debugDumpPrefix, debugDumpAlways, useChunkedReader, useSubPageChunked, maxReadBatchSizeRows,
       maxReadBatchSizeBytes, targetBatchSizeBytes, maxGpuColumnSizeBytes, metrics, partitionSchema,
-      numThreads, ignoreMissingFiles, ignoreCorruptFiles, readUseFieldId, readOnHost)
+      numThreads, ignoreMissingFiles, ignoreCorruptFiles, readUseFieldId)
   }
 
   /**
@@ -1890,18 +1900,11 @@ class MultiFileParquetPartitionReader(
     numThreads: Int,
     ignoreMissingFiles: Boolean,
     ignoreCorruptFiles: Boolean,
-    useFieldId: Boolean,
-    readOnHostOpts: String)
+    useFieldId: Boolean)
   extends MultiFileCoalescingPartitionReaderBase(conf, clippedBlocks,
     partitionSchema, maxReadBatchSizeRows, maxReadBatchSizeBytes, maxGpuColumnSizeBytes,
     numThreads, execMetrics)
   with ParquetPartitionReaderBase {
-
-  /*private val hybridOpts: HybridParquetOpts = {
-    val opts = HostParquetIterator.parseHybridParquetOpts(readOnHostOpts)
-    HostParquetIterator.initialize(opts)
-    opts
-  }*/
 
   // Some implicits to convert the base class to the sub-class and vice versa
   implicit def toMessageType(schema: SchemaBase): MessageType =
@@ -2097,17 +2100,11 @@ class MultiFileCloudParquetPartitionReader(
     queryUsesInputFile: Boolean,
     keepReadsInOrder: Boolean,
     combineConf: CombineConf,
-    readOnHostOpts: String)
+    hybridOpts: HybridParquetOpts)
   extends MultiFileCloudPartitionReaderBase(conf, files, numThreads, maxNumFileProcessed, null,
     execMetrics, maxReadBatchSizeRows, maxReadBatchSizeBytes, ignoreCorruptFiles,
     alluxioPathReplacementMap, alluxioReplacementTaskTime, keepReadsInOrder, combineConf)
   with ParquetPartitionReaderBase {
-
-  private val hybridOpts: HybridParquetOpts = {
-    val opts = HostParquetIterator.parseHybridParquetOpts(readOnHostOpts)
-    HostParquetIterator.initialize(opts)
-    opts
-  }
 
   def checkIfNeedToSplit(current: HostMemoryBuffersWithMetaData,
       next: HostMemoryBuffersWithMetaData): Boolean = {
@@ -2573,64 +2570,69 @@ class MultiFileCloudParquetPartitionReader(
     }
     val colTypes = readDataSchema.fields.map(f => f.dataType)
 
-    lazy val canReadOnHost = HostParquetIterator.schemaSupportCheck(colTypes)
+    // Schedule HybridParquetScan if configured
+    if (hybridOpts != null) {
+      val opts: HybridParquetOpts = hybridOpts
 
-    val (readOnHost, slotAcquired) = hybridOpts.mode match {
-      case "CPU_ONLY" =>
-        (canReadOnHost, false)
-      case "GPU_ONLY" =>
-        (false, false)
-      case _ if hybridOpts.pollInterval > 0 && canReadOnHost =>
-        var ret: Option[Boolean] = None
-        withResource(new NvtxWithMetrics(
-          "hybridPollTime", NvtxColor.WHITE, metrics("hybridPollTime"))) { _ =>
-          var gpuWait = true
-          while (ret.isEmpty) {
-            GpuSemaphore.tryAcquire(TaskContext.get()) match {
-              case SemaphoreAcquired =>
-                ret = Option(false)
-              case AcquireFailed(_) if gpuWait =>
-                gpuWait = false
-                Thread.sleep(hybridOpts.pollInterval)
-              case AcquireFailed(_) =>
-                gpuWait = true
-                if (HostParquetIterator.tryAcquireSlot(hybridOpts)) {
-                  ret = Option(true)
-                }
+      lazy val canReadOnHost = HostParquetIterator.schemaSupportCheck(colTypes)
+
+      val (readOnHost, slotAcquired) = opts.mode match {
+        case "CPU_ONLY" =>
+          (canReadOnHost, false)
+        case "GPU_ONLY" =>
+          (false, false)
+        case _ if opts.pollInterval > 0 && canReadOnHost =>
+          var ret: Option[Boolean] = None
+          withResource(new NvtxWithMetrics(
+            "hybridPollTime", NvtxColor.WHITE, metrics("hybridPollTime"))) { _ =>
+            var gpuWait = true
+            while (ret.isEmpty) {
+              GpuSemaphore.tryAcquire(TaskContext.get()) match {
+                case SemaphoreAcquired =>
+                  ret = Option(false)
+                case AcquireFailed(_) if gpuWait =>
+                  gpuWait = false
+                  Thread.sleep(opts.pollInterval)
+                case AcquireFailed(_) =>
+                  gpuWait = true
+                  if (HostParquetIterator.tryAcquireSlot(opts)) {
+                    ret = Option(true)
+                  }
+              }
             }
           }
-        }
-        (ret.get, true)
-      case _ =>
-        (false, false)
-    }
-
-    if (readOnHost) {
-      val asyncReader = AsyncParquetReader(conf, hybridOpts.batchSizeBytes.toInt,
-        hostBuffer, 0, dataSize, metrics,
-        dateRebaseMode, timestampRebaseMode, hasInt96Timestamps,
-        clippedSchema, readDataSchema,
-        slotAcquired, hybridOpts.enableDictLateMat, hybridOpts.async)
-
-      val batchIter = HostParquetIterator(asyncReader, hybridOpts, colTypes, metrics)
-
-      val iterator = if (allPartValues.isDefined) {
-        val allPartInternalRows = allPartValues.get.map(_._2)
-        val rowsPerPartition = allPartValues.get.map(_._1)
-        new GpuColumnarBatchWithPartitionValuesIterator(batchIter, allPartInternalRows,
-          rowsPerPartition, partitionSchema, maxGpuColumnSizeBytes)
-      } else {
-        // this is a bit weird, we don't have number of rows when allPartValues isn't
-        // filled in so can't use GpuColumnarBatchWithPartitionValuesIterator
-        batchIter.flatMap { batch =>
-          // we have to add partition values here for this batch, we already verified that
-          // its not different for all the blocks in this batch
-          BatchWithPartitionDataUtils.addSinglePartitionValueToBatch(batch,
-            partedFile.partitionValues, partitionSchema, maxGpuColumnSizeBytes)
-        }
+          (ret.get, true)
+        case _ =>
+          (false, false)
       }
 
-      return iterator
+      if (readOnHost) {
+        val asyncReader = AsyncParquetReader(conf, opts.batchSizeBytes.toInt,
+          hostBuffer, 0, dataSize, metrics,
+          dateRebaseMode, timestampRebaseMode, hasInt96Timestamps,
+          clippedSchema, readDataSchema,
+          slotAcquired, opts.enableDictLateMat, opts.async)
+
+        val batchIter = HostParquetIterator(asyncReader, opts, colTypes, metrics)
+
+        val iterator = if (allPartValues.isDefined) {
+          val allPartInternalRows = allPartValues.get.map(_._2)
+          val rowsPerPartition = allPartValues.get.map(_._1)
+          new GpuColumnarBatchWithPartitionValuesIterator(batchIter, allPartInternalRows,
+            rowsPerPartition, partitionSchema, maxGpuColumnSizeBytes)
+        } else {
+          // this is a bit weird, we don't have number of rows when allPartValues isn't
+          // filled in so can't use GpuColumnarBatchWithPartitionValuesIterator
+          batchIter.flatMap { batch =>
+            // we have to add partition values here for this batch, we already verified that
+            // its not different for all the blocks in this batch
+            BatchWithPartitionDataUtils.addSinglePartitionValueToBatch(batch,
+              partedFile.partitionValues, partitionSchema, maxGpuColumnSizeBytes)
+          }
+        }
+
+        return iterator
+      }
     }
 
     RmmRapidsRetryIterator.withRetryNoSplit(hostBuffer) { _ =>

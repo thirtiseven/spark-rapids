@@ -36,9 +36,6 @@ import org.apache.parquet.column.page.PageReadStore
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.schema.MessageType
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
-import org.json4s._
-import org.json4s.DefaultFormats
-import org.json4s.jackson.JsonMethods._
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
@@ -442,14 +439,14 @@ class AsyncParquetReader(
   }
 
   private def launchTask(): Unit = if (asynchronous && task == null) {
-    //    val failedCallback = new FailedCallback {
-    //      private val queue = resultQueue
-    //      override def callback(ex: Throwable): Unit = {
-    //        queue.offer(Right(ex))
-    //      }
-    //    }
+    val failedCallback = new ComputeThreadPool.FailedCallback {
+      private val queue = resultQueue
+      override def callback(ex: Throwable): Unit = {
+        queue.offer(Right(ex))
+      }
+    }
     task = new TaskWithPriority(() => readAsProducer(),
-      0, slotAcquired, null, null)
+      0, slotAcquired, null, failedCallback)
     ComputeThreadPool.submitTask(task)
   }
 
@@ -741,20 +738,6 @@ object HostParquetIterator extends Logging {
       dictionaryInfo.foreach(_.vectors.safeClose())
       hostDctVecHolder.safeClose()
     }
-  }
-
-  def parseHybridParquetOpts(str: String): HybridParquetOpts = {
-    implicit val formats: Formats = DefaultFormats
-    val defaultJson = parse(
-      """{"mode": "GPU_ONLY", "maxConcurrent": 0, "batchSizeBytes": 0, "async": true,
-        |"pollInterval": 0, "enableDictLateMat": false}""".stripMargin)
-
-    val json: JValue = if (str.isEmpty) {
-      defaultJson
-    } else {
-      defaultJson merge parse(str)
-    }
-    json.extract[HybridParquetOpts]
   }
 
   def schemaSupportCheck(types: Array[DataType]): Boolean = {

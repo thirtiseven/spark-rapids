@@ -44,6 +44,7 @@ import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import scala.collection.JavaConverters;
 import scala.collection.Seq;
 import scala.Tuple2;
@@ -364,7 +365,8 @@ class GpuMultiFileBatchReader extends BaseDataReader<ColumnarBatch> {
           new CombineConf(
               -1, // combineThresholdsize
               -1) // combineWaitTime
-          , ""
+          ,
+          null
       );
     }
 
@@ -435,8 +437,7 @@ class GpuMultiFileBatchReader extends BaseDataReader<ColumnarBatch> {
           metrics, partitionSchema, numThreads,
           false, // ignoreMissingFiles
           false, // ignoreCorruptFiles
-          false, // useFieldId
-          ""
+          false // useFieldId
       ) {
         @Override
         public boolean checkIfNeedToSplitDataBlock(SingleDataBlockInfo currentBlockInfo,

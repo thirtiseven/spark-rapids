@@ -16,8 +16,10 @@
 
 package org.apache.spark.sql.execution.datasources.parquet.rapids
 
+import java.util
 import java.util.Optional
 
+import scala.collection.JavaConverters.asScalaIteratorConverter
 import scala.collection.mutable
 
 import ai.rapids.cudf.{DType, HostColumnVector, HostColumnVectorCore, HostMemoryBuffer}
@@ -27,15 +29,14 @@ import org.apache.parquet.column.values.dictionary.PlainValuesDictionary.PlainBi
 
 import org.apache.spark.internal.Logging
 
+
 case class DictLatMatInfo(dictVector: HostColumnVector, dictPageOffsets: Array[Int])
 
 object DictLateMatUtils extends Logging {
 
   def extractDict(rowGroups: Seq[PageReadStore],
                   descriptor: ColumnDescriptor): Option[DictLatMatInfo] = {
-
     val dictPages = mutable.ArrayBuffer[DictionaryPage]()
-
     // Go through each RowGroup and each page inside them to check if all pages use Dictionary.
     // Dictionary late materialization only works if all pages use Dictionary.
     rowGroups.foreach { rowGroup =>
@@ -46,7 +47,6 @@ object DictLateMatUtils extends Logging {
       }
       dictPages += dictPage
     }
-
     Some(combineDictPages(dictPages, descriptor))
   }
 
@@ -54,7 +54,6 @@ object DictLateMatUtils extends Logging {
                                descriptor: ColumnDescriptor): DictLatMatInfo = {
     val pageOffsets = mutable.ArrayBuffer[Int](0)
     var rowNum: Int = 0
-
     val dictionaries = dictPages.map { dictPage =>
       val dictionary = dictPage.getEncoding.initDictionary(descriptor, dictPage)
         .asInstanceOf[PlainBinaryDictionary]
@@ -87,7 +86,6 @@ object DictLateMatUtils extends Logging {
 
     val dictVector = new HostColumnVector(DType.STRING, rowNum, Optional.of(0L),
       charBuf, null, offsetBuf, new java.util.ArrayList[HostColumnVectorCore]())
-
     DictLatMatInfo(dictVector, pageOffsets.toArray)
   }
 
@@ -97,26 +95,24 @@ object DictLateMatUtils extends Logging {
     val rawPagesField = ccPageReader.getDeclaredField("compressedPages")
     rawPagesField.setAccessible(true)
 
-    val pageQueue = rawPagesField.get(pageReader).asInstanceOf[java.util.ArrayDeque[DataPage]]
-    val swapQueue = new java.util.ArrayDeque[DataPage]()
-    var allDictEncoded = true
-
-    while (!pageQueue.isEmpty) {
-      swapQueue.addLast(pageQueue.pollFirst())
-      if (allDictEncoded) {
-        allDictEncoded = swapQueue.getLast match {
-          case p: DataPageV1 =>
-            p.getValueEncoding.usesDictionary()
-          case p: DataPageV2 =>
-            p.getDataEncoding.usesDictionary()
-        }
-      }
-    }
-    while (!swapQueue.isEmpty) {
-      pageQueue.addLast(swapQueue.pollFirst())
+    // For parquet-hadoop <= 1.10.X, compressedPages is stored as LinkedList
+    // For parquet-hadoop >= 1.11.X, compressedPages is stored as ArrayDeque
+    val pages = rawPagesField.get(pageReader)
+    val pageIterator = if (pages.isInstanceOf[util.ArrayDeque[_]]) {
+      pages.asInstanceOf[util.ArrayDeque[DataPage]].iterator()
+    } else if (pages.isInstanceOf[util.LinkedList[_]]) {
+      pages.asInstanceOf[util.LinkedList[DataPage]].iterator()
+    } else {
+      throw new IllegalArgumentException(
+        s"Get unknown type ${pages.getClass} from ColumnChunkPageReader::compressedPages")
     }
 
-    allDictEncoded
+    pageIterator.asScala.forall {
+      case p: DataPageV1 =>
+        p.getValueEncoding.usesDictionary()
+      case p: DataPageV2 =>
+        p.getDataEncoding.usesDictionary()
+    }
   }
 
   private val ccPageReader: Class[_] = {

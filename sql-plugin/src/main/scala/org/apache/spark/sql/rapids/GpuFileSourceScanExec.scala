@@ -427,7 +427,7 @@ case class GpuFileSourceScanExec(
     FILTER_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_FILTER_TIME)
   ) ++ fileCacheMetrics ++ {
     relation.fileFormat match {
-      case _: GpuReadParquetFileFormat if rapidsConf.parquetReadOnHost.nonEmpty =>
+      case _: GpuReadParquetFileFormat if rapidsConf.parquetScanHybridMode != "GPU_ONLY" =>
         Map(READ_FS_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_READ_FS_TIME),
           WRITE_BUFFER_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_WRITE_BUFFER_TIME),
           "filteredRowGroups" -> createMetric(DEBUG_LEVEL, "filtered row groups"),

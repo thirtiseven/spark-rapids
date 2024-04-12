@@ -1521,12 +1521,37 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .booleanConf
     .createWithDefault(false)
 
-  val PARQUET_READ_ON_HOST = conf("spark.rapids.sql.parquet.readOnHost")
-    .doc("Leverages CPUs to read parquet files if there is no available GPU. " +
-      "The host-side reader produces cuDF column vector directly. R2C is unnecessary.")
+  val PARQUET_HYBRID_SCAN_MODE = conf("spark.rapids.sql.parquet.scan.hybridMode")
+    .doc("The execution mode of hybrid parquet scan. There are 3 modes: GPU_ONLY, disable " +
+      "hybrid scan (the default mode); CPU_ONLY, only decode data via CPU; DeviceFirst, run " +
+      "decode tasks on CPUs if GPU resources are not available.")
     .internal()
     .stringConf
-    .createWithDefault("")
+    .createWithDefault("GPU_ONLY")
+
+  val PARQUET_HOST_SCAN_PARALLELISM = conf("spark.rapids.sql.parquet.scan.hostParallelism")
+    .doc("The max concurrent capacity for host parquet scan(decode) tasks")
+    .internal()
+    .integerConf
+    .createWithDefault(0)
+
+  val PARQUET_HOST_SCAN_BATCH_SIZE_BYTES = conf("spark.rapids.sql.parquet.scan.hostBatchSizeBytes")
+    .doc("Similar to spark.rapids.sql.batchSizeBytes, but it is only for decode tasks run on CPUs")
+    .internal()
+    .integerConf
+    .createWithDefault(1024 * 1024 * 128)
+
+  val PARQUET_HOST_SCAN_ASYNC = conf("spark.rapids.sql.parquet.scan.async")
+    .doc("Whether run host parquet decode tasks asynchronously or not")
+    .internal()
+    .booleanConf
+    .createWithDefault(false)
+
+  val PARQUET_SCAN_DICT_LATE_MAT = conf("spark.rapids.sql.parquet.scan.enableDictLateMat")
+    .doc("Whether pushing down binary dicts onto GPU and materializing via GPU or not")
+    .internal()
+    .booleanConf
+    .createWithDefault(false)
 
   val ORC_DEBUG_DUMP_PREFIX = conf("spark.rapids.sql.orc.debug.dumpPrefix")
     .doc("A path prefix where ORC split file data is dumped for debugging.")
@@ -2547,7 +2572,15 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val parquetDebugDumpAlways: Boolean = get(PARQUET_DEBUG_DUMP_ALWAYS)
 
-  lazy val parquetReadOnHost: String = get(PARQUET_READ_ON_HOST)
+  lazy val parquetScanHybridMode: String = get(PARQUET_HYBRID_SCAN_MODE)
+
+  lazy val parquetScanHostParallelism: Int = get(PARQUET_HOST_SCAN_PARALLELISM)
+
+  lazy val parquetScanHostBatchSizeBytes: Int = get(PARQUET_HOST_SCAN_BATCH_SIZE_BYTES)
+
+  lazy val parquetScanHostAsync: Boolean = get(PARQUET_HOST_SCAN_ASYNC)
+
+  lazy val parquetScanEnableDictLateMat: Boolean = get(PARQUET_SCAN_DICT_LATE_MAT)
 
   lazy val orcDebugDumpPrefix: Option[String] = get(ORC_DEBUG_DUMP_PREFIX)
 

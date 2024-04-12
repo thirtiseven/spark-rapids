@@ -20,14 +20,15 @@ import scala.util.parsing.combinator.RegexParsers
 
 import ai.rapids.cudf.{ColumnVector, GetJsonObjectOptions, Scalar}
 import com.nvidia.spark.rapids.Arm.withResource
+import com.nvidia.spark.rapids.jni.JSONUtils
 
 import org.apache.spark.sql.catalyst.expressions.{ExpectsInputTypes, Expression, GetJsonObject}
 import org.apache.spark.sql.types.{DataType, StringType}
 import org.apache.spark.unsafe.types.UTF8String
 
 // Copied from Apache Spark org/apache/spark/sql/catalyst/expressions/jsonExpressions.scala
-private[this] sealed trait PathInstruction
-private[this] object PathInstruction {
+sealed trait PathInstruction
+object PathInstruction {
   case object Subscript extends PathInstruction
   case object Wildcard extends PathInstruction
   case object Key extends PathInstruction
@@ -35,7 +36,7 @@ private[this] object PathInstruction {
   case class Named(name: String) extends PathInstruction
 }
 
-private[this] object JsonPathParser extends RegexParsers {
+object JsonPathParser extends RegexParsers {
   import PathInstruction._
 
   def root: Parser[Char] = '$'
@@ -83,12 +84,41 @@ private[this] object JsonPathParser extends RegexParsers {
     }
   }
 
+  def fallbackCheck(instructions: List[PathInstruction]): Boolean = {
+    // JNI kernel has a limit of 16 nested nodes, fallback to CPU if we exceed that
+    instructions.length > 16
+  }
+
+  def unzipInstruction(instruction: PathInstruction): (String, String, Long) = {
+    instruction match {
+      case Subscript => ("subscript", "", -1)
+      case Key => ("key", "", -1)
+      case Wildcard => ("wildcard", "", -1)
+      case Index(index) => ("index", "", index)
+      case Named(name) => ("named", name, -1)
+    }
+  }
+
+  def convertToJniObject(instructions: List[PathInstruction]): 
+      Array[JSONUtils.PathInstructionJni] = {
+    instructions.map { instruction =>
+      val (tpe, name, index) = unzipInstruction(instruction)
+      new JSONUtils.PathInstructionJni(tpe match {
+        case "subscript" => JSONUtils.PathInstructionType.SUBSCRIPT
+        case "key" => JSONUtils.PathInstructionType.KEY
+        case "wildcard" => JSONUtils.PathInstructionType.WILDCARD
+        case "index" => JSONUtils.PathInstructionType.INDEX
+        case "named" => JSONUtils.PathInstructionType.NAMED
+      }, name, index)
+    }.toArray
+  }
+
   def containsUnsupportedPath(instructions: List[PathInstruction]): Boolean = {
     // Gpu GetJsonObject is not supported if JSON path contains wildcard [*]
     // see https://github.com/NVIDIA/spark-rapids/issues/10216
     instructions.exists {
       case Wildcard => true
-      case Named(name) if name == "*" => true
+      case Named("*")  => true
       case _ => false
     }
   }
@@ -116,17 +146,71 @@ class GpuGetJsonObjectMeta(
     val lit = GpuOverrides.extractLit(expr.right)
     lit.map { l =>
       val instructions = JsonPathParser.parse(l.value.asInstanceOf[UTF8String].toString)
-      if (instructions.exists(JsonPathParser.containsUnsupportedPath)) {
-        willNotWorkOnGpu("get_json_object on GPU does not support wildcard [*] in path")
+      if (conf.isLegacyGetJsonObjectEnabled == false) {
+        if (instructions.exists(JsonPathParser.fallbackCheck(_))) {
+          willNotWorkOnGpu("get_json_object on GPU does not support more than 16 nested paths")
+        }
+      } else {
+        if (instructions.exists(JsonPathParser.containsUnsupportedPath)) {
+          willNotWorkOnGpu("get_json_object on GPU does not support wildcard [*] in path")
+        }
       }
     }
   }
 
-  override def convertToGpu(lhs: Expression, rhs: Expression): GpuExpression =
-    GpuGetJsonObject(lhs, rhs)
+  override def convertToGpu(lhs: Expression, rhs: Expression): GpuExpression = {
+    if (conf.isLegacyGetJsonObjectEnabled == false) {
+      GpuGetJsonObject(lhs, rhs)
+    } else {
+      GpuGetJsonObjectLegacy(lhs, rhs)
+    }
+  }
 }
 
 case class GpuGetJsonObject(json: Expression, path: Expression)
+    extends GpuBinaryExpressionArgsAnyScalar
+        with ExpectsInputTypes {
+  override def left: Expression = json
+  override def right: Expression = path
+  override def dataType: DataType = StringType
+  override def inputTypes: Seq[DataType] = Seq(StringType, StringType)
+  override def nullable: Boolean = true
+  override def prettyName: String = "get_json_object"
+
+  private var cachedInstructions: 
+      Option[Option[List[PathInstruction]]] = None
+
+  def parseJsonPath(path: GpuScalar): Option[List[PathInstruction]] = {
+    if (path.isValid) {
+      val pathStr = path.getValue.toString()
+      JsonPathParser.parse(pathStr)
+    } else {
+      None
+    }
+  }
+
+  override def doColumnar(lhs: GpuColumnVector, rhs: GpuScalar): ColumnVector = {
+    cachedInstructions.getOrElse {
+      val pathInstructions = parseJsonPath(rhs)
+      cachedInstructions = Some(pathInstructions)
+      pathInstructions
+    } match {
+      case Some(instructions) => {
+        val jniInstructions = JsonPathParser.convertToJniObject(instructions)
+        JSONUtils.getJsonObject(lhs.getBase, jniInstructions)
+      }
+      case None => GpuColumnVector.columnVectorFromNull(lhs.getRowCount.toInt, StringType)
+    }
+  }
+
+  override def doColumnar(numRows: Int, lhs: GpuScalar, rhs: GpuScalar): ColumnVector = {
+    withResource(GpuColumnVector.from(lhs, numRows, left.dataType)) { expandedLhs =>
+      doColumnar(expandedLhs, rhs)
+    }
+  }
+}
+
+case class GpuGetJsonObjectLegacy(json: Expression, path: Expression)
     extends GpuBinaryExpressionArgsAnyScalar
         with ExpectsInputTypes {
   override def left: Expression = json

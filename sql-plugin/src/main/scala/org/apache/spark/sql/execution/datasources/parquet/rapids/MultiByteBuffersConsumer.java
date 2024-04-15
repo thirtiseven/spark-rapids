@@ -18,7 +18,7 @@ package org.apache.spark.sql.execution.datasources.parquet.rapids;
 
 import org.apache.parquet.bytes.ByteBufferInputStream;
 import org.apache.parquet.io.api.Binary;
-import org.apache.spark.sql.execution.vectorized.rapids.HostWritableColumnVector;
+import org.apache.spark.sql.execution.vectorized.rapids.RapidsWritableColumnVector;
 import org.apache.spark.sql.execution.vectorized.rapids.WritableColumnVector;
 
 import java.nio.ByteBuffer;
@@ -175,7 +175,7 @@ public class MultiByteBuffersConsumer
 	}
 
 	public void readBinaries(int total, WritableColumnVector c, int rowId) {
-		HostWritableColumnVector vector = (HostWritableColumnVector) c;
+		RapidsWritableColumnVector vector = (RapidsWritableColumnVector) c;
 		WritableColumnVector charVector = c.arrayData();
 
 		for (int i = 0; i < total; ++i) {

@@ -16,7 +16,7 @@
 
 package org.apache.spark.sql.execution.datasources.parquet.rapids
 
-import java.util.TimeZone
+import java.util.{Optional, TimeZone}
 import java.util.concurrent.{LinkedBlockingQueue, Semaphore, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import java.util.concurrent.locks.ReentrantLock
@@ -39,10 +39,10 @@ import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.execution.vectorized.rapids.HostWritableColumnVector
+import org.apache.spark.sql.execution.vectorized.rapids.RapidsWritableColumnVector
 import org.apache.spark.sql.rapids.ComputeThreadPool
 import org.apache.spark.sql.rapids.ComputeThreadPool.TaskWithPriority
-import org.apache.spark.sql.types.{ArrayType, BinaryType, DataType, DecimalType, IntegerType, MapType, StructField, StructType}
+import org.apache.spark.sql.types.{ArrayType, BinaryType, DataType, DecimalType, IntegerType, MapType, StringType, StructField, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 
@@ -152,16 +152,32 @@ class AsyncParquetReader(
 
   private lazy val numBatches = {
     val value = (totalRowCnt + rowBatchSize - 1) / rowBatchSize
-    logError(s"[$taskID] rowCount:$totalRowCnt; rowBatchSize:$rowBatchSize; numBatches:$value")
+    logInfo(s"[$taskID] rowCount:$totalRowCnt; rowBatchSize:$rowBatchSize; numBatches:$value")
     value
   }
   private val consumedBatches = new AtomicInteger(0)
   private val producedBatches = new AtomicInteger(0)
+  // global row offset for Dictionary Push down
   @volatile private var globalRowOffset = 0
 
   private val parquetColumn: ParquetColumn = {
     val converter = new ParquetToSparkSchemaConverter()
     converter.convertParquetColumn(clippedSchema, None)
+  }
+
+  private lazy val topLevelStringColumnMeta: Map[String, BinaryColumnMetaSummary] = {
+    val fieldNames = parquetColumn.sparkType.asInstanceOf[StructType].fields.map(_.name)
+    val mapBuilder = mutable.ArrayBuffer[(String, BinaryColumnMetaSummary)]()
+    parquetColumn.children.zipWithIndex.foreach {
+      case (c, i) if c.isPrimitive =>
+        val descriptor = c.descriptor.get
+        if (descriptor.getPrimitiveType.getPrimitiveTypeName == PrimitiveTypeName.BINARY) {
+          mapBuilder += fieldNames(i) ->
+            BinaryColumnMetaUtils.inspectColumn(rowGroupQueue, descriptor)
+        }
+      case _ =>
+    }
+    mapBuilder.toMap
   }
 
   // compute while assembling dictionary columns
@@ -176,41 +192,41 @@ class AsyncParquetReader(
     if (!enableDictLateMat) {
       mutable.TreeMap.empty[Int, (HostColumnVector, Array[Int])]
     } else {
-      logError(s"[$taskID] Row Group size ${rowGroupQueue.size}")
+      logInfo(s"[$taskID] Row Group size ${rowGroupQueue.size}")
 
+      val fieldNames = parquetColumn.sparkType.asInstanceOf[StructType].fields.map(_.name)
       val builder = mutable.TreeMap.empty[Int, (HostColumnVector, Array[Int])]
       val stack = mutable.Stack[ParquetColumn]()
       val leafOffsetsBuffer = mutable.ArrayBuffer[Int](0)
       val fieldHasDctLatMat = mutable.ArrayBuffer[Boolean]()
       var leafIndex = 0
 
-      parquetColumn.children.foreach { column =>
+      parquetColumn.children.zipWithIndex.foreach { case (column, fieldIndex) =>
         val numDictFound = builder.size
         stack.push(column)
         while (stack.nonEmpty) {
           stack.pop() match {
             // TODO: support Dictionary late materialize on columns of nested type
-            case c if c.isPrimitive && c == column =>
-              val descriptor = c.descriptor.get
-              val typeName = descriptor.getPrimitiveType.getPrimitiveTypeName
-              if (typeName == PrimitiveTypeName.BINARY) {
-                DictLateMatUtils.extractDict(rowGroupQueue, descriptor) match {
-                  case None =>
-                    logError(s"[$taskID] Column ${c.path.mkString(".")} is NOT all dictEncoded")
-                  case Some(info) =>
-                    if (rowGroupRowOffsets == null) {
-                      val rgRowOff = Array.ofDim[Int](rowGroupQueue.size + 1)
-                      rowGroupQueue.indices.foreach { i =>
-                        rgRowOff(i + 1) = rgRowOff(i) + rowGroupQueue(i).getRowCount.toInt
-                      }
-                      rowGroupRowOffsets = rgRowOff
-                    }
-                    builder.put(leafIndex, info.dictVector -> info.dictPageOffsets)
-                    logError(s"[$taskID] Column ${c.path.mkString(".")} is all dictEncoded")
-                }
-              }
-              leafIndex += 1
             case c if c.isPrimitive =>
+              topLevelStringColumnMeta.get(fieldNames(fieldIndex)) match {
+                case Some(binColMeta) if binColMeta.isAllDictEncoded =>
+                  val patch = BinaryColumnMetaUtils.buildDictLateMatPatch(
+                    binColMeta.dictPages.get, c.descriptor.get)
+                  builder.put(leafIndex,
+                    patch.dictVector -> patch.dictPageOffsets)
+
+                  // Compute rowGroupRowOffsets if DictLateMaterialize will be applied on
+                  // at least one column.
+                  if (rowGroupRowOffsets == null) {
+                    val rgRowOff = Array.ofDim[Int](rowGroupQueue.size + 1)
+                    rowGroupQueue.indices.foreach { i =>
+                      rgRowOff(i + 1) = rgRowOff(i) + rowGroupQueue(i).getRowCount.toInt
+                    }
+                    rowGroupRowOffsets = rgRowOff
+                  }
+                  logInfo(s"[$taskID] Column ${c.path.mkString(".")} is all dictEncoded")
+                case _ =>
+              }
               leafIndex += 1
             case cv =>
               cv.children.reverseIterator.foreach(stack.push)
@@ -229,9 +245,30 @@ class AsyncParquetReader(
     }
   }
 
-  private lazy val dataColumnBuilders: Array[HostWritableColumnVector] = {
-    sparkTypesWithDict.fields.map { f =>
-      new HostWritableColumnVector(rowBatchSize min totalRowCnt, f.dataType)
+  private lazy val dataColumnBuilders: Array[RapidsWritableColumnVector] = {
+    sparkTypesWithDict.fields.map {
+      case f: StructField if f.dataType == StringType
+        && topLevelStringColumnMeta.contains(f.name) =>
+        val sizeInBytes = topLevelStringColumnMeta(f.name).sizeInBytes
+        // The estimated char sizes are set to be a little larger than the exact size,
+        // because if the initial allocation turns out to be not enough, the buffer growth
+        // would be considerably expensive.
+        val (batchRowSize, batchCharSize) = if (rowBatchSize >= totalRowCnt) {
+          totalRowCnt -> sizeInBytes.toInt
+        } else {
+          rowBatchSize -> (rowBatchSize.toDouble / totalRowCnt * sizeInBytes).toInt
+        }
+        if (batchCharSize >= batchRowSize) {
+          logInfo(s"[$taskID] Initialize StringColBuffer(total byteSize $sizeInBytes) " +
+            s"${f.name} with $batchRowSize rows and $batchCharSize bytes")
+          new RapidsWritableColumnVector(batchRowSize, f.dataType, Optional.of(batchCharSize))
+        } else {
+          logInfo(s"[$taskID] can NOT initialize StringColBuffer(total byteSize $sizeInBytes) " +
+            s"${f.name}  $batchRowSize rows > $batchCharSize bytes")
+          new RapidsWritableColumnVector(batchRowSize, f.dataType)
+        }
+      case f: StructField =>
+        new RapidsWritableColumnVector(rowBatchSize min totalRowCnt, f.dataType)
     }
   }
 

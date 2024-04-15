@@ -1,12 +1,11 @@
 /*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Copyright (c) 2024, NVIDIA CORPORATION.
  *
- *    http://www.apache.org/licenses/LICENSE-2.0
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.spark.sql.execution.vectorized.rapids;
 
 import java.math.BigDecimal;
@@ -921,22 +921,29 @@ public abstract class WritableColumnVector extends ColumnVector {
 	 * type.
 	 */
 	protected WritableColumnVector(int capacity, DataType dataType) {
+		this(capacity, dataType, Optional.empty());
+	}
+
+	protected WritableColumnVector(int capacity, DataType dataType, Optional<Integer> charCapacity) {
 		super(dataType);
 		this.capacity = capacity;
 
 		if (isArray()) {
 			DataType childType;
-			int childCapacity = capacity;
+			int childCapacity;
 			if (type instanceof ArrayType) {
 				childType = ((ArrayType)type).elementType();
+				childCapacity = capacity;
 			} else {
 				childType = DataTypes.ByteType;
-				childCapacity *= DEFAULT_ARRAY_LENGTH;
+				// It is possible to estimate the capacity of ByteVector for non-nested StringColumn.
+				// Therefore, a specific optional argument is added to carry the estimated value.
+				childCapacity = charCapacity.orElse(capacity * DEFAULT_ARRAY_LENGTH);
 			}
 			this.childColumns = new WritableColumnVector[1];
 			this.childColumns[0] = reserveNewColumn(childCapacity, childType);
 		} else if (type instanceof StructType) {
-			StructType st = (StructType)type;
+			StructType st = (StructType) type;
 			this.childColumns = new WritableColumnVector[st.fields().length];
 			for (int i = 0; i < childColumns.length; ++i) {
 				this.childColumns[i] = reserveNewColumn(capacity, st.fields()[i].dataType());

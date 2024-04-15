@@ -18,7 +18,7 @@ package org.apache.spark.sql.execution.datasources.parquet.rapids;
 
 import org.apache.parquet.column.Dictionary;
 
-import org.apache.spark.sql.execution.vectorized.rapids.HostWritableColumnVector;
+import org.apache.spark.sql.execution.vectorized.rapids.RapidsWritableColumnVector;
 import org.apache.spark.sql.execution.vectorized.rapids.WritableColumnVector;
 
 public abstract class ParquetVectorUpdater {
@@ -71,7 +71,7 @@ public abstract class ParquetVectorUpdater {
 			WritableColumnVector dictionaryIds,
 			Dictionary dictionary) {
 
-		HostWritableColumnVector cv = (HostWritableColumnVector) values;
+		RapidsWritableColumnVector cv = (RapidsWritableColumnVector) values;
 
 		if (!cv.hasNullMask()) {
 			for (int i = offset; i < offset + total; i++) {

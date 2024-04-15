@@ -30,8 +30,7 @@ import org.apache.spark.sql.catalyst.util.RebaseDateTime;
 import org.apache.spark.sql.execution.datasources.DataSourceUtils;
 import org.apache.spark.sql.execution.datasources.SchemaColumnConvertNotSupportedException;
 import org.apache.spark.sql.execution.datasources.parquet.ParquetRowConverter;
-import org.apache.spark.sql.execution.vectorized.rapids.HostWritableColumnVector;
-import org.apache.spark.sql.execution.vectorized.rapids.ParquetHelperVector;
+import org.apache.spark.sql.execution.vectorized.rapids.RapidsWritableColumnVector;
 import org.apache.spark.sql.execution.vectorized.rapids.WritableColumnVector;
 import org.apache.spark.sql.types.*;
 
@@ -796,31 +795,11 @@ public class ParquetVectorUpdaterFactory {
 				WritableColumnVector values,
 				WritableColumnVector dictionaryIds,
 				Dictionary dictionary) {
-			HostWritableColumnVector cv = (HostWritableColumnVector) values;
+			RapidsWritableColumnVector cv = (RapidsWritableColumnVector) values;
 			OffHeapBinaryDictionary offHeapDict = (OffHeapBinaryDictionary) dictionary;
 			int[] dctOff = offHeapDict.getOffsets();
 			int id = dictionaryIds.getDictId(offset);
 			cv.putBytesUnsafely(offset, offHeapDict.getData(), dctOff[id], dctOff[id + 1] - dctOff[id]);
-		}
-
-		@Override
-		public void decodeDictionaryIds(
-				int total,
-				int offset,
-				WritableColumnVector values,
-				WritableColumnVector dictionaryIds,
-				Dictionary dictionary) {
-			super.decodeDictionaryIds(total, offset, values, dictionaryIds, dictionary);
-			/*
-			HostWritableColumnVector cv = (HostWritableColumnVector) values;
-			OffHeapBinaryDictionary offHeapDict = (OffHeapBinaryDictionary) dictionary;
-
-			cv.decodeBinaryDictAndAppendData(
-					total, offset,
-					offHeapDict.getOffsets(),
-					offHeapDict.getData(),
-					((ParquetHelperVector) dictionaryIds).getRawBuffer());
-			 */
 		}
 	}
 

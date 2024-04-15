@@ -27,7 +27,7 @@ import com.nvidia.spark.rapids.GpuColumnVector;
 import org.apache.spark.sql.types.*;
 import org.apache.spark.unsafe.types.UTF8String;
 
-public class HostWritableColumnVector extends WritableColumnVector {
+public class RapidsWritableColumnVector extends WritableColumnVector {
 
 	private HostMemoryBuffer data = null;
 	private HostMemoryBuffer valids = null;
@@ -43,8 +43,12 @@ public class HostWritableColumnVector extends WritableColumnVector {
 	private int rowGroupIndex = 0;
 	private int rowGroupArrayIndex = 0;
 
-	public HostWritableColumnVector(int capacity, DataType type) {
-		super(capacity, type);
+	public RapidsWritableColumnVector(int capacity, DataType type) {
+		this(capacity, type, Optional.empty());
+	}
+
+	public RapidsWritableColumnVector(int capacity, DataType type, Optional<Integer> charCapacity) {
+		super(capacity, type, charCapacity);
 		this.capacity = 0;
 		resetAllBuffers(capacity, false);
 	}
@@ -81,8 +85,8 @@ public class HostWritableColumnVector extends WritableColumnVector {
 			}
 			offsetBuffer = charOffsets;
 			charOffsets = null;
-			dataBuffer = ((HostWritableColumnVector)childColumns[0]).data;
-			((HostWritableColumnVector)childColumns[0]).data = null;
+			dataBuffer = ((RapidsWritableColumnVector)childColumns[0]).data;
+			((RapidsWritableColumnVector)childColumns[0]).data = null;
 			sizeCounter[0] += offsetBuffer.getLength();
 			sizeCounter[0] += dataBuffer.getLength();
 		} else if (type instanceof StructType) {
@@ -105,7 +109,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		List<HostColumnVectorCore> children = new ArrayList<>();
 		if (childColumns != null && !(type instanceof StringType)) {
 			for (WritableColumnVector ch : childColumns) {
-				children.add(((HostWritableColumnVector) ch).buildImpl(false, sizeCounter));
+				children.add(((RapidsWritableColumnVector) ch).buildImpl(false, sizeCounter));
 			}
 		}
 
@@ -194,7 +198,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 				newCapacity *= DEFAULT_ARRAY_LENGTH;
 			}
 			for (WritableColumnVector ch : childColumns) {
-				((HostWritableColumnVector) ch).reallocate(newCapacity);
+				((RapidsWritableColumnVector) ch).reallocate(newCapacity);
 			}
 		}
 	}
@@ -484,7 +488,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		rowGroupIndex++;
 		rowId += rowGroupOffset;
 
-		HostWritableColumnVector chars = (HostWritableColumnVector) childColumns[0];
+		RapidsWritableColumnVector chars = (RapidsWritableColumnVector) childColumns[0];
 		int globalOffset = chars.elementsAppended + rowGroupStringOffset;
 
 		chars.reserve(chars.elementsAppended + length);
@@ -515,87 +519,6 @@ public class HostWritableColumnVector extends WritableColumnVector {
 		}
 		charOffsets.setInt((rowId + 1) * 4L, globalOffset + length);
 		lastCharRowId = rowId;
-	}
-
-	public void decodeBinaryDictAndAppendData(int numRows,
-																						int rowOffset,
-																						int[] dictOffsets,
-																						HostMemoryBuffer dictData,
-																						HostMemoryBuffer dictIndices) {
-
-		HostWritableColumnVector chars = (HostWritableColumnVector) childColumns[0];
-		int globalStringOffset = chars.elementsAppended + rowGroupStringOffset;
-		int globalRowOffset = rowOffset + rowGroupOffset;
-
-		for (int i = lastCharRowId + 1; i < globalRowOffset; ++i) {
-			charOffsets.setInt((i + 1) * 4L, globalStringOffset);
-		}
-
-		/*
-		  Decode absolute positions to the Dictionary from DictionaryIndices. Meanwhile, accumulate charOffsets.
-		 */
-		int[] decodedOffsets = new int[numRows];
-		int[] decodedLengths = new int[numRows];
-		int charCount = 0;
-
-		if (valids == null) {
-			for (int i = 0; i < numRows; i++) {
-				int id = dictIndices.getInt((rowOffset + i) * 4L);
-				decodedOffsets[i] = dictOffsets[id];
-				decodedLengths[i] = dictOffsets[id + 1] - dictOffsets[id];
-				charCount += decodedLengths[i];
-				charOffsets.setInt((globalRowOffset + i + 1) * 4L, globalStringOffset + charCount);
-			}
-		} else {
-			for (int i = 0; i < numRows; i++) {
-				if (valids.getByte(globalRowOffset + i) == 1) {
-					charOffsets.setInt((globalRowOffset + i + 1) * 4L, globalStringOffset + charCount);
-					continue;
-				}
-				int id = dictIndices.getInt((rowOffset + i) * 4L);
-				decodedOffsets[i] = dictOffsets[id];
-				decodedLengths[i] = dictOffsets[id + 1] - dictOffsets[id];
-				charCount += decodedLengths[i];
-				charOffsets.setInt((globalRowOffset + i + 1) * 4L, globalStringOffset + charCount);
-			}
-		}
-
-		rowGroupIndex += numRows;
-		lastCharRowId = rowOffset + numRows - 1;
-
-		/*
-			Gather char data to HostColumnVector builder
-	 	 */
-		chars.reserve(chars.elementsAppended + charCount);
-		int charsDstOffset = chars.elementsAppended + chars.rowGroupOffset;
-
-		for (int i = 0; i < numRows; i++) {
-			if (decodedLengths[i] == 0) {
-				continue;
-			}
-			int curOffset = decodedOffsets[i];
-			int curLength = decodedLengths[i];
-			if (curLength < 8) {
-				for (int j = curOffset; j < curOffset + curLength; j++) {
-					chars.data.setByte(charsDstOffset++, dictData.getByte(j));
-				}
-			}/* else if (curLength <= 64) {
-				int position = curOffset;
-				for (; position < (curOffset + curLength) >> 3 << 3; position += 8) {
-					chars.data.setLong(charsDstOffset, dictData.getLong(position));
-					charsDstOffset += 8;
-				}
-				for (; position < curOffset + curLength; position++) {
-					chars.data.setByte(charsDstOffset++, dictData.getByte(position));
-				}
-			}*/ else {
-				chars.data.copyFromHostBuffer(charsDstOffset, dictData, curOffset, curLength);
-				charsDstOffset += curLength;
-			}
-		}
-
-		chars.rowGroupIndex += charCount;
-		chars.elementsAppended += charCount;
 	}
 
 	public void commitStringAppend(int rowId, int prevOffset, int curLength) {
@@ -666,7 +589,7 @@ public class HostWritableColumnVector extends WritableColumnVector {
 
 	@Override
 	protected WritableColumnVector reserveNewColumn(int capacity, DataType type) {
-		return new HostWritableColumnVector(capacity, type);
+		return new RapidsWritableColumnVector(capacity, type);
 	}
 
 	@Override

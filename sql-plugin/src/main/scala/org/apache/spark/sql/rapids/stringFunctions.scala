@@ -26,7 +26,7 @@ import ai.rapids.cudf.{BinaryOp, BinaryOperable, CaptureGroups, ColumnVector, Co
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm._
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
-import com.nvidia.spark.rapids.jni.CastStrings
+import com.nvidia.spark.rapids.jni.{CastStrings, StringDigitsPattern}
 import com.nvidia.spark.rapids.shims.{ShimExpression, SparkShimImpl}
 
 import org.apache.spark.sql.catalyst.expressions._
@@ -1059,6 +1059,7 @@ object RegexprPart {
   case object Start extends RegexprPart // ^
   case object End extends RegexprPart   // $
   case object Wildcard extends RegexprPart  // .* or (.*)
+  case class Digits(from: Int, to: Int) extends RegexprPart  // [0-9]{a, b}
   case class Fixstring(name: String) extends RegexprPart // normal string without special characters
   case class Regexpr(value: String) extends RegexprPart  // other strings
 }
@@ -1095,6 +1096,10 @@ class GpuRLikeMeta(
           Wildcard :: parseRegexToParts(s.substring(4))
         case s if s.endsWith("(.*)") => 
           parseRegexToParts(s.substring(0, s.length - 4)) :+ Wildcard
+        case s if s.endsWith("([0-9]{5})") => 
+          parseRegexToParts(s.substring(0, s.length - 10)) :+ Digits(5, 5)
+        case s if s.endsWith("[0-9]{4,}") => 
+          parseRegexToParts(s.substring(0, s.length - 9)) :+ Digits(4, -1)
         case s if s.startsWith("(") && s.endsWith(")") => 
           parseRegexToParts(s.substring(1, s.length - 1))
         case s if isSimplePattern(s) => 
@@ -1120,6 +1125,16 @@ class GpuRLikeMeta(
         case Fixstring(s) :: List(End) => {
           GpuEndsWith(lhs, GpuLiteral(s, StringType))
         }
+        case Digits(from, _) :: rest 
+            if rest == List() || rest.forall(_ == Wildcard) => {
+          println("!!!GpuStringDigits1")
+          GpuStringDigits(lhs, GpuLiteral("", StringType), from)
+        } 
+        case Fixstring(s) :: Digits(from, _) :: rest 
+            if rest == List() || rest.forall(_ == Wildcard) => {
+          println("!!!GpuStringDigits2")
+          GpuStringDigits(lhs, GpuLiteral(s, StringType), from)
+        } 
         case Fixstring(s) :: rest
             if rest == List() || rest.forall(_ == Wildcard) => {
           GpuContains(lhs, GpuLiteral(s, StringType))
@@ -1164,6 +1179,24 @@ class GpuRLikeMeta(
         GpuRLike(lhs, rhs, patternStr)
       }
     }
+}
+
+case class GpuStringDigits(left: Expression, right: Expression, from: Int)
+  extends GpuBinaryExpressionArgsAnyScalar with ImplicitCastInputTypes with NullIntolerant {
+
+  override def dataType: DataType = BooleanType
+
+  override def inputTypes: Seq[AbstractDataType] = Seq(StringType, StringType)
+
+  override def doColumnar(lhs: GpuColumnVector, rhs: GpuScalar): ColumnVector = {
+    StringDigitsPattern.stringDigitsPattern(lhs.getBase, rhs.getBase, from)
+  }
+
+  override def doColumnar(numRows: Int, lhs: GpuScalar, rhs: GpuScalar): ColumnVector = {
+    withResource(GpuColumnVector.from(lhs, numRows, left.dataType)) { expandedLhs =>
+      doColumnar(expandedLhs, rhs)
+    }
+  }
 }
 
 case class GpuRLike(left: Expression, right: Expression, pattern: String)

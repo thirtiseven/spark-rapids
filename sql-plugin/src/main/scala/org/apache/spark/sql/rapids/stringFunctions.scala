@@ -1127,12 +1127,12 @@ class GpuRLikeMeta(
         }
         case Digits(from, _) :: rest 
             if rest == List() || rest.forall(_ == Wildcard) => {
-          println("!!!GpuStringDigits1")
+          println(s"!!!GpuStringDigits1: $from")
           GpuStringDigits(lhs, GpuLiteral("", StringType), from)
         } 
         case Fixstring(s) :: Digits(from, _) :: rest 
             if rest == List() || rest.forall(_ == Wildcard) => {
-          println("!!!GpuStringDigits2")
+          println(s"!!!GpuStringDigits2: $s, $from")
           GpuStringDigits(lhs, GpuLiteral(s, StringType), from)
         } 
         case Fixstring(s) :: rest

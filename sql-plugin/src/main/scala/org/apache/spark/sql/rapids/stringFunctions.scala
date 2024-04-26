@@ -1127,14 +1127,42 @@ class GpuRLikeMeta(
         }
         case Digits(from, _) :: rest 
             if rest == List() || rest.forall(_ == Wildcard) => {
-          println(s"!!!GpuStringDigits1: $from")
+          // println(s"!!!GpuStringDigits1: $from")
           GpuStringDigits(lhs, GpuLiteral("", StringType), from)
         } 
         case Fixstring(s) :: Digits(from, _) :: rest 
             if rest == List() || rest.forall(_ == Wildcard) => {
-          println(s"!!!GpuStringDigits2: $s, $from")
+          // println(s"!!!GpuStringDigits2: $s, $from")
           GpuStringDigits(lhs, GpuLiteral(s, StringType), from)
         } 
+        case Fixstring(s) :: rest
+            if rest == List() || rest.forall(_ == Wildcard) => {
+          GpuContains(lhs, GpuLiteral(s, StringType))
+        } 
+        case _ => {
+          val patternStr = pattern.getOrElse(throw new IllegalStateException(
+            "Expression has not been tagged with cuDF regex pattern"))
+          GpuRLike(lhs, rhs, patternStr)
+        }
+      }
+    }
+
+    def optimizeSimplePatternLegancy(rhs: Expression, lhs: Expression, parts: List[RegexprPart]): 
+        GpuExpression = {
+      parts match {
+        case Wildcard :: rest => {
+          optimizeSimplePattern(rhs, lhs, rest)
+        }
+        case Start :: Wildcard :: List(End) => {
+          GpuEqualTo(lhs, rhs)
+        }
+        case Start :: Fixstring(s) :: rest 
+            if rest.forall(_ == Wildcard) || rest == List() => {
+          GpuStartsWith(lhs, GpuLiteral(s, StringType))
+        }
+        case Fixstring(s) :: List(End) => {
+          GpuEndsWith(lhs, GpuLiteral(s, StringType))
+        }
         case Fixstring(s) :: rest
             if rest == List() || rest.forall(_ == Wildcard) => {
           GpuContains(lhs, GpuLiteral(s, StringType))
@@ -1168,12 +1196,20 @@ class GpuRLikeMeta(
     }
 
     override def convertToGpu(lhs: Expression, rhs: Expression): GpuExpression = {
-      if (conf.isRlikeRegexRewriteEnabled) {
+      if (conf.isRlikeRegexRewriteEnabled == "new") {
+        // println(s"!!!GpuRLike: ${conf.isRlikeRegexRewriteEnabled}")
         // if the pattern can be converted to a startswith or endswith pattern, we can use
         // GpuStartsWith, GpuEndsWith or GpuContains instead to get better performance
         val parts = parseRegexToParts(originalPattern)
         optimizeSimplePattern(rhs, lhs, parts)
+      } else if (conf.isRlikeRegexRewriteEnabled == "legacy") {
+        // println(s"!!!GpuRLike: ${conf.isRlikeRegexRewriteEnabled}")
+        // if the pattern can be converted to a startswith or endswith pattern, we can use
+        // GpuStartsWith, GpuEndsWith or GpuContains instead to get better performance
+        val parts = parseRegexToParts(originalPattern)
+        optimizeSimplePatternLegancy(rhs, lhs, parts)
       } else {
+        // println(s"!!!GpuRLike: ${conf.isRlikeRegexRewriteEnabled}")
         val patternStr = pattern.getOrElse(throw new IllegalStateException(
             "Expression has not been tagged with cuDF regex pattern"))
         GpuRLike(lhs, rhs, patternStr)

@@ -60,19 +60,19 @@ case class AsyncBatchResult(data: Array[HostColumnVector],
 
 class AsyncParquetReaderError(ex: Throwable) extends RuntimeException(ex)
 
-class AsyncParquetReader(
-    conf: Configuration,
-    tgtBatchSize: Int,
-    fileBuffer: HostMemoryBuffer,
-    offset: Long,
-    len: Long,
-    metrics: Map[String, GpuMetric],
-    dateRebaseMode: DateTimeRebaseMode,
-    timestampRebaseMode: DateTimeRebaseMode,
-    clippedSchema: MessageType,
-    slotAcquired: Boolean,
-    enableDictLateMat: Boolean,
-    asynchronous: Boolean)
+class AsyncParquetReader(conf: Configuration,
+                         tgtBatchSize: Int,
+                         fileBuffer: HostMemoryBuffer,
+                         offset: Long,
+                         len: Long,
+                         metrics: Map[String, GpuMetric],
+                         dateRebaseMode: DateTimeRebaseMode,
+                         timestampRebaseMode: DateTimeRebaseMode,
+                         clippedSchema: MessageType,
+                         slotAcquired: Boolean,
+                         enableDictLateMat: Boolean,
+                         asynchronous: Boolean,
+                         directBuffering: Boolean)
   extends Iterator[AsyncBatchResult] with AutoCloseable with Logging {
 
   private type Element = Either[AsyncBatchResult, Throwable]
@@ -94,13 +94,24 @@ class AsyncParquetReader(
   private var currentGroup: PageReadStore = _
 
   private val pageReader: ParquetFileReader = {
-    val options = HadoopReadOptions.builder(conf)
-      .withRange(offset, offset + len)
-      .withCodecFactory(new ParquetCodecFactory(conf, 0))
-      .withAllocator(new DirectByteBufferAllocator)
-      .build()
-    val bufferFile = new HMBInputFile(fileBuffer, length = Some(offset + len))
-    val reader = new ParquetFileReader(bufferFile, options)
+    val reader = if (!directBuffering) {
+      val options = HadoopReadOptions.builder(conf)
+        .withRange(offset, offset + len)
+        .withAllocator(new DirectByteBufferAllocator)
+        .withCodecFactory(new ParquetHeapCodecFactory(conf, 0))
+        .build()
+      val bufferFile = new HMBInputFile(fileBuffer, length = Some(offset + len))
+      new ParquetFileReader(bufferFile, options)
+    } else {
+      val options = HadoopReadOptions.builder(conf)
+        .withRange(offset, offset + len)
+        .withAllocator(new DirectByteBufferAllocator)
+        .withCodecFactory(new ParquetDirectCodecFactory(conf, 0))
+        .build()
+      val bufferFile = new HMBInputFile(fileBuffer, length = Some(offset + len))
+      new ParquetFileReader(bufferFile, options)
+    }
+
     // The fileSchema here has already been clipped
     reader.setRequestedSchema(clippedSchema)
     reader
@@ -578,13 +589,14 @@ object AsyncParquetReader {
             readDataSchema: StructType,
             slotAcquired: Boolean,
             enableDictLateMat: Boolean,
-            asynchronous: Boolean): AsyncParquetReader = {
+            asynchronous: Boolean,
+            directBuffering: Boolean): AsyncParquetReader = {
     new AsyncParquetReader(conf,
       tgtBatchSize, fileBuffer, offset, len,
       metrics,
       dateRebaseMode, timestampRebaseMode,
       clippedSchema,
-      slotAcquired, enableDictLateMat, asynchronous)
+      slotAcquired, enableDictLateMat, asynchronous, directBuffering)
   }
 }
 
@@ -735,4 +747,5 @@ case class HybridParquetOpts(mode: String,
                              batchSizeBytes: Long,
                              pollInterval: Int,
                              enableDictLateMat: Boolean,
-                             async: Boolean)
+                             async: Boolean,
+                             unsafeDecompression: Boolean)

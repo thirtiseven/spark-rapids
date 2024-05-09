@@ -34,9 +34,9 @@ import org.apache.parquet.hadoop.metadata.CompressionCodecName;
  * workaround for memory issues encountered when reading from zstd-compressed files. For
  * details, see <a href="https://issues.apache.org/jira/browse/PARQUET-2160">PARQUET-2160</a>
  */
-public class ParquetCodecFactory extends CodecFactory {
+public class ParquetHeapCodecFactory extends CodecFactory {
 
-	public ParquetCodecFactory(Configuration configuration, int pageSize) {
+	public ParquetHeapCodecFactory(Configuration configuration, int pageSize) {
 		super(configuration, pageSize);
 	}
 

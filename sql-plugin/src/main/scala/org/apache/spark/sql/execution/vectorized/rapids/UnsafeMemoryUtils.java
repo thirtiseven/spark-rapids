@@ -16,20 +16,34 @@
 
 package org.apache.spark.sql.execution.vectorized.rapids;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.nio.Buffer;
+import java.nio.ByteBuffer;
 
 public class UnsafeMemoryUtils {
 
-	static Method copyMemoryDirectly;
+	static Method copyDirectMemory;
+	static Method freeDirectMemory;
+	static Field getDirectAddress;
 
 	static {
 		try {
 			Class<?> clz = Class.forName("ai.rapids.cudf.UnsafeMemoryAccessor");
-			copyMemoryDirectly = clz.getMethod("copyMemory",
+			copyDirectMemory = clz.getMethod("copyMemory",
 					Object.class, long.class, Object.class, long.class, long.class);
-			copyMemoryDirectly.setAccessible(true);
+			copyDirectMemory.setAccessible(true);
+			freeDirectMemory = clz.getMethod("free", long.class);
+			freeDirectMemory.setAccessible(true);
 		} catch (ClassNotFoundException | NoSuchMethodException e) {
+			throw new RuntimeException(e);
+		}
+
+		try {
+			getDirectAddress = Buffer.class.getDeclaredField("address");
+			getDirectAddress.setAccessible(true);
+		} catch (NoSuchFieldException e) {
 			throw new RuntimeException(e);
 		}
 	}
@@ -41,13 +55,34 @@ public class UnsafeMemoryUtils {
 	public static void copyMemory(Object src, long srcOffset, Object dst, long dstOffset,
 																long length) {
 		try {
-			copyMemoryDirectly.invoke(null,
+			copyDirectMemory.invoke(null,
 					src,
 					srcOffset,
 					dst,
 					dstOffset,
 					length);
 		} catch (IllegalAccessException | InvocationTargetException e) {
+			throw new RuntimeException(e);
+		}
+	}
+
+	/**
+	 * The reflection of `ai.rapids.cudf.UnsafeMemoryAccessor.free`
+	 */
+	public static void freeMemory(long address) {
+		try {
+			freeDirectMemory.invoke(null, address);
+		} catch (IllegalAccessException | InvocationTargetException e) {
+			throw new RuntimeException(e);
+		}
+	}
+
+	public static void freeDirectByteBuffer(ByteBuffer bb) {
+		assert bb.isDirect();
+		try {
+			long address = (long) getDirectAddress.get(bb);
+			freeMemory(address);
+		} catch (IllegalAccessException e) {
 			throw new RuntimeException(e);
 		}
 	}

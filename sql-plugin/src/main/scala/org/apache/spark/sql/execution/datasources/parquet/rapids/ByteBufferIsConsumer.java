@@ -71,7 +71,8 @@ public abstract class ByteBufferIsConsumer {
 	public static ByteBufferIsConsumer create(ByteBufferInputStream bis) {
 		List<ByteBuffer> buffers = bis.remainingBuffers();
 		if (buffers.isEmpty()) {
-			throw new IllegalArgumentException("Got empty ByteBufferInputStream");
+			System.err.println("Got empty ByteBufferInputStream");
+			return new EmptyBufferIsConsumer();
 		}
 		if (buffers.size() > 1) {
 			System.err.printf("create a MultiByteBuffersConsumer with %d buffers\n", buffers.size());
@@ -82,5 +83,4 @@ public abstract class ByteBufferIsConsumer {
 		}
 		return new DirectByteBufferIsConsumer(buffers.iterator());
 	}
-
 }

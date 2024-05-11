@@ -1545,26 +1545,32 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .stringConf
     .createWithDefault("GPU_ONLY")
 
-  val PARQUET_HOST_SCAN_PARALLELISM = conf("spark.rapids.sql.parquet.scan.hostParallelism")
+  val PARQUET_CPU_SCAN_PARALLELISM = conf("spark.rapids.sql.parquet.scan.hostParallelism")
     .doc("The max concurrent capacity for host parquet scan(decode) tasks")
     .internal()
     .integerConf
     .createWithDefault(0)
 
-  val PARQUET_HOST_SCAN_BATCH_SIZE_BYTES = conf("spark.rapids.sql.parquet.scan.hostBatchSizeBytes")
+  val PARQUET_CPU_SCAN_BATCH_SIZE_BYTES = conf("spark.rapids.sql.parquet.scan.hostBatchSizeBytes")
     .doc("Similar to spark.rapids.sql.batchSizeBytes, but it is only for decode tasks run on CPUs")
     .internal()
     .integerConf
     .createWithDefault(1024 * 1024 * 128)
 
-  val PARQUET_HOST_SCAN_ASYNC = conf("spark.rapids.sql.parquet.scan.async")
+  val PARQUET_CPU_SCAN_ASYNC = conf("spark.rapids.sql.parquet.scan.async")
     .doc("Whether run host parquet decode tasks asynchronously or not")
     .internal()
     .booleanConf
-    .createWithDefault(false)
+    .createWithDefault(true)
 
-  val PARQUET_SCAN_DICT_LATE_MAT = conf("spark.rapids.sql.parquet.scan.enableDictLateMat")
+  val PARQUET_CPU_SCAN_DICT_LATE_MAT = conf("spark.rapids.sql.parquet.scan.enableDictLateMat")
     .doc("Whether pushing down binary dicts onto GPU and materializing via GPU or not")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
+  val PARQUET_CPU_SCAN_UNSAFE_DECOMP = conf("spark.rapids.sql.parquet.scan.unsafeDecompress")
+    .doc("Whether using UnsafeDecompressor instead of the default one of parquet-hadoop or not")
     .internal()
     .booleanConf
     .createWithDefault(false)
@@ -2630,13 +2636,15 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val parquetScanHybridMode: String = get(PARQUET_HYBRID_SCAN_MODE)
 
-  lazy val parquetScanHostParallelism: Int = get(PARQUET_HOST_SCAN_PARALLELISM)
+  lazy val parquetScanHostParallelism: Int = get(PARQUET_CPU_SCAN_PARALLELISM)
 
-  lazy val parquetScanHostBatchSizeBytes: Int = get(PARQUET_HOST_SCAN_BATCH_SIZE_BYTES)
+  lazy val parquetScanHostBatchSizeBytes: Int = get(PARQUET_CPU_SCAN_BATCH_SIZE_BYTES)
 
-  lazy val parquetScanHostAsync: Boolean = get(PARQUET_HOST_SCAN_ASYNC)
+  lazy val parquetScanHostAsync: Boolean = get(PARQUET_CPU_SCAN_ASYNC)
 
-  lazy val parquetScanEnableDictLateMat: Boolean = get(PARQUET_SCAN_DICT_LATE_MAT)
+  lazy val parquetScanEnableDictLateMat: Boolean = get(PARQUET_CPU_SCAN_DICT_LATE_MAT)
+
+  lazy val parquetScanUnsafeDecompression: Boolean = get(PARQUET_CPU_SCAN_UNSAFE_DECOMP)
 
   lazy val orcDebugDumpPrefix: Option[String] = get(ORC_DEBUG_DUMP_PREFIX)
 

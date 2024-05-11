@@ -21,7 +21,6 @@ import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.util.Iterator;
 
-import org.apache.parquet.bytes.ByteBufferInputStream;
 import org.apache.parquet.io.api.Binary;
 import org.apache.spark.sql.execution.vectorized.rapids.RapidsWritableColumnVector;
 import org.apache.spark.sql.execution.vectorized.rapids.UnsafeMemoryUtils;
@@ -47,6 +46,7 @@ public class DirectByteBufferIsConsumer extends ByteBufferIsConsumer {
 	}
 
 	protected void pointToNextBuffer() {
+		// Close current buffer manually before pointing to next (since it is DirectBuffer)
 		super.pointToNextBuffer();
 		assert current.isDirect();
 		try {
@@ -109,6 +109,9 @@ public class DirectByteBufferIsConsumer extends ByteBufferIsConsumer {
 		for (int i = 0; i < total; ++i) {
 			if (!current.hasRemaining()) pointToNextBuffer();
 
+			if (current.remaining() < 4) {
+				throw new AssertionError("DirectBuffer remaining < 4 bytes(" + current.remaining() + ")");
+			}
 			int curLength = current.getInt();
 			int prevOffset = charVector.getElementsAppended();
 
@@ -235,5 +238,4 @@ public class DirectByteBufferIsConsumer extends ByteBufferIsConsumer {
 
 		return Binary.fromConstantByteArray(target);
 	}
-
 }

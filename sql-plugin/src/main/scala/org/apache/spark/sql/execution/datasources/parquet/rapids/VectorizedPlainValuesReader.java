@@ -16,8 +16,6 @@
 
 package org.apache.spark.sql.execution.datasources.parquet.rapids;
 
-import java.io.IOException;
-
 import org.apache.commons.lang3.NotImplementedException;
 import org.apache.parquet.bytes.ByteBufferInputStream;
 import org.apache.parquet.column.values.ValuesReader;

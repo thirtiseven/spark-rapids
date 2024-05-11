@@ -1140,7 +1140,8 @@ case class GpuParquetMultiFilePartitionReaderFactory(
     rapidsConf.parquetScanHostBatchSizeBytes,
     3,
     rapidsConf.parquetScanEnableDictLateMat,
-    rapidsConf.parquetScanHostAsync)
+    rapidsConf.parquetScanHostAsync,
+    rapidsConf.parquetScanUnsafeDecompression)
 
   // We can't use the coalescing files reader when InputFileName, InputFileBlockStart,
   // or InputFileBlockLength because we are combining all the files into a single buffer
@@ -2623,7 +2624,7 @@ class MultiFileCloudParquetPartitionReader(
           hostBuffer, 0, dataSize, metrics,
           dateRebaseMode, timestampRebaseMode, hasInt96Timestamps,
           clippedSchema, readDataSchema,
-          slotAcquired, opts.enableDictLateMat, opts.async)
+          slotAcquired, opts.enableDictLateMat, opts.async, opts.unsafeDecompression)
 
         val batchIter = HostParquetIterator(asyncReader, opts, colTypes, metrics)
 

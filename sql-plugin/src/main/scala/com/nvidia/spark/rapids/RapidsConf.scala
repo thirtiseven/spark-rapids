@@ -991,8 +991,8 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
   val ENABLE_RLIKE_REGEX_REWRITE = conf("spark.rapids.sql.rLikeRegexRewrite.enabled")
       .doc("Enable the optimization to rewrite rlike regex to contains in some cases.")
       .internal()
-      .stringConf
-      .createWithDefault("new")
+      .booleanConf
+      .createWithDefault(true)
 
   val ENABLE_GETJSONOBJECT_LEGACY = conf("spark.rapids.sql.getJsonObject.legacy.enabled")
       .doc("When set to true, the get_json_object function will use the legacy implementation " +
@@ -1873,6 +1873,14 @@ val SHUFFLE_COMPRESSION_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.chun
     .startupOnly()
     .bytesConf(ByteUnit.BYTE)
     .createWithDefault(64 * 1024)
+
+  val SHUFFLE_COMPRESSION_ZSTD_CHUNK_SIZE =
+    conf("spark.rapids.shuffle.compression.zstd.chunkSize")
+      .doc("A configurable chunk size to use when compressing with ZSTD.")
+      .internal()
+      .startupOnly()
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefault(64 * 1024)
 
   val SHUFFLE_MULTITHREADED_MAX_BYTES_IN_FLIGHT =
     conf("spark.rapids.shuffle.multiThreaded.maxBytesInFlight")
@@ -2795,7 +2803,7 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val isTieredProjectEnabled: Boolean = get(ENABLE_TIERED_PROJECT)
 
-  lazy val isRlikeRegexRewriteEnabled: String = get(ENABLE_RLIKE_REGEX_REWRITE)
+  lazy val isRlikeRegexRewriteEnabled: Boolean = get(ENABLE_RLIKE_REGEX_REWRITE)
 
   lazy val isLegacyGetJsonObjectEnabled: Boolean = get(ENABLE_GETJSONOBJECT_LEGACY)
 
@@ -2990,6 +2998,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val shuffleCompressionCodec: String = get(SHUFFLE_COMPRESSION_CODEC)
 
   lazy val shuffleCompressionChunkSize: Long = get(SHUFFLE_COMPRESSION_CHUNK_SIZE)
+
+  lazy val shuffleCompressionZstdChunkSize: Long = get(SHUFFLE_COMPRESSION_ZSTD_CHUNK_SIZE)
 
   lazy val shuffleCompressionMaxBatchMemory: Long = get(SHUFFLE_COMPRESSION_MAX_BATCH_MEMORY)
 

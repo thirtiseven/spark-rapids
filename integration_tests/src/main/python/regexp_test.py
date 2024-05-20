@@ -445,45 +445,25 @@ def test_regexp_like():
                 'regexp_like(a, "a[bc]d")'),
         conf=_regexp_conf)
 
-@pytest.mark.skipif(is_before_spark_320(), reason='regexp_like is synonym for RLike starting in Spark 3.2.0')
-def test_regexp_rlike_rewrite_optimization():
-    gen = mk_str_gen('[abcd]{3,6}')
+def test_rlike_rewrite_optimization():
+    gen = mk_str_gen('[ab\n]{3,6}')
     assert_gpu_and_cpu_are_equal_collect(
             lambda spark: unary_op_df(spark, gen).selectExpr(
                 'a',
-                'regexp_like(a, "(abcd)(.*)")',
-                'regexp_like(a, "abcd(.*)")',
-                'regexp_like(a, "(.*)(abcd)(.*)")',
-                'regexp_like(a, "^(abcd)(.*)")',
-                'regexp_like(a, "^abcd")',
-                'regexp_like(a, "(abcd)$")',
-                'regexp_like(a, ".*abcd$")',
-                'regexp_like(a, "^(abcd)$")',
-                'regexp_like(a, "^abcd$")',
-                'regexp_like(a, "ab(.*)cd")',
-                'regexp_like(a, "^^abcd")',
-                'regexp_like(a, "(.*)(.*)abcd")'),
-        conf=_regexp_conf)
-
-@pytest.mark.skipif(is_before_spark_320(), reason='regexp_like is synonym for RLike starting in Spark 3.2.0')
-def test_regexp_rlike_rewrite_optimization_str_dig():
-    gen = mk_str_gen('([abcd]{3,6})?[0-9]{2,5}')
-    assert_gpu_and_cpu_are_equal_collect(
-            lambda spark: unary_op_df(spark, gen).selectExpr(
-                'a',
-                'regexp_like(a, "[0-9]{4,}")',
-                'regexp_like(a, "abcd([0-9]{5})")'),
-        conf=_regexp_conf)
-    
-# [\\u4e00-\\u9fa5]+
-
-@pytest.mark.skipif(is_before_spark_320(), reason='regexp_like is synonym for RLike starting in Spark 3.2.0')
-def test_regexp_rlike_rewrite_optimization_chinese():
-    gen = mk_str_gen('[0-9]{0,2}([英伟达]{0,3})?[a-z]{0,2}')
-    assert_gpu_and_cpu_are_equal_collect(
-            lambda spark: unary_op_df(spark, gen).selectExpr(
-                'a',
-                'regexp_like(a, "[\\u4e00-\\u9fa5]+")'),
+                'rlike(a, "(abb)(.*)")',
+                'rlike(a, "abb(.*)")',
+                'rlike(a, "(.*)(abb)(.*)")',
+                'rlike(a, "^(abb)(.*)")',
+                'rlike(a, "^abb")',
+                'rlike(a, "\\\\A(abb)(.*)")',
+                'rlike(a, "\\\\Aabb")',
+                'rlike(a, "^(abb)\\\\Z")',
+                'rlike(a, "^abb$")',
+                'rlike(a, "ab(.*)cd")',
+                'rlike(a, "^^abb")',
+                'rlike(a, "(.*)(.*)abb")',
+                'rlike(a, "(.*).*abb.*(.*).*")',
+                'rlike(a, ".*^abb$")'),
         conf=_regexp_conf)
 
 def test_regexp_replace_character_set_negated():

@@ -46,7 +46,7 @@ class BatchedNvcompLZ4Compressor(maxBatchMemorySize: Long,
   override protected def compress(
       tables: Array[ContiguousTable],
       stream: Cuda.Stream): Array[CompressedTable] = {
-    val batchCompressor = new BatchedLZ4Compressor(codecConfigs.chunkSize,
+    val batchCompressor = new BatchedLZ4Compressor(codecConfigs.lz4ChunkSize,
       maxBatchMemorySize)
     val inputBuffers: Array[BaseDeviceMemoryBuffer] = tables.map { table =>
       val buffer = table.getBuffer
@@ -77,7 +77,7 @@ class BatchedNvcompLZ4Compressor(maxBatchMemorySize: Long,
 class BatchedNvcompLZ4Decompressor(maxBatchMemory: Long,
     codecConfigs: TableCompressionCodecConfig, stream: Cuda.Stream)
     extends BatchedBufferDecompressor(maxBatchMemory, stream) {
-  private val batchDecompressor = new BatchedLZ4Decompressor(codecConfigs.chunkSize)
+  private val batchDecompressor = new BatchedLZ4Decompressor(codecConfigs.lz4ChunkSize)
 
   override val codecId: Byte = CodecType.NVCOMP_LZ4
   override def decompressAsync(

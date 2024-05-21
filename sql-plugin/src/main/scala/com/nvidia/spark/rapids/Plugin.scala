@@ -427,7 +427,6 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
   var rapidsShuffleHeartbeatManager: RapidsShuffleHeartbeatManager = null
   private lazy val extraDriverPlugins =
     RapidsPluginUtils.extraPlugins.map(_.driverPlugin()).filterNot(_ == null)
-
   override def receive(msg: Any): AnyRef = {
     msg match {
       case m: FileCacheLocalityMsg =>
@@ -446,6 +445,7 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
         }
         rapidsShuffleHeartbeatManager.executorHeartbeat(id)
       case m: GpuCoreDumpMsg => GpuCoreDumpHandler.handleMsg(m)
+      case m: ProfileMsg => ProfilerOnDriver.handleMsg(m)
       case m => throw new IllegalStateException(s"Unknown message $m")
     }
   }
@@ -458,6 +458,7 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
     RapidsPluginUtils.detectMultipleJars(conf)
     RapidsPluginUtils.logPluginMode(conf)
     GpuCoreDumpHandler.driverInit(sc, conf)
+    ProfilerOnDriver.init(sc, conf)
 
     if (GpuShuffleEnv.isRapidsShuffleAvailable(conf)) {
       GpuShuffleEnv.initShuffleManager()
@@ -507,6 +508,7 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
       val sparkConf = pluginContext.conf()
       val numCores = RapidsPluginUtils.estimateCoresOnExec(sparkConf)
       val conf = new RapidsConf(extraConf.asScala.toMap)
+      ProfilerOnExecutor.init(pluginContext, conf)
 
       // Checks if the current GPU architecture is supported by the
       // spark-rapids-jni and cuDF libraries.
@@ -656,6 +658,7 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
     GpuSemaphore.shutdown()
     PythonWorkerSemaphore.shutdown()
     GpuDeviceManager.shutdown()
+    ProfilerOnExecutor.shutdown()
     Option(rapidsShuffleHeartbeatEndpoint).foreach(_.close())
     extraExecutorPlugins.foreach(_.shutdown())
     FileCache.shutdown()
@@ -692,6 +695,7 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
   override def onTaskStart(): Unit = {
     startTaskNvtx(TaskContext.get)
     extraExecutorPlugins.foreach(_.onTaskStart())
+    ProfilerOnExecutor.onTaskStart()
   }
 
   override def onTaskSucceeded(): Unit = {

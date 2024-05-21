@@ -65,6 +65,7 @@ import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, PartitionReaderFactory}
 import org.apache.spark.sql.execution.QueryExecutionException
 import org.apache.spark.sql.execution.datasources.{DataSourceUtils, PartitionedFile, PartitioningAwareFileIndex, SchemaColumnConvertNotSupportedException}
+import org.apache.spark.sql.execution.datasources.parquet.rapids.{AsyncParquetReader, HostParquetIterator, HybridParquetOpts}
 import org.apache.spark.sql.execution.datasources.v2.FileScan
 import org.apache.spark.sql.execution.datasources.v2.parquet.ParquetScan
 import org.apache.spark.sql.internal.SQLConf
@@ -436,11 +437,17 @@ class HMBSeekableInputStream(
   }
 }
 
-class HMBInputFile(buffer: HostMemoryBuffer) extends InputFile {
+class HMBInputFile(buffer: HostMemoryBuffer,
+                   offset: Option[Long] = None,
+                   length: Option[Long] = None) extends InputFile {
 
-  override def getLength: Long = buffer.getLength
+  override def getLength: Long = length.getOrElse(buffer.getLength)
 
-  override def newStream(): SeekableInputStream = new HMBSeekableInputStream(buffer, getLength)
+  override def newStream(): SeekableInputStream = {
+    val is = new HMBSeekableInputStream(buffer, getLength)
+    offset.foreach(is.seek)
+    is
+  }
 }
 
 private case class GpuParquetFileFilterHandler(
@@ -746,6 +753,13 @@ private case class GpuParquetFileFilterHandler(
         }
       } else {
         footer.getBlocks
+      }
+
+      metrics.get("filteredRowGroups").foreach { metric =>
+        metric += footer.getBlocks.size() - blocks.size()
+      }
+      metrics.get("totalRowGroups").foreach { metric =>
+        metric += footer.getBlocks.size()
       }
 
       val (clipped, clippedSchema) =
@@ -1120,6 +1134,15 @@ case class GpuParquetMultiFilePartitionReaderFactory(
   private val alluxioReplacementTaskTime =
     AlluxioCfgUtils.enabledAlluxioReplacementAlgoTaskTime(rapidsConf)
 
+  private val hybridScanOpts = HybridParquetOpts(
+    rapidsConf.parquetScanHybridMode,
+    rapidsConf.parquetScanHostParallelism,
+    rapidsConf.parquetScanHostBatchSizeBytes,
+    3,
+    rapidsConf.parquetScanEnableDictLateMat,
+    rapidsConf.parquetScanHostAsync,
+    rapidsConf.parquetScanUnsafeDecompression)
+
   // We can't use the coalescing files reader when InputFileName, InputFileBlockStart,
   // or InputFileBlockLength because we are combining all the files into a single buffer
   // and we don't know which file is associated with each row. If this changes we need to
@@ -1145,13 +1168,16 @@ case class GpuParquetMultiFilePartitionReaderFactory(
         filters, readDataSchema)
     }
     val combineConf = CombineConf(combineThresholdSize, combineWaitTime)
+    HostParquetIterator.initialize(hybridScanOpts)
+
     new MultiFileCloudParquetPartitionReader(conf, files, filterFunc, isCaseSensitive,
       debugDumpPrefix, debugDumpAlways, maxReadBatchSizeRows, maxReadBatchSizeBytes,
       targetBatchSizeBytes, maxGpuColumnSizeBytes,
       useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes,
       metrics, partitionSchema, numThreads, maxNumFileProcessed, ignoreMissingFiles,
       ignoreCorruptFiles, readUseFieldId, alluxioPathReplacementMap.getOrElse(Map.empty),
-      alluxioReplacementTaskTime, queryUsesInputFile, keepReadsInOrderFromConf, combineConf)
+      alluxioReplacementTaskTime, queryUsesInputFile, keepReadsInOrderFromConf, combineConf,
+      hybridScanOpts)
   }
 
   private def filterBlocksForCoalescingReader(
@@ -1976,11 +2002,13 @@ class MultiFileParquetPartitionReader(
   override def readBufferToTablesAndClose(dataBuffer: HostMemoryBuffer, dataSize: Long,
       clippedSchema: SchemaBase, readDataSchema: StructType,
       extraInfo: ExtraInfo): GpuDataProducer[Table] = {
-
+    // The semaphore may be already acquired during polling, but does no harm to keep this
+    // line even so. The metrics here is just for GPU_ONLY mode.
+    withResource(new NvtxWithMetrics(
+      "GPU wait time for Decode", NvtxColor.WHITE, metrics("decodeGpuWait"))) { _ =>
+      GpuSemaphore.acquireIfNecessary(TaskContext.get())
+    }
     val parseOpts = getParquetOptions(readDataSchema, clippedSchema, useFieldId)
-
-    // About to start using the GPU
-    GpuSemaphore.acquireIfNecessary(TaskContext.get())
 
     MakeParquetTableProducer(useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes,
       conf, currentTargetBatchSize, parseOpts,
@@ -2084,7 +2112,8 @@ class MultiFileCloudParquetPartitionReader(
     alluxioReplacementTaskTime: Boolean,
     queryUsesInputFile: Boolean,
     keepReadsInOrder: Boolean,
-    combineConf: CombineConf)
+    combineConf: CombineConf,
+    hybridOpts: HybridParquetOpts)
   extends MultiFileCloudPartitionReaderBase(conf, files, numThreads, maxNumFileProcessed, null,
     execMetrics, maxReadBatchSizeRows, maxReadBatchSizeBytes, ignoreCorruptFiles,
     alluxioPathReplacementMap, alluxioReplacementTaskTime, keepReadsInOrder, combineConf)
@@ -2554,13 +2583,83 @@ class MultiFileCloudParquetPartitionReader(
     }
     val colTypes = readDataSchema.fields.map(f => f.dataType)
 
-    // about to start using the GPU
-    GpuSemaphore.acquireIfNecessary(TaskContext.get())
+    // Schedule HybridParquetScan if configured
+    if (hybridOpts != null) {
+      val opts: HybridParquetOpts = hybridOpts
+
+      lazy val canReadOnHost = HostParquetIterator.schemaSupportCheck(colTypes)
+
+      val (readOnHost, slotAcquired) = opts.mode match {
+        case "CPU_ONLY" =>
+          (canReadOnHost, false)
+        case "GPU_ONLY" =>
+          (false, false)
+        case _ if opts.pollInterval > 0 && canReadOnHost =>
+          var ret: Option[Boolean] = None
+          withResource(new NvtxWithMetrics(
+            "hybridPollTime", NvtxColor.WHITE, metrics("hybridPollTime"))) { _ =>
+            var gpuWait = true
+            while (ret.isEmpty) {
+              GpuSemaphore.tryAcquire(TaskContext.get()) match {
+                case SemaphoreAcquired =>
+                  ret = Option(false)
+                case AcquireFailed(_) if gpuWait =>
+                  gpuWait = false
+                  Thread.sleep(opts.pollInterval)
+                case AcquireFailed(_) =>
+                  gpuWait = true
+                  if (HostParquetIterator.tryAcquireSlot(opts)) {
+                    ret = Option(true)
+                  }
+              }
+            }
+          }
+          (ret.get, true)
+        case _ =>
+          (false, false)
+      }
+
+      if (readOnHost) {
+        val asyncReader = AsyncParquetReader(conf, opts.batchSizeBytes.toInt,
+          hostBuffer, 0, dataSize, metrics,
+          dateRebaseMode, timestampRebaseMode, hasInt96Timestamps,
+          clippedSchema, readDataSchema,
+          slotAcquired, opts.enableDictLateMat, opts.async, opts.unsafeDecompression)
+
+        val batchIter = HostParquetIterator(asyncReader, opts, colTypes, metrics)
+
+        val iterator = if (allPartValues.isDefined) {
+          val allPartInternalRows = allPartValues.get.map(_._2)
+          val rowsPerPartition = allPartValues.get.map(_._1)
+          new GpuColumnarBatchWithPartitionValuesIterator(batchIter, allPartInternalRows,
+            rowsPerPartition, partitionSchema, maxGpuColumnSizeBytes)
+        } else {
+          // this is a bit weird, we don't have number of rows when allPartValues isn't
+          // filled in so can't use GpuColumnarBatchWithPartitionValuesIterator
+          batchIter.flatMap { batch =>
+            // we have to add partition values here for this batch, we already verified that
+            // its not different for all the blocks in this batch
+            BatchWithPartitionDataUtils.addSinglePartitionValueToBatch(batch,
+              partedFile.partitionValues, partitionSchema, maxGpuColumnSizeBytes)
+          }
+        }
+
+        return iterator
+      }
+    }
 
     RmmRapidsRetryIterator.withRetryNoSplit(hostBuffer) { _ =>
       // The MakeParquetTableProducer will close the input buffer, and that would be bad
       // because we don't want to close it until we know that we are done with it
       hostBuffer.incRefCount()
+
+      // The semaphore may be already acquired during polling, but does no harm to keep this
+      // line even so.
+      withResource(new NvtxWithMetrics(
+        "GPU wait time for Decode", NvtxColor.WHITE, metrics("decodeGpuWait"))) { _ =>
+        GpuSemaphore.acquireIfNecessary(TaskContext.get())
+      }
+
       val tableReader = MakeParquetTableProducer(useChunkedReader,
         maxChunkedReaderMemoryUsageSizeBytes,
         conf, targetBatchSizeBytes,

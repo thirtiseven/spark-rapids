@@ -3928,8 +3928,10 @@ object GpuOverrides extends Logging {
           }
         }
 
-        override def convertToGpu(): GpuPartitioning =
-          GpuHashPartitioning(childExprs.map(_.convertToGpu()), hp.numPartitions)
+        override def convertToGpu(): GpuPartitioning = {
+          GpuHashPartitioning(childExprs.map(_.convertToGpu()), hp.numPartitions,
+            conf.shuffleEnablePaddingPartition)
+        }
       }),
     part[RangePartitioning](
       "Range partitioning",

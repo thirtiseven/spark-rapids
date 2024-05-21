@@ -169,7 +169,7 @@ case class GpuStartsWith(left: Expression, right: Expression)
 
   override def toString: String = s"gpustartswith($left, $right)"
 
-  def doColumnar(lhs: GpuColumnVector, rhs: GpuScalar): ColumnVector =
+  def doColumnar(lhs: GpuColumnVector, rhs: GpuScalar): ColumnVector = 
     lhs.getBase.startsWith(rhs.getBase)
 
   override def doColumnar(numRows: Int, lhs: GpuScalar, rhs: GpuScalar): ColumnVector = {
@@ -1053,6 +1053,17 @@ object GpuRegExpUtils {
   }
 
 
+}
+
+sealed trait RegexprPart
+object RegexprPart {
+  case object Start extends RegexprPart // ^
+  case object End extends RegexprPart   // $
+  case object Wildcard extends RegexprPart  // .* or (.*)
+  case class Digits(from: Int, to: Int) extends RegexprPart  // [0-9]{a, b}
+  case object Chinese extends RegexprPart  // Chinese characters  [\u4e00-\u9fa5]+
+  case class Fixstring(name: String) extends RegexprPart // normal string without special characters
+  case class Regexpr(value: String) extends RegexprPart  // other strings
 }
 
 class GpuRLikeMeta(

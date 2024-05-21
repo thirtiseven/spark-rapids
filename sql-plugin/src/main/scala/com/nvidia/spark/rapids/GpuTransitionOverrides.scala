@@ -70,7 +70,7 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
 
   /** Adds the appropriate coalesce after a shuffle depending on the type of shuffle configured */
   private def addPostShuffleCoalesce(plan: SparkPlan): SparkPlan = {
-    if (GpuShuffleEnv.useGPUShuffle(rapidsConf)) {
+    if (GpuShuffleEnv.useGPUShuffle(rapidsConf) || GpuShuffleEnv.serializingOnGpu(rapidsConf)) {
       GpuCoalesceBatches(plan, TargetSize(rapidsConf.gpuTargetBatchSizeBytes))
     } else {
       GpuShuffleCoalesceExec(plan, rapidsConf.gpuTargetBatchSizeBytes)
@@ -360,6 +360,7 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
     case _: GpuDataSourceScanExec => true
     case _: DataSourceV2ScanExecBase => true
     case _: RDDScanExec => true // just in case an RDD was reading in data
+    case _: ExpandExec => true
     case _ => false
   }
 
@@ -519,8 +520,13 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
   private def insertShuffleCoalesce(plan: SparkPlan): SparkPlan = plan match {
     case exec: GpuShuffleExchangeExecBase =>
       // always follow a GPU shuffle with a shuffle coalesce
-      GpuShuffleCoalesceExec(exec.withNewChildren(exec.children.map(insertShuffleCoalesce)),
-        rapidsConf.gpuTargetBatchSizeBytes)
+      if (GpuShuffleEnv.serializingOnGpu(rapidsConf)) {
+        GpuCoalesceBatches(exec.withNewChildren(exec.children.map(insertShuffleCoalesce)),
+          TargetSize(rapidsConf.gpuTargetBatchSizeBytes))
+      } else {
+        GpuShuffleCoalesceExec(exec.withNewChildren(exec.children.map(insertShuffleCoalesce)),
+          rapidsConf.gpuTargetBatchSizeBytes)
+      }
     case exec => exec.withNewChildren(plan.children.map(insertShuffleCoalesce))
   }
 
@@ -775,6 +781,15 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
     }
   }
 
+  /**
+   * So far (2024-03-15) the DataWritingCommandExec in Spark always returns empty data,
+   * so the following ColumnarToRow is useless. Safe to remove it.
+   */
+  private def removeUselessColumnarToRow(plan: SparkPlan): SparkPlan = plan match {
+    case GpuColumnarToRowExec(child @ GpuDataWritingCommandExec(_, _), _) => child
+    case _ => plan
+  }
+
   override def apply(sparkPlan: SparkPlan): SparkPlan = GpuOverrideUtil.tryOverride { plan =>
     this.rapidsConf = new RapidsConf(plan.conf)
     if (rapidsConf.isSqlEnabled && rapidsConf.isSqlExecuteOnGPU) {
@@ -829,7 +844,8 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
         }
 
         insertStageLevelMetrics(updatedPlan)
-        updatedPlan
+        // TODO Add a config to support disabling this rule
+        removeUselessColumnarToRow(updatedPlan)
       }
     } else {
       plan

@@ -708,6 +708,71 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .checkValues(Set("DEBUG", "MODERATE", "ESSENTIAL"))
       .createWithDefault("MODERATE")
 
+  val PROFILE_PATH = conf("spark.rapids.profile.pathPrefix")
+    .doc("Enables profiling and specifies a URI path to use when writing profile data")
+    .internal()
+    .stringConf
+    .createOptional
+
+  val PROFILE_EXECUTORS = conf("spark.rapids.profile.executors")
+    .doc("Comma-separated list of executors IDs and hyphenated ranges of executor IDs to " +
+      "profile when profiling is enabled")
+    .internal()
+    .stringConf
+    .createWithDefault("0")
+
+  val PROFILE_TIME_RANGES_SECONDS = conf("spark.rapids.profile.timeRangesInSeconds")
+    .doc("Comma-separated list of start-end ranges of time, in seconds, since executor startup " +
+      "to start and stop profiling. For example, a value of 10-30,100-110 will have the profiler " +
+      "wait for 10 seconds after executor startup then profile for 20 seconds, then wait for " +
+      "70 seconds then profile again for the next 10 seconds")
+    .internal()
+    .stringConf
+    .createOptional
+
+  val PROFILE_JOBS = conf("spark.rapids.profile.jobs")
+    .doc("Comma-separated list of job IDs and hyphenated ranges of job IDs to " +
+      "profile when profiling is enabled")
+    .internal()
+    .stringConf
+    .createOptional
+
+  val PROFILE_STAGES = conf("spark.rapids.profile.stages")
+    .doc("Comma-separated list of stage IDs and hyphenated ranges of stage IDs to " +
+      "profile when profiling is enabled")
+    .internal()
+    .stringConf
+    .createOptional
+
+  val PROFILE_DRIVER_POLL_MILLIS = conf("spark.rapids.profile.driverPollMillis")
+    .doc("Interval in milliseconds the executors will poll for job and stage completion when " +
+      "stage-level profiling is used.")
+    .internal()
+    .integerConf
+    .createWithDefault(1000)
+
+  val PROFILE_COMPRESSION = conf("spark.rapids.profile.compression")
+    .doc("Specifies the compression codec to use when writing profile data, one of " +
+      "zstd or none")
+    .internal()
+    .stringConf
+    .transform(_.toLowerCase(java.util.Locale.ROOT))
+    .checkValues(Set("zstd", "none"))
+    .createWithDefault("zstd")
+
+  val PROFILE_FLUSH_PERIOD_MILLIS = conf("spark.rapids.profile.flushPeriodMillis")
+    .doc("Specifies the time period in milliseconds to flush profile records. " +
+      "A value <= 0 will disable time period flushing.")
+    .internal()
+    .integerConf
+    .createWithDefault(0)
+
+  val PROFILE_WRITE_BUFFER_SIZE = conf("spark.rapids.profile.writeBufferSize")
+    .doc("Buffer size to use when writing profile records.")
+    .internal()
+    .bytesConf(ByteUnit.BYTE)
+    .createWithDefault(1024 * 1024)
+
   // ENABLE/DISABLE PROCESSING
 
   val SQL_ENABLED = conf("spark.rapids.sql.enabled")
@@ -1154,6 +1219,20 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .booleanConf
     .createWithDefault(true)
 
+  val ENABLE_COALESCE_AFTER_EXPAND = conf("spark.rapids.sql.coalesceAfterExpand.enabled")
+    .doc("When set to false disables the coalesce after GPU Expand. ")
+    .internal()
+    .booleanConf
+    .createWithDefault(false)
+
+  val EXPAND_CACHING_NULL_VEC_MAX_NULL_COUNT =
+    conf("spark.rapids.sql.expandCachingNullVec.maxNulls")
+    .doc("Max number of null scalar in null vectors to cache for GPU Expand. " +
+      "If the number of null scala exceeds this value, the null vectors will not be cached." +
+      "The value has to be positive for caching to be enabled.")
+    .internal().integerConf
+    .createWithDefault(0)
+
   val ENABLE_ORC_FLOAT_TYPES_TO_STRING =
     conf("spark.rapids.sql.format.orc.floatTypesToString.enable")
     .doc("When reading an ORC file, the source data schemas(schemas of ORC file) may differ " +
@@ -1537,6 +1616,44 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .booleanConf
     .createWithDefault(false)
 
+  val PARQUET_HYBRID_SCAN_MODE = conf("spark.rapids.sql.parquet.scan.hybridMode")
+    .doc("The execution mode of hybrid parquet scan. There are 3 modes: GPU_ONLY, disable " +
+      "hybrid scan (the default mode); CPU_ONLY, only decode data via CPU; DeviceFirst, run " +
+      "decode tasks on CPUs if GPU resources are not available.")
+    .internal()
+    .stringConf
+    .createWithDefault("GPU_ONLY")
+
+  val PARQUET_CPU_SCAN_PARALLELISM = conf("spark.rapids.sql.parquet.scan.hostParallelism")
+    .doc("The max concurrent capacity for host parquet scan(decode) tasks")
+    .internal()
+    .integerConf
+    .createWithDefault(0)
+
+  val PARQUET_CPU_SCAN_BATCH_SIZE_BYTES = conf("spark.rapids.sql.parquet.scan.hostBatchSizeBytes")
+    .doc("Similar to spark.rapids.sql.batchSizeBytes, but it is only for decode tasks run on CPUs")
+    .internal()
+    .integerConf
+    .createWithDefault(1024 * 1024 * 128)
+
+  val PARQUET_CPU_SCAN_ASYNC = conf("spark.rapids.sql.parquet.scan.async")
+    .doc("Whether run host parquet decode tasks asynchronously or not")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
+  val PARQUET_CPU_SCAN_DICT_LATE_MAT = conf("spark.rapids.sql.parquet.scan.enableDictLateMat")
+    .doc("Whether pushing down binary dicts onto GPU and materializing via GPU or not")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
+  val PARQUET_CPU_SCAN_UNSAFE_DECOMP = conf("spark.rapids.sql.parquet.scan.unsafeDecompress")
+    .doc("Whether using UnsafeDecompressor instead of the default one of parquet-hadoop or not")
+    .internal()
+    .booleanConf
+    .createWithDefault(false)
+
   val ORC_DEBUG_DUMP_PREFIX = conf("spark.rapids.sql.orc.debug.dumpPrefix")
     .doc("A path prefix where ORC split file data is dumped for debugging.")
     .internal()
@@ -1750,8 +1867,8 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .stringConf
     .createWithDefault("none")
 
-val SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.lz4.chunkSize")
-    .doc("A configurable chunk size to use when compressing with LZ4.")
+val SHUFFLE_COMPRESSION_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.chunkSize")
+    .doc("A configurable chunk size to use when compressing with LZ4 or ZSTD.")
     .internal()
     .startupOnly()
     .bytesConf(ByteUnit.BYTE)
@@ -1801,6 +1918,24 @@ val SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.
         .startupOnly()
         .integerConf
         .createWithDefault(20)
+
+  val SHUFFLE_ENABLE_PADDING_PARTITION =
+    conf("spark.rapids.shuffle.paddingPartition.enabled")
+        .doc("Enable padding partition to avoid the expensive alignment of validity buffer " +
+            "during serializing nullable column vectors for shuffle write")
+        .internal()
+        .booleanConf
+        .createWithDefault(false)
+
+  val SHUFFLE_WRITER_GPU_SERIALIZING =
+    conf("spark.rapids.shuffle.serializeOnGpu.enabled")
+      .doc("When true, the batch serializing for Shuffle will run on GPU. " +
+        "It requires making sure the shuffle writer currently being used is compatible " +
+        "with this GPU serializing.")
+      .internal()
+      .startupOnly()
+      .booleanConf
+      .createWithDefault(false)
 
   // ALLUXIO CONFIGS
   val ALLUXIO_MASTER = conf("spark.rapids.alluxio.master")
@@ -2390,6 +2525,24 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val metricsLevel: String = get(METRICS_LEVEL)
 
+  lazy val profilePath: Option[String] = get(PROFILE_PATH)
+
+  lazy val profileExecutors: String = get(PROFILE_EXECUTORS)
+
+  lazy val profileTimeRangesSeconds: Option[String] = get(PROFILE_TIME_RANGES_SECONDS)
+
+  lazy val profileJobs: Option[String] = get(PROFILE_JOBS)
+
+  lazy val profileStages: Option[String] = get(PROFILE_STAGES)
+
+  lazy val profileDriverPollMillis: Int = get(PROFILE_DRIVER_POLL_MILLIS)
+
+  lazy val profileCompression: String = get(PROFILE_COMPRESSION)
+
+  lazy val profileFlushPeriodMillis: Int = get(PROFILE_FLUSH_PERIOD_MILLIS)
+
+  lazy val profileWriteBufferSize: Long = get(PROFILE_WRITE_BUFFER_SIZE)
+
   lazy val isSqlEnabled: Boolean = get(SQL_ENABLED)
 
   lazy val isSqlExecuteOnGPU: Boolean = get(SQL_MODE).equals("executeongpu")
@@ -2586,6 +2739,18 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val parquetDebugDumpAlways: Boolean = get(PARQUET_DEBUG_DUMP_ALWAYS)
 
+  lazy val parquetScanHybridMode: String = get(PARQUET_HYBRID_SCAN_MODE)
+
+  lazy val parquetScanHostParallelism: Int = get(PARQUET_CPU_SCAN_PARALLELISM)
+
+  lazy val parquetScanHostBatchSizeBytes: Int = get(PARQUET_CPU_SCAN_BATCH_SIZE_BYTES)
+
+  lazy val parquetScanHostAsync: Boolean = get(PARQUET_CPU_SCAN_ASYNC)
+
+  lazy val parquetScanEnableDictLateMat: Boolean = get(PARQUET_CPU_SCAN_DICT_LATE_MAT)
+
+  lazy val parquetScanUnsafeDecompression: Boolean = get(PARQUET_CPU_SCAN_UNSAFE_DECOMP)
+
   lazy val orcDebugDumpPrefix: Option[String] = get(ORC_DEBUG_DUMP_PREFIX)
 
   lazy val orcDebugDumpAlways: Boolean = get(ORC_DEBUG_DUMP_ALWAYS)
@@ -2643,6 +2808,10 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val isLegacyGetJsonObjectEnabled: Boolean = get(ENABLE_GETJSONOBJECT_LEGACY)
 
   lazy val isExpandPreprojectEnabled: Boolean = get(ENABLE_EXPAND_PREPROJECT)
+
+  lazy val isCoalesceAfterExpandEnabled: Boolean = get(ENABLE_COALESCE_AFTER_EXPAND)
+
+  lazy val expandCachingNullVecMaxCount: Int = get(EXPAND_CACHING_NULL_VEC_MAX_NULL_COUNT)
 
   lazy val multiThreadReadNumThreads: Int = {
     // Use the largest value set among all the options.
@@ -2828,7 +2997,7 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val shuffleCompressionCodec: String = get(SHUFFLE_COMPRESSION_CODEC)
 
-  lazy val shuffleCompressionLz4ChunkSize: Long = get(SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE)
+  lazy val shuffleCompressionChunkSize: Long = get(SHUFFLE_COMPRESSION_CHUNK_SIZE)
 
   lazy val shuffleCompressionZstdChunkSize: Long = get(SHUFFLE_COMPRESSION_ZSTD_CHUNK_SIZE)
 
@@ -2840,6 +3009,10 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val shuffleMultiThreadedWriterThreads: Int = get(SHUFFLE_MULTITHREADED_WRITER_THREADS)
 
   lazy val shuffleMultiThreadedReaderThreads: Int = get(SHUFFLE_MULTITHREADED_READER_THREADS)
+
+  lazy val isSerializingOnGpu: Boolean = get(SHUFFLE_WRITER_GPU_SERIALIZING)
+
+  lazy val shuffleEnablePaddingPartition: Boolean = get(SHUFFLE_ENABLE_PADDING_PARTITION)
 
   def isUCXShuffleManagerMode: Boolean =
     RapidsShuffleManagerMode

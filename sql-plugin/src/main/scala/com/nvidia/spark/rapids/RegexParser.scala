@@ -2046,7 +2046,8 @@ object RegexRewrite {
       Option[(String, Int, Int, Int)] = {
     val haveLiteralPrefix = isliteralString(astLs.dropRight(1))
     val endsWithRange = astLs.lastOption match {
-      case Some(RegexRepetition(
+      case Some(ast) => removeBrackets(Seq(ast)) match {
+        case Seq(RegexRepetition(
           RegexCharacterClass(false, ListBuffer(RegexCharacterRange(a,b))), 
           quantifier)) => {
         val (start, end) = (a, b) match {
@@ -2068,6 +2069,8 @@ object RegexRewrite {
         }
         // Convert start and end to code points
         Some((length, start.toInt, end.toInt))
+      }
+        case _ => None
       }
       case _ => None
     }
@@ -2128,19 +2131,23 @@ object RegexRewrite {
       case (RegexChar('^') | RegexEscaped('A')) :: ast 
           if isliteralString(stripTailingWildcards(ast)) => {
         // ^literal.* => startsWith literal
+        println("startsWith")
         RegexOptimizationType.StartsWith(RegexCharsToString(stripTailingWildcards(ast)))
       }
       case astLs => {
-        val noStartsWithAst = stripTailingWildcards(stripLeadingWildcards(astLs))
+        val noStartsWithAst = removeBrackets(stripTailingWildcards(stripLeadingWildcards(astLs)))
         val prefixRangeInfo = getPrefixRangePattern(noStartsWithAst)
         if (prefixRangeInfo.isDefined) {
           val (prefix, length, start, end) = prefixRangeInfo.get
           // (literal[a-b]{x,y}) => prefix range pattern
+          println("prefixRange" + prefix + length + start + end)
           RegexOptimizationType.PrefixRange(prefix, length, start, end)
         } else if (isliteralString(noStartsWithAst)) {
           // literal.* or (literal).* => contains literal
+          println("contains")
           RegexOptimizationType.Contains(RegexCharsToString(noStartsWithAst))
         } else {
+          println("noOptimization")
           RegexOptimizationType.NoOptimization
         }
       }

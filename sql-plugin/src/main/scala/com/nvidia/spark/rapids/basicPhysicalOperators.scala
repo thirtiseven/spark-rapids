@@ -244,6 +244,7 @@ abstract class AbstractProjectSplitIterator(iter: Iterator[ColumnarBatch],
         }
       }
     } else {
+      println("!!!AbstractProjectSplitIterator schema: " + schema.mkString(", "))
       val cb = iter.next()
       opTime.ns {
         val numSplits = closeOnExcept(cb) { cb =>
@@ -286,16 +287,19 @@ abstract class AbstractProjectSplitIterator(iter: Iterator[ColumnarBatch],
 object PreProjectSplitIterator {
   def calcMinOutputSize(cb: ColumnarBatch, boundExprs: GpuTieredProject): Long = {
     val numRows = cb.numRows()
+    println("boundExprs.outputTypes: " + boundExprs.outputTypes)
+    println("boundExprs.outputTypes: " + boundExprs.outputTypes.size)
     boundExprs.outputTypes.zipWithIndex.map {
-      case (dataType, index) =>
+      case (dataType, _) => // index
         if (GpuBatchUtils.isFixedWidth(dataType)) {
           GpuBatchUtils.minGpuMemory(dataType, true, numRows)
         } else {
-          boundExprs.getPassThroughIndex(index).map { inputIndex =>
-            cb.column(inputIndex).asInstanceOf[GpuColumnVector].getBase.getDeviceMemorySize
-          }.getOrElse {
-            GpuBatchUtils.minGpuMemory(dataType, true, numRows)
-          }
+          // java.lang.ArrayIndexOutOfBoundsException: 2 related to getPassThroughIndex
+          // boundExprs.getPassThroughIndex(index).map { inputIndex =>
+          //   cb.column(inputIndex).asInstanceOf[GpuColumnVector].getBase.getDeviceMemorySize
+          // }.getOrElse {
+          GpuBatchUtils.minGpuMemory(dataType, true, numRows)
+          // }
         }
     }.sum
   }

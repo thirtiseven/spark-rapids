@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ import ai.rapids.cudf.JCudfSerialization.HostConcatResult
 import com.nvidia.spark.rapids.{GpuColumnVectorFromBuffer, RmmRapidsRetryIterator}
 import com.nvidia.spark.rapids.Arm.withResource
 
-import org.apache.spark.sql.types.DataType
+import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 object HostConcatResultUtil {
@@ -50,6 +50,10 @@ object HostConcatResultUtil {
       // that it is acquired in the coalesce code.
       new ColumnarBatch(Array.empty, hostConcatResult.getTableHeader.getNumRows)
     } else {
+      println("!!!sparkSchema: " + sparkSchema.mkString(", "))
+      // val hardCodeSparkSchema = Array(IntegerType, StructType(Seq(
+      //   StructField("_key_value", IntegerType, nullable = true),
+      //   StructField("_key_ordering", LongType, nullable = true))).asInstanceOf[DataType])
       RmmRapidsRetryIterator.withRetryNoSplit {
         withResource(hostConcatResult.toContiguousTable) { ct =>
           GpuColumnVectorFromBuffer.from(ct, sparkSchema)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -176,7 +176,17 @@ case class GpuBoundReference(ordinal: Int, dataType: DataType, nullable: Boolean
     s"input[$ordinal, ${dataType.simpleString}, $nullable]($name#${exprId.id})"
 
   override def columnarEval(batch: ColumnarBatch): GpuColumnVector = {
-    batch.column(ordinal) match {
+    println("!!!GpuBoundReference" + toString)
+    println("!!!ordinal: " + ordinal)
+    val xx = if (ordinal >= batch.numCols()) {
+      println("!!!GpuBoundReference" + toString + "ordinal: " + ordinal + "batch.numCols(): " + batch.numCols())
+      batch.numCols() - 1
+    } else {
+      println("!!!ordinal: " + ordinal)
+      ordinal
+    }
+    println("!!!xx: " + xx + "batch.numCols(): " + batch.numCols() + "ordinal: " + ordinal)
+    batch.column(xx) match {
       case fb: GpuColumnVectorFromBuffer =>
         // When doing a project we might re-order columns or do other things that make it
         // so this no longer looks like the original contiguous buffer it came from

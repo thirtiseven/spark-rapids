@@ -2124,7 +2124,7 @@ abstract class GpuMaxMinByBase(valueExpr: Expression, orderingExpr: Expression)
   override lazy val evaluateExpression: Expression = bufferValue
 
   override lazy val preMerge: Seq[Expression] = {
-    println("!!!!!!!!preMerge")
+    // println("!!!!!!!!preMerge")
     val childrenWithNames = Seq(
       GpuLiteral(CudfMaxMinBy.KEY_VALUE, StringType), bufferValue,
       GpuLiteral(CudfMaxMinBy.KEY_ORDERING, StringType), bufferOrdering
@@ -2133,7 +2133,7 @@ abstract class GpuMaxMinByBase(valueExpr: Expression, orderingExpr: Expression)
   }
 
   override lazy val postMerge: Seq[Expression] = {
-    println("!!!!!!!!postMerge")
+    // println("!!!!!!!!postMerge")
     Seq(
     GpuGetStructField(cudfMaxMinByAggregate.attr, ordinal = 0, name = Some(CudfMaxMinBy.KEY_VALUE)),
     GpuGetStructField(cudfMaxMinByAggregate.attr, ordinal = 1, name = Some(CudfMaxMinBy.KEY_ORDERING))

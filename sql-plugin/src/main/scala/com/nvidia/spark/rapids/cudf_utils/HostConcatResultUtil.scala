@@ -50,7 +50,7 @@ object HostConcatResultUtil {
       // that it is acquired in the coalesce code.
       new ColumnarBatch(Array.empty, hostConcatResult.getTableHeader.getNumRows)
     } else {
-      println("!!!sparkSchema: " + sparkSchema.mkString(", "))
+      // println("!!!sparkSchema: " + sparkSchema.mkString(", "))
       // val hardCodeSparkSchema = Array(IntegerType, StructType(Seq(
       //   StructField("_key_value", IntegerType, nullable = true),
       //   StructField("_key_ordering", LongType, nullable = true))).asInstanceOf[DataType])

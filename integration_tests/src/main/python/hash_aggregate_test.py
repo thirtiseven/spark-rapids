@@ -1281,6 +1281,13 @@ def test_hash_groupby_with_minby():
     )
 
 @ignore_order(local=True)
+def test_hash_groupby_with_minby_2():
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: three_col_df(spark, StringGen(pattern="[abc]{2}"), int_gen, UniqueLongGen())
+            .groupby('a').agg(f.min_by('b', 'c'))
+    )
+
+@ignore_order(local=True)
 def test_reduction_with_minby():
     assert_gpu_and_cpu_are_equal_collect(
         lambda spark: two_col_df(spark, int_gen, UniqueLongGen()).selectExpr(

@@ -359,11 +359,10 @@ class AggHelper(
         val cols = GpuColumnVector.extractColumns(preProcessed)
         val reductionCol = cols(aggOrdinals(ix))
         withResource(aggFn(reductionCol.getBase)) { res =>
-          println("!!!res: " + res)
-          println("!!!cudfAgg.dataType: " + cudfAgg.dataType)
+          // println("!!!res: " + res)
+          // println("!!!cudfAgg.dataType: " + cudfAgg.dataType)
           cvs += GpuColumnVector.from(
             cudf.ColumnVector.fromScalar(res, 1), cudfAgg.dataType)
-            // cudf.ColumnVector.fromScalar(res, 1), IntegerType)
         }
       }
       new ColumnarBatch(cvs.toArray, 1)
@@ -384,7 +383,7 @@ class AggHelper(
             .withKeysSorted(doSortAgg)
             .build()
 
-        println("!!!preProcessedTbl: " + preProcessedTbl)
+        // println("!!!preProcessedTbl: " + preProcessedTbl)
 
         val cudfAggsOnColumn = cudfAggregates.zip(aggOrdinals).map {
           case (cudfAgg, ord) => cudfAgg.groupByAggregate.onColumn(ord)
@@ -600,15 +599,15 @@ object GpuAggFinalPassIterator {
     val aggBufferAttributes = groupingAttributes ++
         aggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)
 
-    println("groupingAttributes: " + groupingAttributes)
-    println("aggBufferAttributes: " + aggBufferAttributes)
+    // println("!!!groupingAttributes: " + groupingAttributes)
+    // println("!!!aggBufferAttributes: " + aggBufferAttributes)
 
-    println("modeInfo: " + modeInfo)
+    // println("modeInfo: " + modeInfo)
 
     val boundFinalProjections = if (modeInfo.hasFinalMode || modeInfo.hasCompleteMode) {
       val finalProjections = groupingAttributes ++
           aggregateExpressions.map(_.aggregateFunction.evaluateExpression)
-      println("finalProjections: " + finalProjections)
+      // println("finalProjections: " + finalProjections)
       Some(GpuBindReferences.bindGpuReferences(finalProjections, aggBufferAttributes))
     } else {
       None
@@ -619,10 +618,10 @@ object GpuAggFinalPassIterator {
     // - Final mode: grouping key + spark aggregates (e.g. avg)
     val finalAttributes = groupingAttributes ++ aggregateAttributes
 
-    println("resultExpressions: " + resultExpressions)
-    println("resultExpressions.map(_.toAttribute): " + resultExpressions.map(_.toAttribute))
-    println("finalAttributes: " + finalAttributes)
-    println("groupingAttributes: " + groupingAttributes)
+    // println("resultExpressions: " + resultExpressions)
+    // println("resultExpressions.map(_.toAttribute): " + resultExpressions.map(_.toAttribute))
+    // println("finalAttributes: " + finalAttributes)
+    // println("groupingAttributes: " + groupingAttributes)
 
     // boundResultReferences is used to project the aggregated input batch(es) for the result.
     // - Partial mode: it's a pass through. We take whatever was aggregated and let it come
@@ -652,7 +651,7 @@ object GpuAggFinalPassIterator {
       metrics: GpuHashAggregateMetrics): ColumnarBatch = {
     // Perform the last project to get the correct shape that Spark expects. Note this may
     // add things like literals that were not part of the aggregate into the batch.
-    println("!!!boundExpressions.boundResultReferences: " + boundExpressions.boundResultReferences)
+    // println("!!!boundExpressions.boundResultReferences: " + boundExpressions.boundResultReferences)
     // val a = boundExpressions.boundResultReferences(0)
     // val minBy: AttributeReference = AttributeReference("CudfMinBy", StructType(Seq(
     //     StructField("_key_value", IntegerType, nullable = true),
@@ -671,23 +670,23 @@ object GpuAggFinalPassIterator {
       metrics: GpuHashAggregateMetrics): Iterator[ColumnarBatch] = {
     val aggTime = metrics.computeAggTime
     val opTime = metrics.opTime
-    println("!!makeIter")
-    println("!!boundExpressions: " + boundExpressions)
-    println("!!boundExpressions.boundFinalProjections: " + boundExpressions.boundFinalProjections)
+    // println("!!makeIter")
+    // println("!!boundExpressions: " + boundExpressions)
+    // println("!!boundExpressions.boundFinalProjections: " + boundExpressions.boundFinalProjections)
     cbIter.map { batch =>
       withResource(new NvtxWithMetrics("finalize agg", NvtxColor.DARK_GREEN, aggTime,
         opTime)) { _ =>
         val finalBatch = boundExpressions.boundFinalProjections.map { exprs =>
-          println("## flag 1")
+          // println("## flag 1")
           val temp = GpuProjectExec.projectAndClose(batch, exprs, NoopMetric)
           temp
         }.getOrElse(batch)
-        println("!!finalBatch: " + finalBatch)
-        println("!!finalBatch column num: " + finalBatch.numCols())
-        for (i <- 0 until finalBatch.numCols()) {
-          println("!!finalBatch column " + i + ": " + finalBatch.column(i).dataType())
-        }
-        // reorderFinalBatch(finalBatch, boundExpressions, metrics)
+        // println("!!finalBatch: " + finalBatch)
+        // println("!!finalBatch column num: " + finalBatch.numCols())
+        // for (i <- 0 until finalBatch.numCols()) {
+        //   println("!!finalBatch column " + i + ": " + finalBatch.column(i).dataType())
+        // }
+        reorderFinalBatch(finalBatch, boundExpressions, metrics)
         finalBatch
       }
     }
@@ -1698,10 +1697,10 @@ object GpuHashAggregateExecBase {
   def calcInputAttributes(aggregateExpressions: Seq[GpuAggregateExpression],
                           childOutput: Seq[Attribute],
                           inputAggBufferAttributes: Seq[Attribute]): Seq[Attribute] = {
-    println("!!calcInputAttributes")
-    println("aggregateExpressions: " + aggregateExpressions)
-    println("childOutput: " + childOutput)
-    println("inputAggBufferAttributes: " + inputAggBufferAttributes)
+    // println("!!calcInputAttributes")
+    // println("aggregateExpressions: " + aggregateExpressions)
+    // println("childOutput: " + childOutput)
+    // println("inputAggBufferAttributes: " + inputAggBufferAttributes)
     val modes = aggregateExpressions.map(_.mode).distinct
     if (modes.contains(Final) || modes.contains(PartialMerge)) {
       // SPARK-31620: when planning aggregates, the partial aggregate uses aggregate function's
@@ -1836,7 +1835,7 @@ case class GpuHashAggregateExec(
     val boundGroupExprs = GpuBindReferences.bindGpuReferencesTiered(groupingExprs, inputAttrs, true)
 
     rdd.mapPartitions { cbIter =>
-      println("resultExprs: " + resultExprs)
+      // println("!!!resultExprs: " + resultExprs)
       val postBoundReferences = GpuAggFinalPassIterator.setupReferences(groupingExprs,
         aggregateExprs, aggregateAttrs, resultExprs, modeInfo)
 
@@ -2014,8 +2013,8 @@ class DynamicGpuPartialSortAggregateIterator(
         outputRows = NoopMetric)
     }
 
-    println("!!inputAttrs" + inputAttrs)
-    println("!!aggregateAttrs" + aggregateAttrs)
+    // println("!!inputAttrs" + inputAttrs)
+    // println("!!aggregateAttrs" + aggregateAttrs)
 
     // After sorting we want to split the input for the project so that
     // we don't get ourselves in trouble.
@@ -2036,8 +2035,8 @@ class DynamicGpuPartialSortAggregateIterator(
       inputIter: Iterator[ColumnarBatch],
       preProcessAggHelper: AggHelper): Iterator[ColumnarBatch] = {
 
-    println("!!inputAttrs: " + inputAttrs)
-    println("!!aggregateAttrs: " + aggregateAttrs)
+    // println("!!inputAttrs: " + inputAttrs)
+    // println("!!aggregateAttrs: " + aggregateAttrs)
 
     // We still want to split the input, because the heuristic may not be perfect and
     //  this is relatively light weight

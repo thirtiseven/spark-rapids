@@ -2084,10 +2084,10 @@ abstract class GpuMaxMinByBase(valueExpr: Expression, orderingExpr: Expression)
     GpuLiteral.default(cudfMaxMinByAggregate.dataType))
 
   protected lazy val bufferValue: AttributeReference =
-    AttributeReference("value", valueExpr.dataType)()
+    AttributeReference("valueWithExtremumOrdering", valueExpr.dataType)()
   
   protected lazy val bufferOrdering: AttributeReference =
-    AttributeReference("ordering", orderingExpr.dataType)()
+    AttributeReference("extremumOrdering", orderingExpr.dataType)()
 
   protected lazy val bufferStruct: AttributeReference =
     AttributeReference(cudfMaxMinByAggregate.name, StructType(Seq(
@@ -2096,13 +2096,19 @@ abstract class GpuMaxMinByBase(valueExpr: Expression, orderingExpr: Expression)
 
   override lazy val inputProjection: Seq[Expression] = Seq(
     GpuCreateNamedStruct(Seq(
-      GpuLiteral(CudfMaxMinBy.KEY_VALUE, StringType), bufferValue,
-      GpuLiteral(CudfMaxMinBy.KEY_ORDERING, StringType), bufferOrdering
+      GpuLiteral(CudfMaxMinBy.KEY_VALUE, StringType), valueExpr,
+      GpuLiteral(CudfMaxMinBy.KEY_ORDERING, StringType), orderingExpr
     )))
   // override lazy val inputProjection: Seq[Expression] = Seq(
   //   valueExpr, orderingExpr)
 
-  override def aggBufferAttributes: Seq[AttributeReference] = bufferValue :: Nil
+  // lazy val extremumOrdering =
+  //   AttributeReference("extremumOrdering", orderingExpr.dataType)()
+  // lazy val valueWithExtremumOrdering =
+  //   AttributeReference("valueWithExtremumOrdering", valueExpr.dataType)()
+
+  override lazy val aggBufferAttributes: Seq[AttributeReference] =
+    bufferValue :: bufferOrdering :: Nil
 
   override lazy val postUpdate: Seq[Expression] = {
     Seq(
@@ -2113,8 +2119,9 @@ abstract class GpuMaxMinByBase(valueExpr: Expression, orderingExpr: Expression)
 
   override lazy val updateAggregates: Seq[CudfAggregate] = Seq(cudfMaxMinByAggregate)
   override lazy val mergeAggregates: Seq[CudfAggregate] = Seq(cudfMaxMinByAggregate)
-  override lazy val evaluateExpression: Expression = GpuGetStructField(
-    cudfMaxMinByAggregate.attr, ordinal = 0, name = Some(CudfMaxMinBy.KEY_VALUE))
+  // override lazy val evaluateExpression: Expression = GpuGetStructField(
+  //   cudfMaxMinByAggregate.attr, ordinal = 0, name = Some(CudfMaxMinBy.KEY_VALUE))
+  override lazy val evaluateExpression: Expression = bufferValue
 
   override lazy val preMerge: Seq[Expression] = {
     println("!!!!!!!!preMerge")

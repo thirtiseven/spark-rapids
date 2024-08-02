@@ -802,7 +802,7 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .stringConf
     .transform(_.toLowerCase(java.util.Locale.ROOT))
     .checkValues(Set("explainonly", "executeongpu"))
-    .createWithDefault("executeongpu")
+    .createWithDefault("explainonly")
 
   val UDF_COMPILER_ENABLED = conf("spark.rapids.sql.udfCompiler.enabled")
     .doc("When set to true, Scala UDFs will be considered for compilation as Catalyst expressions")

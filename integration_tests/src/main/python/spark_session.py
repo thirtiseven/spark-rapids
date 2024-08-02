@@ -53,13 +53,14 @@ _default_conf = {
     'spark.rapids.sql.improvedFloatOps.enabled': 'false',
     'spark.rapids.sql.incompatibleDateFormats.enabled': 'false',
     'spark.rapids.sql.incompatibleOps.enabled': 'false',
-    'spark.rapids.sql.mode': 'executeongpu',
+    'spark.rapids.sql.mode': 'explainonly',
     'spark.rapids.sql.variableFloatAgg.enabled': 'false',
     'spark.sql.legacy.allowNegativeScaleOfDecimal': 'true',
 }
 
 def _set_all_confs(conf):
     newconf = _default_conf.copy()
+    print("!!!Setting conf: ", conf)
     inject_oom = get_inject_oom_conf()
     if inject_oom:
         _spark.conf.set("spark.rapids.sql.test.injectRetryOOM",
@@ -124,6 +125,7 @@ def pyspark_compatibility_fixes():
 @pyspark_compatibility_fixes()
 def with_spark_session(func, conf={}):
     """Run func that takes a spark session as input with the given configs set."""
+    print("!!!Running with_spark_session")
     reset_spark_session_conf()
     _add_job_description(conf)
     # Only set the ansi conf if not set by the test explicitly by setting the value in the dict

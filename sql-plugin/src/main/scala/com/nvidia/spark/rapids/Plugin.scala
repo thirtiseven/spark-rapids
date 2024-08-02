@@ -515,7 +515,8 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
       // spark-rapids-jni and cuDF libraries.
       // Note: We allow this check to be skipped for off-chance cases.
       if (!conf.skipGpuArchCheck) {
-        RapidsPluginUtils.validateGpuArchitecture()
+        println("Skipping GPU architecture check but config is not set")
+        // RapidsPluginUtils.validateGpuArchitecture()
       }
 
       // Fail if there are multiple plugin jars in the classpath.

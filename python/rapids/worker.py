@@ -68,6 +68,7 @@ def initialize_gpu_mem():
 
 
 if __name__ == '__main__':
+    print("!!!Running worker.py")
     # GPU context setup
     initialize_gpu_mem()
 

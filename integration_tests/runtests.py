@@ -22,4 +22,5 @@ if __name__ == '__main__':
     #cProfile.run('main(sys.argv[1:])', 'test_profile')
     # arguments are the same as for pytest https://docs.pytest.org/en/latest/usage.html
     # or run pytest -h
+    print("!!!Running tests with arguments: ", sys.argv[1:])
     sys.exit(main(sys.argv[1:]))

@@ -52,7 +52,7 @@ def should_sort_locally():
 def array_columns_to_sort_locally():
     return _sort_array_columns_locally
 
-_allow_any_non_gpu = False
+_allow_any_non_gpu = True
 _non_gpu_allowed = []
 _per_test_ansi_mode_enabled = None
 

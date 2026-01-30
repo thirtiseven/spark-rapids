@@ -192,6 +192,13 @@ else
             PROTOBUF_JARS="$PROTOBUF_JARS $PROTOBUF_JAVA_JAR_PATH"
             echo "Including protobuf-java jar: $PROTOBUF_JAVA_JAR_PATH"
         fi
+        # Also add protobuf jars to driver classpath for Class.forName() to work
+        # This is needed because --jars only adds to executor classpath
+        if [[ -n "$PROTOBUF_JARS" ]]; then
+            PROTOBUF_DRIVER_CP=$(echo $PROTOBUF_JARS | tr ' ' ':')
+            export PYSP_TEST_spark_driver_extraClassPath="${PYSP_TEST_spark_driver_extraClassPath:+${PYSP_TEST_spark_driver_extraClassPath}:}${PROTOBUF_DRIVER_CP}"
+            echo "Added protobuf jars to driver classpath"
+        fi
     else
         export INCLUDE_SPARK_PROTOBUF_JAR=false
     fi

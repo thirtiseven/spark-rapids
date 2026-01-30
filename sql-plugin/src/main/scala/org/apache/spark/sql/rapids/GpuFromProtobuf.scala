@@ -47,11 +47,16 @@ import org.apache.spark.sql.types._
  * @param cudfTypeScales Encodings for decoded fields (parallel to decodedFieldIndices)
  * @param isRequired Whether each decoded field is required (parallel to decodedFieldIndices).
  *                   Required fields missing in failOnErrors mode will cause an exception.
- * @param hasDefaultValue Whether each decoded field has a default value (parallel to decodedFieldIndices)
- * @param defaultInts Default values for int/long/enum fields (parallel to decodedFieldIndices)
- * @param defaultFloats Default values for float/double fields (parallel to decodedFieldIndices)
- * @param defaultBools Default values for bool fields (parallel to decodedFieldIndices)
- * @param defaultStrings Default values for string/bytes fields as UTF-8 bytes (parallel to decodedFieldIndices)
+ * @param hasDefaultValue Whether each decoded field has a default value
+ *                        (parallel to decodedFieldIndices)
+ * @param defaultInts Default values for int/long/enum fields
+ *                    (parallel to decodedFieldIndices)
+ * @param defaultFloats Default values for float/double fields
+ *                      (parallel to decodedFieldIndices)
+ * @param defaultBools Default values for bool fields
+ *                     (parallel to decodedFieldIndices)
+ * @param defaultStrings Default values for string/bytes fields as UTF-8 bytes
+ *                       (parallel to decodedFieldIndices)
  * @param enumValidValues Valid enum values for each field (null if not an enum). Unknown values
  *                        will be set to null to match Spark CPU PERMISSIVE mode behavior.
  * @param failOnErrors If true, throw exception on malformed data; if false, return null
@@ -150,6 +155,90 @@ case class GpuFromProtobuf(
       }
     } else {
       result
+    }
+  }
+}
+
+/**
+ * GPU implementation for Spark's `from_protobuf` with nested and repeated field support.
+ *
+ * This variant uses a flattened schema representation where nested fields have parent
+ * indices pointing to their containing message field.
+ *
+ * @param fullSchema The complete output schema
+ * @param fieldNumbers Protobuf field numbers for all fields in the flattened schema
+ * @param parentIndices Parent field index for each field (-1 for top-level)
+ * @param depthLevels Nesting depth for each field (0 for top-level)
+ * @param wireTypes Expected wire type for each field
+ * @param outputTypeIds cudf type ids for output columns
+ * @param encodings Encoding info for each field
+ * @param isRepeated Whether each field is a repeated field (array)
+ * @param isRequired Whether each field is required (proto2)
+ * @param hasDefaultValue Whether each field has a default value
+ * @param defaultInts Default values for int/long/enum fields
+ * @param defaultFloats Default values for float/double fields
+ * @param defaultBools Default values for bool fields
+ * @param defaultStrings Default values for string/bytes fields
+ * @param enumValidValues Valid enum values for each field
+ * @param failOnErrors If true, throw exception on malformed data
+ */
+case class GpuFromProtobufNested(
+    fullSchema: StructType,
+    fieldNumbers: Array[Int],
+    parentIndices: Array[Int],
+    depthLevels: Array[Int],
+    wireTypes: Array[Int],
+    outputTypeIds: Array[Int],
+    encodings: Array[Int],
+    isRepeated: Array[Boolean],
+    isRequired: Array[Boolean],
+    hasDefaultValue: Array[Boolean],
+    defaultInts: Array[Long],
+    defaultFloats: Array[Double],
+    defaultBools: Array[Boolean],
+    defaultStrings: Array[Array[Byte]],
+    enumValidValues: Array[Array[Int]],
+    failOnErrors: Boolean,
+    child: Expression)
+  extends GpuUnaryExpression with ExpectsInputTypes with NullIntolerantShim {
+
+  override def inputTypes: Seq[AbstractDataType] = Seq(BinaryType)
+
+  override def dataType: DataType = fullSchema.asNullable
+
+  override def nullable: Boolean = true
+
+  override protected def doColumnar(input: GpuColumnVector): cudf.ColumnVector = {
+    val jniResult = try {
+      Protobuf.decodeNestedToStruct(
+        input.getBase,
+        fieldNumbers,
+        parentIndices,
+        depthLevels,
+        wireTypes,
+        outputTypeIds,
+        encodings,
+        isRepeated,
+        isRequired,
+        hasDefaultValue,
+        defaultInts,
+        defaultFloats,
+        defaultBools,
+        defaultStrings,
+        enumValidValues,
+        failOnErrors)
+    } catch {
+      case e: CudfException if failOnErrors =>
+        throw new org.apache.spark.SparkException("Malformed protobuf message", e)
+    }
+
+    // Apply input nulls to output
+    if (input.getBase.hasNulls) {
+      withResource(jniResult) { _ =>
+        jniResult.mergeAndSetValidity(BinaryOp.BITWISE_AND, input.getBase)
+      }
+    } else {
+      jniResult
     }
   }
 }

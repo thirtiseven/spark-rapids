@@ -39,12 +39,13 @@ import scala.util.Try
 
 import ai.rapids.cudf.DType
 import com.nvidia.spark.rapids._
+import com.nvidia.spark.rapids.jni.Protobuf.{WT_32BIT, WT_64BIT, WT_LEN, WT_VARINT}
 
 import org.apache.spark.sql.catalyst.expressions.{
   AttributeReference, Expression, GetStructField, UnaryExpression
 }
 import org.apache.spark.sql.execution.ProjectExec
-import org.apache.spark.sql.rapids.GpuFromProtobuf
+import org.apache.spark.sql.rapids.{GpuFromProtobuf, GpuFromProtobufNested}
 import org.apache.spark.sql.types._
 
 /**
@@ -60,7 +61,30 @@ private[shims] case class ProtobufFieldInfo(
     isRequired: Boolean,
     hasDefaultValue: Boolean,
     defaultValue: Option[Any],  // Stored as protobuf-java type, will be converted for JNI
-    enumValues: Option[Set[Int]] = None  // Valid enum values (only for ENUM fields with enumsAsInts)
+    // Valid enum values (only for ENUM fields with enumsAsInts)
+    enumValues: Option[Set[Int]] = None,
+    isRepeated: Boolean = false  // Whether this is a repeated field
+)
+
+/**
+ * Flattened field descriptor for nested protobuf schemas.
+ * Used to represent a hierarchical schema as a linear array for GPU processing.
+ */
+private[shims] case class FlattenedFieldDescriptor(
+    fieldNumber: Int,
+    parentIdx: Int,          // Index of parent field in flattened array (-1 for top-level)
+    depth: Int,              // Nesting depth (0 for top-level)
+    wireType: Int,           // Protobuf wire type
+    outputTypeId: Int,       // cudf type id for the output (element type for repeated)
+    encoding: Int,           // Encoding (default/fixed/zigzag)
+    isRepeated: Boolean,     // Whether this is a repeated field
+    isRequired: Boolean,     // Whether this field is required (proto2)
+    hasDefaultValue: Boolean,
+    defaultInt: Long,
+    defaultFloat: Double,
+    defaultBool: Boolean,
+    defaultString: Array[Byte],
+    enumValidValues: Array[Int]
 )
 
 /**
@@ -121,6 +145,23 @@ object ProtobufExprShims {
         // enumValidValues: valid enum values for each decoded field (null if not an enum)
         private var enumValidValues: Array[Array[Int]] = _
         private var failOnErrors: Boolean = _
+
+        // Variables for nested API (used when schema has nested or repeated fields)
+        private var useNestedApi: Boolean = false
+        private var nestedFieldNumbers: Array[Int] = _
+        private var nestedParentIndices: Array[Int] = _
+        private var nestedDepthLevels: Array[Int] = _
+        private var nestedWireTypes: Array[Int] = _
+        private var nestedOutputTypeIds: Array[Int] = _
+        private var nestedEncodings: Array[Int] = _
+        private var nestedIsRepeated: Array[Boolean] = _
+        private var nestedIsRequired: Array[Boolean] = _
+        private var nestedHasDefaultValue: Array[Boolean] = _
+        private var nestedDefaultInts: Array[Long] = _
+        private var nestedDefaultFloats: Array[Double] = _
+        private var nestedDefaultBools: Array[Boolean] = _
+        private var nestedDefaultStrings: Array[Array[Byte]] = _
+        private var nestedEnumValidValues: Array[Array[Int]] = _
 
         override def tagExprForGpu(): Unit = {
           fullSchema = e.dataType match {
@@ -284,6 +325,209 @@ object ProtobufExprShims {
           defaultBools = defBools
           defaultStrings = defStrings
           enumValidValues = enumVals
+
+          // Check if we need the nested API (for repeated fields or nested messages)
+          // Only check fields that will actually be decoded, not all fields in the schema
+          useNestedApi = indicesToDecode.exists { idx =>
+            val sf = fullSchema.fields(idx)
+            val info = fieldsInfoMap(sf.name)
+            info.isRepeated || info.protoTypeName == "MESSAGE"
+          }
+
+          // Double-check: verify all fields to be decoded are actually supported
+          // (This catches edge cases where field analysis might have issues)
+          val unsupportedInDecode = indicesToDecode.filter { idx =>
+            val sf = fullSchema.fields(idx)
+            fieldsInfoMap.get(sf.name).exists(!_.isSupported)
+          }
+          if (unsupportedInDecode.nonEmpty) {
+            val reasons = unsupportedInDecode.map { idx =>
+              val sf = fullSchema.fields(idx)
+              val info = fieldsInfoMap(sf.name)
+              s"${sf.name}: ${info.unsupportedReason.getOrElse("unknown reason")}"
+            }
+            willNotWorkOnGpu(
+              s"Fields not supported for from_protobuf: ${reasons.mkString(", ")}")
+            return
+          }
+
+          if (useNestedApi) {
+            // Build flattened schema for nested API
+            val flatFields = mutable.ArrayBuffer[FlattenedFieldDescriptor]()
+
+            // Helper to add a field and its children recursively
+            def addFieldWithChildren(
+                sf: StructField,
+                info: ProtobufFieldInfo,
+                parentIdx: Int,
+                depth: Int,
+                nestedMsgDesc: AnyRef): Unit = {
+
+              val currentIdx = flatFields.size
+
+              val outputType = sf.dataType match {
+                case ArrayType(elemType, _) =>
+                  elemType match {
+                    case _: StructType =>
+                      // Repeated message field: ArrayType(StructType) - element type is STRUCT
+                      DType.STRUCT.getTypeId.getNativeId
+                    case other =>
+                      GpuFromProtobuf.sparkTypeToCudfIdOpt(other)
+                        .getOrElse(DType.INT8.getTypeId.getNativeId)
+                  }
+                case _: StructType =>
+                  DType.STRUCT.getTypeId.getNativeId
+                case other =>
+                  GpuFromProtobuf.sparkTypeToCudfIdOpt(other)
+                    .getOrElse(DType.INT8.getTypeId.getNativeId)
+              }
+
+              val wireType = getWireType(info.protoTypeName, info.encoding)
+
+              val hasDefault = info.hasDefaultValue && info.defaultValue.isDefined
+              val (defInt, defFloat, defBool, defString) = if (hasDefault) {
+                val defVal = info.defaultValue.get
+                sf.dataType match {
+                  case BooleanType =>
+                    val b = defVal.asInstanceOf[java.lang.Boolean].booleanValue()
+                    (0L, 0.0, b, null: Array[Byte])
+                  case IntegerType | LongType =>
+                    val intVal = defVal match {
+                      case i: java.lang.Integer => i.longValue()
+                      case l: java.lang.Long => l.longValue()
+                      case _ => 0L
+                    }
+                    (intVal, 0.0, false, null: Array[Byte])
+                  case FloatType =>
+                    val f = defVal.asInstanceOf[java.lang.Float].doubleValue()
+                    (0L, f, false, null: Array[Byte])
+                  case DoubleType =>
+                    val d = defVal.asInstanceOf[java.lang.Double].doubleValue()
+                    (0L, d, false, null: Array[Byte])
+                  case StringType =>
+                    val str = defVal.asInstanceOf[String]
+                    val bytes = if (str != null) str.getBytes("UTF-8") else null
+                    (0L, 0.0, false, bytes)
+                  case _ => (0L, 0.0, false, null: Array[Byte])
+                }
+              } else {
+                (0L, 0.0, false, null: Array[Byte])
+              }
+
+              val enumValsArr = info.enumValues.map(_.toArray.sorted).orNull
+
+              flatFields += FlattenedFieldDescriptor(
+                fieldNumber = info.fieldNumber,
+                parentIdx = parentIdx,
+                depth = depth,
+                wireType = wireType,
+                outputTypeId = outputType,
+                encoding = info.encoding,
+                isRepeated = info.isRepeated,
+                isRequired = info.isRequired,
+                hasDefaultValue = info.hasDefaultValue,
+                defaultInt = defInt,
+                defaultFloat = defFloat,
+                defaultBool = defBool,
+                defaultString = defString,
+                enumValidValues = enumValsArr
+              )
+
+              // For nested struct types (including repeated message = ArrayType(StructType)), add child fields
+              sf.dataType match {
+                case st: StructType if nestedMsgDesc != null =>
+                  // Non-repeated nested message - add child fields
+                  addChildFieldsFromStruct(st, nestedMsgDesc, sf.name, currentIdx, depth)
+                  
+                case ArrayType(st: StructType, _) if nestedMsgDesc != null =>
+                  // Repeated message field (ArrayType of StructType) - add child fields
+                  addChildFieldsFromStruct(st, nestedMsgDesc, sf.name, currentIdx, depth)
+                  
+                case _ => // Not a struct, no children to add
+              }
+            }
+            
+            // Helper to add child fields from a struct type
+            def addChildFieldsFromStruct(
+                st: StructType,
+                parentMsgDesc: AnyRef,
+                fieldName: String,
+                parentIdx: Int,
+                parentDepth: Int): Unit = {
+              val fd = invoke1[AnyRef](
+                parentMsgDesc, "findFieldByName", classOf[String], fieldName)
+              if (fd != null) {
+                Try {
+                  val childMsgDesc = invoke0[AnyRef](fd, "getMessageType")
+                  // Add each child field
+                  st.fields.foreach { childSf =>
+                    val childFd = invoke1[AnyRef](
+                      childMsgDesc, "findFieldByName", classOf[String], childSf.name)
+                    if (childFd != null) {
+                      val childProtoType = invoke0[AnyRef](childFd, "getType")
+                      val childProtoTypeName = typeName(childProtoType)
+                      val childFieldNumber = invoke0[java.lang.Integer](
+                        childFd, "getNumber").intValue()
+                      val childIsRepeated = Try {
+                        invoke0[java.lang.Boolean](childFd, "isRepeated").booleanValue()
+                      }.getOrElse(false)
+                      val childIsRequired = Try {
+                        invoke0[java.lang.Boolean](childFd, "isRequired").booleanValue()
+                      }.getOrElse(false)
+                      val childHasDefault = Try {
+                        invoke0[java.lang.Boolean](childFd, "hasDefaultValue").booleanValue()
+                      }.getOrElse(false)
+                      val (_, _, childEncoding) = checkFieldSupport(
+                        childSf.dataType, childProtoTypeName, childIsRepeated, enumsAsInts)
+
+                      val childInfo = ProtobufFieldInfo(
+                        fieldNumber = childFieldNumber,
+                        protoTypeName = childProtoTypeName,
+                        sparkType = childSf.dataType,
+                        encoding = childEncoding,
+                        isSupported = true,
+                        unsupportedReason = None,
+                        isRequired = childIsRequired,
+                        hasDefaultValue = childHasDefault,
+                        defaultValue = None,
+                        enumValues = None,
+                        isRepeated = childIsRepeated
+                      )
+
+                      addFieldWithChildren(
+                        childSf, childInfo, parentIdx, parentDepth + 1, childMsgDesc)
+                    }
+                  }
+                }
+              }
+            }
+
+            // Add ALL top-level fields (not just indicesToDecode) because the output
+            // schema must match fullSchema. The kernel will create null columns for
+            // fields not present in the protobuf data.
+            fullSchema.fields.indices.foreach { schemaIdx =>
+              val sf = fullSchema.fields(schemaIdx)
+              val info = fieldsInfoMap(sf.name)
+              addFieldWithChildren(sf, info, -1, 0, msgDesc)
+            }
+
+            // Populate nested API variables
+            val flat = flatFields.toArray
+            nestedFieldNumbers = flat.map(_.fieldNumber)
+            nestedParentIndices = flat.map(_.parentIdx)
+            nestedDepthLevels = flat.map(_.depth)
+            nestedWireTypes = flat.map(_.wireType)
+            nestedOutputTypeIds = flat.map(_.outputTypeId)
+            nestedEncodings = flat.map(_.encoding)
+            nestedIsRepeated = flat.map(_.isRepeated)
+            nestedIsRequired = flat.map(_.isRequired)
+            nestedHasDefaultValue = flat.map(_.hasDefaultValue)
+            nestedDefaultInts = flat.map(_.defaultInt)
+            nestedDefaultFloats = flat.map(_.defaultFloat)
+            nestedDefaultBools = flat.map(_.defaultBool)
+            nestedDefaultStrings = flat.map(_.defaultString)
+            nestedEnumValidValues = flat.map(_.enumValidValues)
+          }
         }
 
         /**
@@ -359,7 +603,8 @@ object ProtobufExprShims {
               isRequired = isFieldRequired,
               hasDefaultValue = hasDefault,
               defaultValue = defaultVal,
-              enumValues = enumVals
+              enumValues = enumVals,
+              isRepeated = isRepeated
             )
           }
 
@@ -376,8 +621,38 @@ object ProtobufExprShims {
             isRepeated: Boolean,
             enumsAsInts: Boolean): (Boolean, Option[String], Int) = {
 
+          // Handle repeated fields (arrays)
           if (isRepeated) {
-            return (false, Some("repeated fields are not supported"), GpuFromProtobuf.ENC_DEFAULT)
+            sparkType match {
+              case ArrayType(elementType, _) =>
+                // Check if element type is supported
+                elementType match {
+                  case BooleanType | IntegerType | LongType | FloatType | DoubleType |
+                       StringType | BinaryType =>
+                    // Supported repeated scalar - determine encoding from proto type
+                    return checkScalarEncoding(elementType, protoTypeName, enumsAsInts)
+                  case _: StructType =>
+                    // Repeated nested message (array of structs) - supported on GPU
+                    return (true, None, GpuFromProtobuf.ENC_DEFAULT)
+                  case _ =>
+                    return (false, Some(s"unsupported repeated element type: $elementType"),
+                      GpuFromProtobuf.ENC_DEFAULT)
+                }
+              case _ =>
+                return (false, Some(s"repeated field should map to ArrayType, got: $sparkType"),
+                  GpuFromProtobuf.ENC_DEFAULT)
+            }
+          }
+
+          // Handle nested messages (non-repeated)
+          if (protoTypeName == "MESSAGE") {
+            sparkType match {
+              case _: StructType =>
+                return (true, None, GpuFromProtobuf.ENC_DEFAULT)
+              case _ =>
+                return (false, Some(s"nested message should map to StructType, got: $sparkType"),
+                  GpuFromProtobuf.ENC_DEFAULT)
+            }
           }
 
           // Check Spark type is one of the supported simple types
@@ -388,6 +663,17 @@ object ProtobufExprShims {
             case other =>
               return (false, Some(s"unsupported Spark type: $other"), GpuFromProtobuf.ENC_DEFAULT)
           }
+
+          checkScalarEncoding(sparkType, protoTypeName, enumsAsInts)
+        }
+
+        /**
+         * Determine encoding for scalar types.
+         */
+        private def checkScalarEncoding(
+            sparkType: DataType,
+            protoTypeName: String,
+            enumsAsInts: Boolean): (Boolean, Option[String], Int) = {
 
           // Determine encoding based on Spark type and proto type combination
           val encoding = (sparkType, protoTypeName) match {
@@ -420,6 +706,24 @@ object ProtobufExprShims {
               (false,
                 Some(s"type mismatch: Spark $sparkType vs Protobuf $protoTypeName"),
                 GpuFromProtobuf.ENC_DEFAULT)
+          }
+        }
+
+        /**
+         * Get wire type constant for a given protobuf type name and encoding.
+         */
+        private def getWireType(protoTypeName: String, encoding: Int): Int = {
+          protoTypeName match {
+            case "BOOL" | "INT32" | "UINT32" | "SINT32" | "INT64" | "UINT64" | "SINT64" | "ENUM" =>
+              if (encoding == GpuFromProtobuf.ENC_FIXED) {
+                if (protoTypeName.contains("64")) WT_64BIT else WT_32BIT
+              } else {
+                WT_VARINT
+              }
+            case "FIXED32" | "SFIXED32" | "FLOAT" => WT_32BIT
+            case "FIXED64" | "SFIXED64" | "DOUBLE" => WT_64BIT
+            case "STRING" | "BYTES" | "MESSAGE" => WT_LEN
+            case _ => WT_VARINT  // default
           }
         }
 
@@ -583,10 +887,18 @@ object ProtobufExprShims {
         }
 
         override def convertToGpu(child: Expression): GpuExpression = {
-          GpuFromProtobuf(
-            fullSchema, decodedFieldIndices, fieldNumbers, cudfTypeIds, cudfTypeScales,
-            isRequired, hasDefaultValue, defaultInts, defaultFloats, defaultBools,
-            defaultStrings, enumValidValues, failOnErrors, child)
+          if (useNestedApi) {
+            GpuFromProtobufNested(
+              fullSchema, nestedFieldNumbers, nestedParentIndices, nestedDepthLevels,
+              nestedWireTypes, nestedOutputTypeIds, nestedEncodings, nestedIsRepeated,
+              nestedIsRequired, nestedHasDefaultValue, nestedDefaultInts, nestedDefaultFloats,
+              nestedDefaultBools, nestedDefaultStrings, nestedEnumValidValues, failOnErrors, child)
+          } else {
+            GpuFromProtobuf(
+              fullSchema, decodedFieldIndices, fieldNumbers, cudfTypeIds, cudfTypeScales,
+              isRequired, hasDefaultValue, defaultInts, defaultFloats, defaultBools,
+              defaultStrings, enumValidValues, failOnErrors, child)
+          }
         }
       }
     )

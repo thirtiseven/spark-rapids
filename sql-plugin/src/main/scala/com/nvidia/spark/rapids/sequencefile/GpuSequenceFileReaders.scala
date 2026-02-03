@@ -275,6 +275,10 @@ private[sequencefile] final class HostBinaryListBufferer(
    * The caller is responsible for closing the returned buffers.
    * This is used by the multi-file reader which needs host buffers for later GPU transfer.
    *
+   * IMPORTANT: This method returns buffers sized exactly to the actual data, not the allocated
+   * size. This is critical because HostAlloc.alloc doesn't zero-initialize memory, and passing
+   * oversized buffers to cuDF can result in garbage data being included in the output.
+   *
    * @return a tuple of (Some(dataBuffer), Some(offsetsBuffer)) if there is data,
    *         or (None, None) if empty
    */
@@ -290,14 +294,41 @@ private[sequencefile] final class HostBinaryListBufferer(
     // Write the final offset
     offsetsBuffer.setInt(numRows.toLong * DType.INT32.getSizeInBytes, dataLocation.toInt)
 
-    // Transfer ownership - the caller is now responsible for closing these buffers
-    val retData = dataBuffer
-    val retOffsets = offsetsBuffer
+    // Calculate exact sizes needed
+    val exactDataSize = dataLocation
+    val exactOffsetsSize = (numRows + 1).toLong * DType.INT32.getSizeInBytes
+
+    // ALWAYS copy to exactly-sized buffers to avoid garbage data
+    // This is critical because:
+    // 1. HostAlloc.alloc doesn't zero-initialize memory
+    // 2. cuDF's copyToDevice uses the buffer's full length, not the logical row count
+    // 3. Even if exactDataSize == dataBuffer.getLength, there could be alignment padding
+    val exactDataBuffer = if (exactDataSize > 0) {
+      closeOnExcept(dataBuffer) { _ =>
+        val newBuf = HostAlloc.alloc(exactDataSize, preferPinned = true)
+        newBuf.copyFromHostBuffer(0, dataBuffer, 0, exactDataSize)
+        dataBuffer.close()
+        newBuf
+      }
+    } else {
+      // For empty data, still need a valid (but minimal) buffer
+      dataBuffer.close()
+      HostAlloc.alloc(1L, preferPinned = true)
+    }
+
+    val exactOffsetsBuffer = closeOnExcept(exactDataBuffer) { _ =>
+      closeOnExcept(offsetsBuffer) { _ =>
+        val newBuf = HostAlloc.alloc(exactOffsetsSize, preferPinned = true)
+        newBuf.copyFromHostBuffer(0, offsetsBuffer, 0, exactOffsetsSize)
+        offsetsBuffer.close()
+        newBuf
+      }
+    }
+
     dataBuffer = null
     offsetsBuffer = null
-    // Note: directOut doesn't own any resources, no need to close
 
-    (Some(retData), Some(retOffsets))
+    (Some(exactDataBuffer), Some(exactOffsetsBuffer))
   }
 
   override def close(): Unit = {
@@ -883,12 +914,16 @@ class MultiFileCloudSequenceFilePartitionReader(
   /**
    * Build a device column (LIST<UINT8>) from host memory buffers.
    * Uses proper nested HostColumnVector structure for efficient single copyToDevice().
+   *
+   * Note: The input buffers are expected to be exactly-sized (from getHostBuffersAndRelease).
+   * This method transfers ownership of the buffers to the HostColumnVector.
    */
   private def buildDeviceColumnFromHostBuffers(
       dataBuffer: HostMemoryBuffer,
       offsetsBuffer: HostMemoryBuffer,
       numRows: Int): ColumnVector = {
-    val dataLen = dataBuffer.getLength.toInt
+    // Get the actual data length from the final offset
+    val dataLen = offsetsBuffer.getInt(numRows.toLong * DType.INT32.getSizeInBytes)
 
     // Create the child HostColumnVectorCore (UINT8 data)
     val emptyChildren = new util.ArrayList[HostColumnVectorCore]()
@@ -900,6 +935,7 @@ class MultiFileCloudSequenceFilePartitionReader(
     listChildren.add(childCore)
 
     // Create the LIST HostColumnVector with proper nested structure
+    // The HostColumnVector takes ownership of the buffers
     val listHost = closeOnExcept(childCore) { _ =>
       new HostColumnVector(DType.LIST, numRows,
         Optional.of[java.lang.Long](0L), // nullCount = 0

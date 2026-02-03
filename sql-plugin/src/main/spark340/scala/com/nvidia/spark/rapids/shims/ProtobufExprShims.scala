@@ -433,7 +433,8 @@ object ProtobufExprShims {
                 enumValidValues = enumValsArr
               )
 
-              // For nested struct types (including repeated message = ArrayType(StructType)), add child fields
+              // For nested struct types (including repeated message = ArrayType(StructType)), 
+              // add child fields
               sf.dataType match {
                 case st: StructType if nestedMsgDesc != null =>
                   // Non-repeated nested message - add child fields

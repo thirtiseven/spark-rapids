@@ -182,8 +182,35 @@ case class GpuFromProtobuf(
  * @param enumValidValues Valid enum values for each field
  * @param failOnErrors If true, throw exception on malformed data
  */
+/**
+ * GPU implementation for Spark's `from_protobuf` decode path for nested/repeated types.
+ *
+ * This implementation supports schema projection: only fields in `decodedTopLevelIndices`
+ * are decoded by the GPU. Fields not in this array will be filled with null columns in
+ * post-processing to ensure the output matches `fullSchema`.
+ *
+ * @param fullSchema The complete output schema (must match the original expression's dataType)
+ * @param decodedTopLevelIndices Indices in fullSchema for top-level fields decoded by GPU.
+ *                               Must be sorted in ascending order.
+ * @param fieldNumbers Protobuf field numbers for all fields in flattened schema
+ * @param parentIndices Parent indices for all fields (-1 for top-level)
+ * @param depthLevels Nesting depth for all fields (0 for top-level)
+ * @param wireTypes Wire types for all fields
+ * @param outputTypeIds cuDF type IDs for all fields
+ * @param encodings Encodings for all fields
+ * @param isRepeated Whether each field is repeated
+ * @param isRequired Whether each field is required
+ * @param hasDefaultValue Whether each field has a default value
+ * @param defaultInts Default int/long values
+ * @param defaultFloats Default float/double values
+ * @param defaultBools Default bool values
+ * @param defaultStrings Default string/bytes values
+ * @param enumValidValues Valid enum values for each field
+ * @param failOnErrors If true, throw exception on malformed data
+ */
 case class GpuFromProtobufNested(
     fullSchema: StructType,
+    decodedTopLevelIndices: Array[Int],
     fieldNumbers: Array[Int],
     parentIndices: Array[Int],
     depthLevels: Array[Int],
@@ -208,7 +235,12 @@ case class GpuFromProtobufNested(
 
   override def nullable: Boolean = true
 
+  // Check if schema projection is active (not all fields are decoded)
+  private val needsSchemaExpansion: Boolean =
+    decodedTopLevelIndices.length != fullSchema.fields.length
+
   override protected def doColumnar(input: GpuColumnVector): cudf.ColumnVector = {
+    val numRows = input.getRowCount.toInt
     val jniResult = try {
       Protobuf.decodeNestedToStruct(
         input.getBase,
@@ -232,13 +264,59 @@ case class GpuFromProtobufNested(
         throw new org.apache.spark.SparkException("Malformed protobuf message", e)
     }
 
-    // Apply input nulls to output
-    if (input.getBase.hasNulls) {
-      withResource(jniResult) { _ =>
-        jniResult.mergeAndSetValidity(BinaryOp.BITWISE_AND, input.getBase)
+    // Expand to full schema if needed (schema projection is active)
+    val expanded = if (needsSchemaExpansion) {
+      withResource(jniResult) { decoded =>
+        expandToFullSchema(decoded, numRows)
       }
     } else {
       jniResult
+    }
+
+    // Apply input nulls to output
+    if (input.getBase.hasNulls) {
+      withResource(expanded) { _ =>
+        expanded.mergeAndSetValidity(BinaryOp.BITWISE_AND, input.getBase)
+      }
+    } else {
+      expanded
+    }
+  }
+
+  /**
+   * Expand a projected struct to match fullSchema by inserting null columns
+   * for fields that were not decoded.
+   *
+   * @param decoded The decoded struct with only decodedTopLevelIndices fields
+   * @param numRows Number of rows in the output
+   * @return A new struct column matching fullSchema
+   */
+  private def expandToFullSchema(decoded: cudf.ColumnVector, numRows: Int): cudf.ColumnVector = {
+    val children = new Array[cudf.ColumnVector](fullSchema.fields.length)
+    var decodedIdx = 0
+
+    try {
+      for (i <- fullSchema.fields.indices) {
+        if (decodedIdx < decodedTopLevelIndices.length &&
+            decodedTopLevelIndices(decodedIdx) == i) {
+          // This field was decoded - copy it from the result
+          withResource(decoded.getChildColumnView(decodedIdx)) { childView =>
+            children(i) = childView.copyToColumnVector()
+          }
+          decodedIdx += 1
+        } else {
+          // This field was not decoded - create a null column
+          children(i) = GpuColumnVector.columnVectorFromNull(numRows, fullSchema.fields(i).dataType)
+        }
+      }
+
+      // makeStruct copies the children, so we must close them after
+      cudf.ColumnVector.makeStruct(numRows, children: _*)
+    } finally {
+      // Always close children - makeStruct copies them, doesn't take ownership
+      children.foreach { col =>
+        if (col != null) col.close()
+      }
     }
   }
 }

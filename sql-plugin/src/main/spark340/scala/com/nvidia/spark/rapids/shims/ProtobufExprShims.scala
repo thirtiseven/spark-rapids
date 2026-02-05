@@ -162,6 +162,8 @@ object ProtobufExprShims {
         private var nestedDefaultBools: Array[Boolean] = _
         private var nestedDefaultStrings: Array[Array[Byte]] = _
         private var nestedEnumValidValues: Array[Array[Int]] = _
+        // Indices in fullSchema for top-level fields that were decoded (for schema projection)
+        private var nestedDecodedTopLevelIndices: Array[Int] = _
 
         override def tagExprForGpu(): Unit = {
           fullSchema = e.dataType match {
@@ -503,10 +505,12 @@ object ProtobufExprShims {
               }
             }
 
-            // Add ALL top-level fields (not just indicesToDecode) because the output
-            // schema must match fullSchema. The kernel will create null columns for
-            // fields not present in the protobuf data.
-            fullSchema.fields.indices.foreach { schemaIdx =>
+            // Only add top-level fields that are actually required (schema projection).
+            // This significantly reduces GPU memory and computation for schemas with many
+            // fields when only a few are needed. The Scala layer will post-process the
+            // output to insert null columns for non-decoded fields.
+            nestedDecodedTopLevelIndices = indicesToDecode
+            indicesToDecode.foreach { schemaIdx =>
               val sf = fullSchema.fields(schemaIdx)
               val info = fieldsInfoMap(sf.name)
               addFieldWithChildren(sf, info, -1, 0, msgDesc)
@@ -890,10 +894,11 @@ object ProtobufExprShims {
         override def convertToGpu(child: Expression): GpuExpression = {
           if (useNestedApi) {
             GpuFromProtobufNested(
-              fullSchema, nestedFieldNumbers, nestedParentIndices, nestedDepthLevels,
-              nestedWireTypes, nestedOutputTypeIds, nestedEncodings, nestedIsRepeated,
-              nestedIsRequired, nestedHasDefaultValue, nestedDefaultInts, nestedDefaultFloats,
-              nestedDefaultBools, nestedDefaultStrings, nestedEnumValidValues, failOnErrors, child)
+              fullSchema, nestedDecodedTopLevelIndices, nestedFieldNumbers, nestedParentIndices,
+              nestedDepthLevels, nestedWireTypes, nestedOutputTypeIds, nestedEncodings,
+              nestedIsRepeated, nestedIsRequired, nestedHasDefaultValue, nestedDefaultInts,
+              nestedDefaultFloats, nestedDefaultBools, nestedDefaultStrings, nestedEnumValidValues,
+              failOnErrors, child)
           } else {
             GpuFromProtobuf(
               fullSchema, decodedFieldIndices, fieldNumbers, cudfTypeIds, cudfTypeScales,

@@ -42,7 +42,7 @@ import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.jni.Protobuf.{WT_32BIT, WT_64BIT, WT_LEN, WT_VARINT}
 
 import org.apache.spark.sql.catalyst.expressions.{
-  AttributeReference, Expression, GetStructField, UnaryExpression
+  AttributeReference, Expression, GetArrayStructFields, GetStructField, UnaryExpression
 }
 import org.apache.spark.sql.execution.ProjectExec
 import org.apache.spark.sql.rapids.{GpuFromProtobuf, GpuFromProtobufNested}
@@ -439,31 +439,50 @@ object ProtobufExprShims {
               // add child fields
               sf.dataType match {
                 case st: StructType if nestedMsgDesc != null =>
-                  // Non-repeated nested message - add child fields
-                  addChildFieldsFromStruct(st, nestedMsgDesc, sf.name, currentIdx, depth)
+                  // Non-repeated nested message - pruning OK
+                  addChildFieldsFromStruct(st, nestedMsgDesc, sf.name, currentIdx, depth,
+                    isRepeatedParent = false)
                   
                 case ArrayType(st: StructType, _) if nestedMsgDesc != null =>
-                  // Repeated message field (ArrayType of StructType) - add child fields
-                  addChildFieldsFromStruct(st, nestedMsgDesc, sf.name, currentIdx, depth)
+                  // Repeated message field - no pruning (expansion too expensive for arrays)
+                  addChildFieldsFromStruct(st, nestedMsgDesc, sf.name, currentIdx, depth,
+                    isRepeatedParent = true)
                   
                 case _ => // Not a struct, no children to add
               }
             }
             
             // Helper to add child fields from a struct type
+            // isRepeatedParent: if true, this is a repeated message field (ArrayType(StructType)).
+            // Nested pruning is disabled for repeated fields because expanding the inner struct
+            // (inserting null columns per element) is too expensive for large arrays.
             def addChildFieldsFromStruct(
                 st: StructType,
                 parentMsgDesc: AnyRef,
                 fieldName: String,
                 parentIdx: Int,
-                parentDepth: Int): Unit = {
+                parentDepth: Int,
+                isRepeatedParent: Boolean): Unit = {
               val fd = invoke1[AnyRef](
                 parentMsgDesc, "findFieldByName", classOf[String], fieldName)
               if (fd != null) {
                 Try {
                   val childMsgDesc = invoke0[AnyRef](fd, "getMessageType")
-                  // Add each child field
-                  st.fields.foreach { childSf =>
+                  // Filter children based on nested schema projection requirements.
+                  // ONLY for non-repeated struct fields. For repeated message fields
+                  // (ArrayType(StructType)), always decode all children because
+                  // post-expansion of inner LIST struct elements is too memory-expensive.
+                  val filteredFields = if (!isRepeatedParent) {
+                    val requiredChildren = nestedFieldRequirements.get(fieldName)
+                    requiredChildren match {
+                      case Some(Some(childNames)) =>
+                        st.fields.filter(f => childNames.contains(f.name))
+                      case _ => st.fields
+                    }
+                  } else {
+                    st.fields  // Always decode all children for repeated messages
+                  }
+                  filteredFields.foreach { childSf =>
                     val childFd = invoke1[AnyRef](
                       childMsgDesc, "findFieldByName", classOf[String], childSf.name)
                     if (childFd != null) {
@@ -783,75 +802,141 @@ object ProtobufExprShims {
         }
 
         /**
+         * Nested field requirements: for each top-level field, what children are needed?
+         * - None means the whole field is needed (all children)
+         * - Some(Set("a","b")) means only children a and b are needed
+         */
+        // Populated during analyzeDownstreamProject, used by addChildFieldsFromStruct
+        private var nestedFieldRequirements: Map[String, Option[Set[String]]] = Map.empty
+
+        /**
          * Analyze a Project plan to find which struct fields are actually used.
          * This looks for GetStructField expressions that reference our protobuf output.
+         * Also detects nested field access (e.g., decoded.ad_info.winfoid) for nested
+         * schema projection.
          */
         private def analyzeDownstreamProject(planMeta: SparkPlanMeta[_]): Option[Set[String]] = {
           planMeta.wrapped match {
             case p: ProjectExec =>
-              // Collect all GetStructField references from the project list
-              val fieldRefs = mutable.Set[String]()
+              // Collect field references with nested child tracking
+              // Key = top-level field name
+              // Value = None (need whole field) or Some(Set(...)) (only need specific children)
+              val fieldReqs = mutable.Map[String, Option[Set[String]]]()
               var hasDirectStructRef = false
 
               p.projectList.foreach { expr =>
-                collectStructFieldReferences(expr, fieldRefs, hasDirectStructRefHolder = () => {
+                collectStructFieldReferences(expr, fieldReqs, hasDirectStructRefHolder = () => {
                   hasDirectStructRef = true
                 })
               }
 
               if (hasDirectStructRef) {
-                // If the entire struct is referenced directly (not via GetStructField),
-                // we need all fields
                 None
-              } else if (fieldRefs.nonEmpty) {
-                Some(fieldRefs.toSet)
+              } else if (fieldReqs.nonEmpty) {
+                nestedFieldRequirements = fieldReqs.toMap
+                Some(fieldReqs.keySet.toSet)
               } else {
-                // No GetStructField found - this shouldn't happen for valid plans
-                // where from_protobuf is followed by field access
                 None
               }
             case _ =>
-              // Not a ProjectExec, cannot analyze schema projection
               None
           }
         }
 
         /**
-         * Recursively collect field names from GetStructField expressions.
-         * Also tracks if the struct is used directly without field extraction.
+         * Get the field name from a GetStructField expression using its ordinal and schema.
          */
+        private def getFieldName(ordinal: Int, nameOpt: Option[String],
+            schema: StructType): String = {
+          nameOpt.getOrElse {
+            if (ordinal < schema.fields.length) schema.fields(ordinal).name
+            else s"_$ordinal"
+          }
+        }
+
+        /**
+         * Recursively collect field names and nested child requirements from
+         * GetStructField expressions. Detects patterns like:
+         *   - decoded.field_name         -> field_name: None (whole field)
+         *   - decoded.ad_info.winfoid    -> ad_info: Some({winfoid})
+         *   - decoded.ad_info            -> ad_info: None (whole field)
+         *
+         * When both whole-field and sub-field access exist, whole-field wins (None).
+         */
+        /**
+         * Helper: record a nested child field requirement for a parent field.
+         * Merges with existing requirements (whole-field wins over sub-field).
+         */
+        private def addNestedFieldReq(
+            fieldReqs: mutable.Map[String, Option[Set[String]]],
+            parentName: String,
+            childName: String): Unit = {
+          fieldReqs.get(parentName) match {
+            case Some(None) => // Already need whole field, keep it
+            case Some(Some(existing)) =>
+              fieldReqs(parentName) = Some(existing + childName)
+            case None =>
+              fieldReqs(parentName) = Some(Set(childName))
+          }
+        }
+
         private def collectStructFieldReferences(
             expr: Expression,
-            fieldRefs: mutable.Set[String],
+            fieldReqs: mutable.Map[String, Option[Set[String]]],
             hasDirectStructRefHolder: () => Unit): Unit = {
           expr match {
+            // Pattern: decoded.parent_struct.child_field (non-array struct)
             case GetStructField(child, ordinal, nameOpt) =>
-              // Check if this GetStructField extracts from our protobuf struct
-              if (isProtobufStructReference(child)) {
-                // Get field name from the schema using ordinal
-                val fieldName = nameOpt.getOrElse {
-                  if (ordinal < fullSchema.fields.length) {
-                    fullSchema.fields(ordinal).name
-                  } else {
-                    s"_$ordinal"
+              child match {
+                case GetStructField(innerChild, innerOrdinal, innerNameOpt)
+                    if isProtobufStructReference(innerChild) =>
+                  val parentName = getFieldName(innerOrdinal, innerNameOpt, fullSchema)
+                  val parentType = fullSchema.fields(innerOrdinal).dataType
+                  val childSchema = parentType match {
+                    case st: StructType => st
+                    case ArrayType(st: StructType, _) => st
+                    case _ => null
                   }
-                }
-                fieldRefs += fieldName
-                // Don't recurse into child - we've handled this protobuf reference
-              } else {
-                // Child is not a protobuf struct, recurse to check for nested access
-                collectStructFieldReferences(child, fieldRefs, hasDirectStructRefHolder)
+                  if (childSchema != null) {
+                    val childName = getFieldName(ordinal, nameOpt, childSchema)
+                    addNestedFieldReq(fieldReqs, parentName, childName)
+                  } else {
+                    fieldReqs(parentName) = None
+                  }
+
+                case _ if isProtobufStructReference(child) =>
+                  // Direct top-level access: decoded.field_name (whole field)
+                  val fieldName = getFieldName(ordinal, nameOpt, fullSchema)
+                  fieldReqs(fieldName) = None
+
+                case _ =>
+                  collectStructFieldReferences(child, fieldReqs, hasDirectStructRefHolder)
+              }
+
+            // Pattern: decoded.ad_info.winfoid where ad_info is ArrayType(StructType)
+            // Spark generates: GetArrayStructFields(GetStructField(decoded, ad_info_ord), field)
+            case gasf: GetArrayStructFields =>
+              gasf.child match {
+                case GetStructField(innerChild, innerOrdinal, innerNameOpt)
+                    if isProtobufStructReference(innerChild) =>
+                  // Nested array-struct access: decoded.array_field.child_field
+                  val parentName = getFieldName(innerOrdinal, innerNameOpt, fullSchema)
+                  val childName = gasf.field.name
+                  addNestedFieldReq(fieldReqs, parentName, childName)
+
+                case _ =>
+                  // Not a direct protobuf reference, recurse into children
+                  gasf.children.foreach { child =>
+                    collectStructFieldReferences(child, fieldReqs, hasDirectStructRefHolder)
+                  }
               }
 
             case _ =>
-              // Check if this expression directly references our protobuf struct
-              // without extracting a field (e.g., passing the whole struct to a function)
               if (isProtobufStructReference(expr)) {
                 hasDirectStructRefHolder()
               }
-              // Recursively check children
               expr.children.foreach { child =>
-                collectStructFieldReferences(child, fieldRefs, hasDirectStructRefHolder)
+                collectStructFieldReferences(child, fieldReqs, hasDirectStructRefHolder)
               }
           }
         }
@@ -893,12 +978,35 @@ object ProtobufExprShims {
 
         override def convertToGpu(child: Expression): GpuExpression = {
           if (useNestedApi) {
+            // Build nested pruned fields map for schema expansion after decoding.
+            // Only include NON-repeated struct fields. Repeated message fields
+            // (ArrayType(StructType)) are NOT pruned (all children are decoded)
+            // because expanding inner LIST struct elements is too memory-expensive.
+            val prunedFieldsMap: Map[String, Seq[String]] = nestedFieldRequirements.collect {
+              case (fieldName, Some(childNames)) =>
+                val fieldIdx = fullSchema.fieldIndex(fieldName)
+                val fieldType = fullSchema.fields(fieldIdx).dataType
+                fieldType match {
+                  case _: StructType =>
+                    // Non-repeated struct: pruning IS applied
+                    val childSchema = fieldType.asInstanceOf[StructType]
+                    val orderedNames = childSchema.fields
+                      .map(_.name)
+                      .filter(childNames.contains)
+                      .toSeq
+                    Some(fieldName -> orderedNames)
+                  case _ =>
+                    // ArrayType(StructType) or other: pruning NOT applied, skip
+                    None
+                }
+            }.flatten.toMap
+
             GpuFromProtobufNested(
               fullSchema, nestedDecodedTopLevelIndices, nestedFieldNumbers, nestedParentIndices,
               nestedDepthLevels, nestedWireTypes, nestedOutputTypeIds, nestedEncodings,
               nestedIsRepeated, nestedIsRequired, nestedHasDefaultValue, nestedDefaultInts,
               nestedDefaultFloats, nestedDefaultBools, nestedDefaultStrings, nestedEnumValidValues,
-              failOnErrors, child)
+              prunedFieldsMap, failOnErrors, child)
           } else {
             GpuFromProtobuf(
               fullSchema, decodedFieldIndices, fieldNumbers, cudfTypeIds, cudfTypeScales,

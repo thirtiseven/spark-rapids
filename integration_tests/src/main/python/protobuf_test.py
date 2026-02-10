@@ -2651,3 +2651,268 @@ def test_from_protobuf_random_repeated_string(spark_tmp_path):
         )
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+# =============================================================================
+# Nested Schema Projection Tests
+# =============================================================================
+# These tests verify that when only specific sub-fields of a nested message
+# are accessed (e.g. decoded.detail.a instead of decoded.detail), the GPU decoder
+# correctly prunes unneeded children while still producing correct results.
+
+def _build_schema_projection_descriptor_set_bytes(spark):
+    """
+    Build a FileDescriptorSet for nested schema projection testing:
+      message Detail {
+        optional int32  a = 1;
+        optional int32  b = 2;
+        optional string c = 3;
+      }
+      message SchemaProj {
+        optional int32  id     = 1;
+        optional string name   = 2;
+        optional Detail detail = 3;
+        repeated Detail items  = 4;
+      }
+    The Detail message has 3 fields so we can test pruning subsets.
+    """
+    jvm = spark.sparkContext._jvm
+    D = jvm.com.google.protobuf.DescriptorProtos
+
+    fd = D.FileDescriptorProto.newBuilder() \
+        .setName("schema_proj.proto") \
+        .setPackage("test")
+    try:
+        fd = fd.setSyntax("proto2")
+    except Exception:
+        pass
+
+    label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
+    label_rep = D.FieldDescriptorProto.Label.LABEL_REPEATED
+
+    # Detail message: { a: int32, b: int32, c: string }
+    detail_msg = D.DescriptorProto.newBuilder().setName("Detail")
+    detail_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("a").setNumber(1).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_INT32).build())
+    detail_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("b").setNumber(2).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_INT32).build())
+    detail_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("c").setNumber(3).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_STRING).build())
+    fd.addMessageType(detail_msg.build())
+
+    # SchemaProj message: { id, name, detail: Detail, items: repeated Detail }
+    main_msg = D.DescriptorProto.newBuilder().setName("SchemaProj")
+    main_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("id").setNumber(1).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_INT32).build())
+    main_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("name").setNumber(2).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_STRING).build())
+    main_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("detail").setNumber(3).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_MESSAGE)
+            .setTypeName(".test.Detail").build())
+    main_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("items").setNumber(4).setLabel(label_rep)
+            .setType(D.FieldDescriptorProto.Type.TYPE_MESSAGE)
+            .setTypeName(".test.Detail").build())
+    fd.addMessageType(main_msg.build())
+
+    fds = D.FileDescriptorSet.newBuilder().addFile(fd.build()).build()
+    return bytes(fds.toByteArray())
+
+
+def _encode_varint_proj(value):
+    """Encode an unsigned integer as a protobuf varint."""
+    result = []
+    v = value & 0xFFFFFFFF
+    while v > 0x7F:
+        result.append((v & 0x7F) | 0x80)
+        v >>= 7
+    result.append(v & 0x7F)
+    return bytes(result)
+
+
+def _schema_proj_detail_bytes(a, b, c):
+    """Encode a Detail message: {a: int32, b: int32, c: string}."""
+    parts = []
+    parts.append(bytes([0x08]) + _encode_varint_proj(a))
+    parts.append(bytes([0x10]) + _encode_varint_proj(b))
+    c_bytes = c.encode("utf-8")
+    parts.append(bytes([0x1A]) + _encode_varint_proj(len(c_bytes)) + c_bytes)
+    return b"".join(parts)
+
+
+def _schema_proj_message_bytes(id_val, name_val, detail_a, detail_b, detail_c, items):
+    """Encode a SchemaProj message."""
+    parts = []
+    parts.append(bytes([0x08]) + _encode_varint_proj(id_val))
+    name_bytes = name_val.encode("utf-8")
+    parts.append(bytes([0x12]) + _encode_varint_proj(len(name_bytes)) + name_bytes)
+    detail_bytes = _schema_proj_detail_bytes(detail_a, detail_b, detail_c)
+    parts.append(bytes([0x1A]) + _encode_varint_proj(len(detail_bytes)) + detail_bytes)
+    for (a, b, c) in items:
+        item_bytes = _schema_proj_detail_bytes(a, b, c)
+        parts.append(bytes([0x22]) + _encode_varint_proj(len(item_bytes)) + item_bytes)
+    return b"".join(parts)
+
+
+_schema_proj_test_data = [
+    _schema_proj_message_bytes(1, "alice", 10, 20, "d1",
+                               [(100, 200, "i1"), (101, 201, "i2")]),
+    _schema_proj_message_bytes(2, "bob", 30, 40, "d2",
+                               [(300, 400, "i3")]),
+    _schema_proj_message_bytes(3, "carol", 50, 60, "d3", []),
+]
+
+
+def _setup_schema_proj(spark_tmp_path):
+    """Common setup: build descriptor and return (desc_path, message_name, desc_bytes)."""
+    desc_path = spark_tmp_path + "/schema_proj.desc"
+    message_name = "test.SchemaProj"
+    desc_bytes = with_cpu_session(_build_schema_projection_descriptor_set_bytes)
+    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
+        spark, desc_path, desc_bytes))
+    return desc_path, message_name, desc_bytes
+
+
+def _decode_schema_proj(df, from_protobuf_fn, desc_path, message_name, desc_bytes):
+    """Apply from_protobuf to a binary DataFrame."""
+    sig = inspect.signature(from_protobuf_fn)
+    if "binaryDescriptorSet" in sig.parameters:
+        return from_protobuf_fn(
+            f.col("bin"), message_name,
+            binaryDescriptorSet=bytearray(desc_bytes))
+    else:
+        return from_protobuf_fn(f.col("bin"), message_name, desc_path)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_schema_proj_nested_single_field(spark_tmp_path):
+    """Select only detail.a from nested struct (prune b, c)."""
+    from_protobuf_fn = _try_import_from_protobuf()
+    if from_protobuf_fn is None:
+        pytest.skip("from_protobuf not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM not available")
+
+    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(d,) for d in _schema_proj_test_data], schema="bin binary")
+        decoded = _decode_schema_proj(
+            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
+        return df.select(
+            decoded.getField("id").alias("id"),
+            decoded.getField("detail").getField("a").alias("detail_a"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_schema_proj_nested_two_fields(spark_tmp_path):
+    """Select detail.a and detail.c (prune b)."""
+    from_protobuf_fn = _try_import_from_protobuf()
+    if from_protobuf_fn is None:
+        pytest.skip("from_protobuf not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM not available")
+
+    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(d,) for d in _schema_proj_test_data], schema="bin binary")
+        decoded = _decode_schema_proj(
+            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
+        return df.select(
+            decoded.getField("detail").getField("a").alias("detail_a"),
+            decoded.getField("detail").getField("c").alias("detail_c"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_schema_proj_whole_struct_no_pruning(spark_tmp_path):
+    """Selecting whole nested struct should NOT prune children."""
+    from_protobuf_fn = _try_import_from_protobuf()
+    if from_protobuf_fn is None:
+        pytest.skip("from_protobuf not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM not available")
+
+    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(d,) for d in _schema_proj_test_data], schema="bin binary")
+        decoded = _decode_schema_proj(
+            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
+        return df.select(
+            decoded.getField("id").alias("id"),
+            decoded.getField("detail").alias("detail"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_schema_proj_whole_and_subfield(spark_tmp_path):
+    """Selecting whole struct AND a sub-field: whole struct wins, no pruning."""
+    from_protobuf_fn = _try_import_from_protobuf()
+    if from_protobuf_fn is None:
+        pytest.skip("from_protobuf not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM not available")
+
+    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(d,) for d in _schema_proj_test_data], schema="bin binary")
+        decoded = _decode_schema_proj(
+            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
+        return df.select(
+            decoded.getField("detail").alias("detail"),
+            decoded.getField("detail").getField("a").alias("detail_a"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_schema_proj_scalar_plus_nested(spark_tmp_path):
+    """Top-level scalar + nested sub-field: prune both top-level and nested."""
+    from_protobuf_fn = _try_import_from_protobuf()
+    if from_protobuf_fn is None:
+        pytest.skip("from_protobuf not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM not available")
+
+    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(d,) for d in _schema_proj_test_data], schema="bin binary")
+        decoded = _decode_schema_proj(
+            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
+        return df.select(
+            decoded.getField("id").alias("id"),
+            decoded.getField("name").alias("name"),
+            decoded.getField("detail").getField("a").alias("detail_a"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)

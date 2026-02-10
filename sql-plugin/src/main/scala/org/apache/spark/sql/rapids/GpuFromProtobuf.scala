@@ -208,6 +208,11 @@ case class GpuFromProtobuf(
  * @param enumValidValues Valid enum values for each field
  * @param failOnErrors If true, throw exception on malformed data
  */
+/**
+ * @param nestedPrunedFields For nested schema projection: maps top-level field name to the
+ *                           ordered list of decoded child field names. Only present for fields
+ *                           where children were pruned. If empty map, no nested pruning.
+ */
 case class GpuFromProtobufNested(
     fullSchema: StructType,
     decodedTopLevelIndices: Array[Int],
@@ -225,19 +230,25 @@ case class GpuFromProtobufNested(
     defaultBools: Array[Boolean],
     defaultStrings: Array[Array[Byte]],
     enumValidValues: Array[Array[Int]],
+    nestedPrunedFields: Map[String, Seq[String]],
     failOnErrors: Boolean,
     child: Expression)
   extends GpuUnaryExpression with ExpectsInputTypes with NullIntolerantShim {
 
   override def inputTypes: Seq[AbstractDataType] = Seq(BinaryType)
 
+  // Output full schema so downstream GetStructField ordinals remain valid.
+  // The GPU decoder only decodes needed fields (schema projection), but the
+  // output is expanded to match fullSchema by inserting null columns.
   override def dataType: DataType = fullSchema.asNullable
 
   override def nullable: Boolean = true
 
-  // Check if schema projection is active (not all fields are decoded)
+  // Schema projection is active when not all top-level fields are decoded,
+  // or when nested children are pruned.
   private val needsSchemaExpansion: Boolean =
-    decodedTopLevelIndices.length != fullSchema.fields.length
+    decodedTopLevelIndices.length != fullSchema.fields.length ||
+    nestedPrunedFields.nonEmpty
 
   override protected def doColumnar(input: GpuColumnVector): cudf.ColumnVector = {
     val numRows = input.getRowCount.toInt
@@ -264,7 +275,7 @@ case class GpuFromProtobufNested(
         throw new org.apache.spark.SparkException("Malformed protobuf message", e)
     }
 
-    // Expand to full schema if needed (schema projection is active)
+    // Expand to full schema if needed (insert null columns for non-decoded fields)
     val expanded = if (needsSchemaExpansion) {
       withResource(jniResult) { decoded =>
         expandToFullSchema(decoded, numRows)
@@ -284,12 +295,9 @@ case class GpuFromProtobufNested(
   }
 
   /**
-   * Expand a projected struct to match fullSchema by inserting null columns
-   * for fields that were not decoded.
-   *
-   * @param decoded The decoded struct with only decodedTopLevelIndices fields
-   * @param numRows Number of rows in the output
-   * @return A new struct column matching fullSchema
+   * Expand a decoded struct (with only decoded fields) to match fullSchema
+   * by inserting null columns for non-decoded fields. For fields with nested
+   * schema pruning, inserts null columns for pruned nested children.
    */
   private def expandToFullSchema(decoded: cudf.ColumnVector, numRows: Int): cudf.ColumnVector = {
     val children = new Array[cudf.ColumnVector](fullSchema.fields.length)
@@ -299,24 +307,88 @@ case class GpuFromProtobufNested(
       for (i <- fullSchema.fields.indices) {
         if (decodedIdx < decodedTopLevelIndices.length &&
             decodedTopLevelIndices(decodedIdx) == i) {
-          // This field was decoded - copy it from the result
-          withResource(decoded.getChildColumnView(decodedIdx)) { childView =>
-            children(i) = childView.copyToColumnVector()
+          val fieldName = fullSchema.fields(i).name
+          nestedPrunedFields.get(fieldName) match {
+            case Some(decodedNames) =>
+              // Nested pruning: expand inner struct by inserting null children
+              withResource(decoded.getChildColumnView(decodedIdx)) { childView =>
+                children(i) = expandNestedField(
+                  childView, fullSchema.fields(i).dataType, decodedNames, numRows)
+              }
+            case None =>
+              withResource(decoded.getChildColumnView(decodedIdx)) { childView =>
+                children(i) = childView.copyToColumnVector()
+              }
           }
           decodedIdx += 1
         } else {
-          // This field was not decoded - create a null column
           children(i) = GpuColumnVector.columnVectorFromNull(numRows, fullSchema.fields(i).dataType)
         }
       }
 
-      // makeStruct copies the children, so we must close them after
       cudf.ColumnVector.makeStruct(numRows, children: _*)
     } finally {
-      // Always close children - makeStruct copies them, doesn't take ownership
-      children.foreach { col =>
-        if (col != null) col.close()
+      children.foreach(col => if (col != null) col.close())
+    }
+  }
+
+  /**
+   * Expand a decoded field with pruned nested children to match the full type.
+   */
+  private def expandNestedField(
+      decoded: cudf.ColumnView,
+      fullType: DataType,
+      decodedChildNames: Seq[String],
+      numRows: Int): cudf.ColumnVector = {
+    fullType match {
+      case st: StructType =>
+        expandStructChildren(decoded, st, decodedChildNames, decoded.getRowCount.toInt)
+
+      case ArrayType(st: StructType, _) =>
+        // LIST<STRUCT>: expand struct child, rebuild list
+        withResource(decoded.getChildColumnView(1)) { structChild =>
+          val structRows = structChild.getRowCount.toInt
+          withResource(expandStructChildren(structChild, st, decodedChildNames, structRows)) {
+            expandedStruct =>
+              withResource(decoded.replaceListChild(expandedStruct)) { expandedList =>
+                expandedList.copyToColumnVector()
+              }
+          }
+        }
+
+      case _ =>
+        decoded.copyToColumnVector()
+    }
+  }
+
+  /**
+   * Expand a STRUCT by inserting null columns for pruned children.
+   */
+  private def expandStructChildren(
+      decoded: cudf.ColumnView,
+      targetSchema: StructType,
+      decodedChildNames: Seq[String],
+      numRows: Int): cudf.ColumnVector = {
+    val children = new Array[cudf.ColumnVector](targetSchema.fields.length)
+    var decodedChildIdx = 0
+
+    try {
+      for (i <- targetSchema.fields.indices) {
+        if (decodedChildIdx < decodedChildNames.length &&
+            decodedChildNames(decodedChildIdx) == targetSchema.fields(i).name) {
+          withResource(decoded.getChildColumnView(decodedChildIdx)) { childView =>
+            children(i) = childView.copyToColumnVector()
+          }
+          decodedChildIdx += 1
+        } else {
+          children(i) = GpuColumnVector.columnVectorFromNull(
+            numRows, targetSchema.fields(i).dataType)
+        }
       }
+
+      cudf.ColumnVector.makeStruct(numRows, children: _*)
+    } finally {
+      children.foreach(col => if (col != null) col.close())
     }
   }
 }

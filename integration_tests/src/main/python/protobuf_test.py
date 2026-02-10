@@ -2916,3 +2916,103 @@ def test_from_protobuf_schema_proj_scalar_plus_nested(spark_tmp_path):
             decoded.getField("detail").getField("a").alias("detail_a"))
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_schema_proj_repeated_msg_single_subfield(spark_tmp_path):
+    """Select items.a from repeated message (ArrayType(StructType)) -- prune b, c.
+    Tests Option A: GetArrayStructFields ordinal remapping for pruned repeated messages."""
+    from_protobuf_fn = _try_import_from_protobuf()
+    if from_protobuf_fn is None:
+        pytest.skip("from_protobuf not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM not available")
+
+    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(d,) for d in _schema_proj_test_data], schema="bin binary")
+        decoded = _decode_schema_proj(
+            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
+        # items is repeated Detail {a, b, c} -- select only items.a
+        return df.select(
+            decoded.getField("id").alias("id"),
+            decoded.getField("items").getField("a").alias("items_a"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_schema_proj_repeated_msg_two_subfields(spark_tmp_path):
+    """Select items.a and items.c from repeated message -- prune b."""
+    from_protobuf_fn = _try_import_from_protobuf()
+    if from_protobuf_fn is None:
+        pytest.skip("from_protobuf not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM not available")
+
+    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(d,) for d in _schema_proj_test_data], schema="bin binary")
+        decoded = _decode_schema_proj(
+            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
+        return df.select(
+            decoded.getField("items").getField("a").alias("items_a"),
+            decoded.getField("items").getField("c").alias("items_c"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_schema_proj_repeated_whole_no_pruning(spark_tmp_path):
+    """Select whole repeated message -- should NOT prune children."""
+    from_protobuf_fn = _try_import_from_protobuf()
+    if from_protobuf_fn is None:
+        pytest.skip("from_protobuf not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM not available")
+
+    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(d,) for d in _schema_proj_test_data], schema="bin binary")
+        decoded = _decode_schema_proj(
+            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
+        return df.select(
+            decoded.getField("id").alias("id"),
+            decoded.getField("items").alias("items"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_schema_proj_mix_struct_and_repeated(spark_tmp_path):
+    """Select sub-fields from both non-repeated struct and repeated message."""
+    from_protobuf_fn = _try_import_from_protobuf()
+    if from_protobuf_fn is None:
+        pytest.skip("from_protobuf not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM not available")
+
+    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(d,) for d in _schema_proj_test_data], schema="bin binary")
+        decoded = _decode_schema_proj(
+            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
+        # Mix: detail.a (non-repeated struct) + items.c (repeated message)
+        return df.select(
+            decoded.getField("id").alias("id"),
+            decoded.getField("detail").getField("a").alias("detail_a"),
+            decoded.getField("items").getField("c").alias("items_c"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)

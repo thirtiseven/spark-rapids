@@ -439,48 +439,41 @@ object ProtobufExprShims {
               // add child fields
               sf.dataType match {
                 case st: StructType if nestedMsgDesc != null =>
-                  // Non-repeated nested message - pruning OK
-                  addChildFieldsFromStruct(st, nestedMsgDesc, sf.name, currentIdx, depth,
-                    isRepeatedParent = false)
+                  // Non-repeated nested message
+                  addChildFieldsFromStruct(st, nestedMsgDesc, sf.name, currentIdx, depth)
                   
                 case ArrayType(st: StructType, _) if nestedMsgDesc != null =>
-                  // Repeated message field - no pruning (expansion too expensive for arrays)
-                  addChildFieldsFromStruct(st, nestedMsgDesc, sf.name, currentIdx, depth,
-                    isRepeatedParent = true)
+                  // Repeated message field (pruned via Option A ordinal remapping)
+                  addChildFieldsFromStruct(st, nestedMsgDesc, sf.name, currentIdx, depth)
                   
                 case _ => // Not a struct, no children to add
               }
             }
             
-            // Helper to add child fields from a struct type
-            // isRepeatedParent: if true, this is a repeated message field (ArrayType(StructType)).
-            // Nested pruning is disabled for repeated fields because expanding the inner struct
-            // (inserting null columns per element) is too expensive for large arrays.
+            // Helper to add child fields from a struct type.
+            // Applies nested schema pruning for ALL struct types (both repeated and non-repeated).
+            // For repeated message fields (ArrayType(StructType)), the pruned output is handled
+            // by ordinal remapping in GpuGetArrayStructFieldsMeta (Option A), not by expansion.
             def addChildFieldsFromStruct(
                 st: StructType,
                 parentMsgDesc: AnyRef,
                 fieldName: String,
                 parentIdx: Int,
-                parentDepth: Int,
-                isRepeatedParent: Boolean): Unit = {
+                parentDepth: Int): Unit = {
               val fd = invoke1[AnyRef](
                 parentMsgDesc, "findFieldByName", classOf[String], fieldName)
               if (fd != null) {
                 Try {
                   val childMsgDesc = invoke0[AnyRef](fd, "getMessageType")
                   // Filter children based on nested schema projection requirements.
-                  // ONLY for non-repeated struct fields. For repeated message fields
-                  // (ArrayType(StructType)), always decode all children because
-                  // post-expansion of inner LIST struct elements is too memory-expensive.
-                  val filteredFields = if (!isRepeatedParent) {
-                    val requiredChildren = nestedFieldRequirements.get(fieldName)
-                    requiredChildren match {
-                      case Some(Some(childNames)) =>
-                        st.fields.filter(f => childNames.contains(f.name))
-                      case _ => st.fields
-                    }
-                  } else {
-                    st.fields  // Always decode all children for repeated messages
+                  val requiredChildren = nestedFieldRequirements.get(fieldName)
+                  val filteredFields = requiredChildren match {
+                    case Some(Some(childNames)) =>
+                      // Only add required children (nested schema projection)
+                      st.fields.filter(f => childNames.contains(f.name))
+                    case _ =>
+                      // None (field not in map) or Some(None) (whole field needed)
+                      st.fields
                   }
                   filteredFields.foreach { childSf =>
                     val childFd = invoke1[AnyRef](
@@ -759,19 +752,14 @@ object ProtobufExprShims {
          * @return Set of field names that are actually required
          */
         private def analyzeRequiredFields(allFieldNames: Set[String]): Set[String] = {
-          // Try to find parent SparkPlanMeta and analyze downstream Project
           val parentPlanOpt = findParentPlanMeta()
 
           parentPlanOpt match {
             case Some(planMeta) =>
-              // First, try to analyze the immediate parent
               analyzeDownstreamProject(planMeta) match {
                 case Some(fields) if fields.nonEmpty =>
-                  // Successfully identified required fields via schema projection
                   fields
                 case _ =>
-                  // The immediate parent might be a ProjectExec that just aliases the output.
-                  // Try to look at its parent (the grandparent) for GetStructField references.
                   planMeta.parent match {
                     case Some(grandParentMeta: SparkPlanMeta[_]) =>
                       analyzeDownstreamProject(grandParentMeta) match {
@@ -782,7 +770,6 @@ object ProtobufExprShims {
                   }
               }
             case None =>
-              // No parent SparkPlanMeta found in the meta tree, assume all fields are needed
               allFieldNames
           }
         }
@@ -978,28 +965,43 @@ object ProtobufExprShims {
 
         override def convertToGpu(child: Expression): GpuExpression = {
           if (useNestedApi) {
-            // Build nested pruned fields map for schema expansion after decoding.
-            // Only include NON-repeated struct fields. Repeated message fields
-            // (ArrayType(StructType)) are NOT pruned (all children are decoded)
-            // because expanding inner LIST struct elements is too memory-expensive.
+            // Build nested pruned fields map for ALL struct types (both repeated and non-repeated).
+            // For repeated message fields (ArrayType(StructType)), pruning is handled via
+            // ordinal remapping in GpuGetArrayStructFieldsMeta (Option A) instead of expansion.
             val prunedFieldsMap: Map[String, Seq[String]] = nestedFieldRequirements.collect {
               case (fieldName, Some(childNames)) =>
                 val fieldIdx = fullSchema.fieldIndex(fieldName)
-                val fieldType = fullSchema.fields(fieldIdx).dataType
-                fieldType match {
-                  case _: StructType =>
-                    // Non-repeated struct: pruning IS applied
-                    val childSchema = fieldType.asInstanceOf[StructType]
-                    val orderedNames = childSchema.fields
-                      .map(_.name)
-                      .filter(childNames.contains)
-                      .toSeq
-                    Some(fieldName -> orderedNames)
-                  case _ =>
-                    // ArrayType(StructType) or other: pruning NOT applied, skip
-                    None
+                val childSchema = fullSchema.fields(fieldIdx).dataType match {
+                  case st: StructType => st
+                  case ArrayType(st: StructType, _) => st
+                  case _ => null
                 }
-            }.flatten.toMap
+                if (childSchema != null) {
+                  // Preserve the original field order
+                  val orderedNames = childSchema.fields
+                    .map(_.name)
+                    .filter(childNames.contains)
+                    .toSeq
+                  fieldName -> orderedNames
+                } else {
+                  fieldName -> childNames.toSeq
+                }
+            }
+
+            // Register pruned field ordinal mappings for GpuGetArrayStructFieldsMeta.
+            // For each pruned ArrayType(StructType) field, map child field names to their
+            // ordinal in the pruned struct so runtime column access uses correct indices.
+            val ordinalMappings = prunedFieldsMap.flatMap { case (parentName, childNames) =>
+              val fieldIdx = fullSchema.fieldIndex(parentName)
+              fullSchema.fields(fieldIdx).dataType match {
+                case ArrayType(_: StructType, _) =>
+                  childNames.zipWithIndex.map { case (name, idx) => name -> idx }
+                case _ => Seq.empty
+              }
+            }
+            if (ordinalMappings.nonEmpty) {
+              GpuFromProtobufNested.registerPrunedFields(ordinalMappings)
+            }
 
             GpuFromProtobufNested(
               fullSchema, nestedDecodedTopLevelIndices, nestedFieldNumbers, nestedParentIndices,

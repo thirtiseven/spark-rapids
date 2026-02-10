@@ -16,7 +16,7 @@
 
 package com.nvidia.spark.rapids.sequencefile
 
-import java.io.{DataOutputStream, FileNotFoundException, IOException}
+import java.io.{FileNotFoundException, IOException}
 import java.net.URI
 import java.util
 import java.util.Optional
@@ -298,30 +298,48 @@ private[sequencefile] final class HostBinaryListBufferer(
     val exactDataSize = dataLocation
     val exactOffsetsSize = (numRows + 1).toLong * DType.INT32.getSizeInBytes
 
-    // ALWAYS copy to exactly-sized buffers to avoid garbage data
-    // This is critical because:
-    // 1. HostAlloc.alloc doesn't zero-initialize memory
-    // 2. cuDF's copyToDevice uses the buffer's full length, not the logical row count
-    // 3. Even if exactDataSize == dataBuffer.getLength, there could be alignment padding
+    // Copy to exactly-sized buffers only if the over-allocation is significant.
+    // cuDF's HostColumnVector.copyToDevice() for flat types (like the UINT8 child) uses
+    // numRows * dtype.getSizeInBytes() to determine the copy size, not the buffer's
+    // allocated length. So small over-allocation is safe. However, large over-allocation
+    // wastes pinned memory and H2D bandwidth, so we copy when the buffer is >25% oversized.
     val exactDataBuffer = if (exactDataSize > 0) {
-      closeOnExcept(dataBuffer) { _ =>
-        val newBuf = HostAlloc.alloc(exactDataSize, preferPinned = true)
-        newBuf.copyFromHostBuffer(0, dataBuffer, 0, exactDataSize)
-        dataBuffer.close()
-        newBuf
+      if (dataBuffer.getLength <= exactDataSize * 5 / 4) {
+        // Buffer is close to the exact size - reuse directly (no copy)
+        val buf = dataBuffer
+        dataBuffer = null
+        buf
+      } else {
+        // Buffer is significantly over-allocated - copy to exact size
+        closeOnExcept(dataBuffer) { _ =>
+          val newBuf = HostAlloc.alloc(exactDataSize, preferPinned = true)
+          newBuf.copyFromHostBuffer(0, dataBuffer, 0, exactDataSize)
+          dataBuffer.close()
+          dataBuffer = null
+          newBuf
+        }
       }
     } else {
       // For empty data, still need a valid (but minimal) buffer
       dataBuffer.close()
+      dataBuffer = null
       HostAlloc.alloc(1L, preferPinned = true)
     }
 
     val exactOffsetsBuffer = closeOnExcept(exactDataBuffer) { _ =>
-      closeOnExcept(offsetsBuffer) { _ =>
-        val newBuf = HostAlloc.alloc(exactOffsetsSize, preferPinned = true)
-        newBuf.copyFromHostBuffer(0, offsetsBuffer, 0, exactOffsetsSize)
-        offsetsBuffer.close()
-        newBuf
+      if (offsetsBuffer.getLength <= exactOffsetsSize * 5 / 4) {
+        // Buffer is close to the exact size - reuse directly
+        val buf = offsetsBuffer
+        offsetsBuffer = null
+        buf
+      } else {
+        closeOnExcept(offsetsBuffer) { _ =>
+          val newBuf = HostAlloc.alloc(exactOffsetsSize, preferPinned = true)
+          newBuf.copyFromHostBuffer(0, offsetsBuffer, 0, exactOffsetsSize)
+          offsetsBuffer.close()
+          offsetsBuffer = null
+          newBuf
+        }
       }
     }
 
@@ -391,8 +409,9 @@ class SequenceFilePartitionReader(
   private[this] val keyBuf = new DataOutputBuffer()
   private[this] val valueBytes = reader.createValueBytes()
 
+  // Reusable buffer for value byte extraction. DataOutputBuffer extends DataOutputStream,
+  // and getData() returns the internal array without copying (unlike ByteArrayOutputStream).
   private[this] val pendingValueOut = new DataOutputBuffer()
-  private[this] val pendingValueDos = new DataOutputStream(pendingValueOut)
 
   private[this] var pending: Option[PendingRecord] = None
   private[this] var exhausted = false
@@ -431,7 +450,7 @@ class SequenceFilePartitionReader(
     val valueArr =
       if (wantsValue) {
         pendingValueOut.reset()
-        valueBytes.writeUncompressedBytes(pendingValueDos)
+        valueBytes.writeUncompressedBytes(pendingValueOut)
         Some(util.Arrays.copyOf(pendingValueOut.getData, pendingValueOut.getLength))
       } else None
     PendingRecord(keyArr, valueArr, recordBytes(keyLen, valueLen))
@@ -502,7 +521,15 @@ class SequenceFilePartitionReader(
                 keepReading = false
               } else {
                 keyBuf.foreach(_.addBytesWritablePayload(this.keyBuf.getData, 0, keyLen))
-                valBuf.foreach(_.addValueBytes(valueBytes, valueLen))
+                // Use reusable pendingValueOut instead of per-record ByteArrayOutputStream.
+                // This matches the efficient key path: getData() returns internal array
+                // (zero-copy), then addBytesWritablePayload does a single copy to host buffer.
+                valBuf.foreach { vb =>
+                  pendingValueOut.reset()
+                  valueBytes.writeUncompressedBytes(pendingValueOut)
+                  vb.addBytesWritablePayload(
+                    pendingValueOut.getData, 0, pendingValueOut.getLength)
+                }
                 rows += 1
                 bytes += recBytes
               }
@@ -1003,10 +1030,14 @@ class MultiFileCloudSequenceFilePartitionReader(
         val keyDataOut = new DataOutputBuffer()
         val valueBytes = reader.createValueBytes()
 
-        // Use streaming buffers to avoid holding all data in Java heap.
-        // Start with reasonable initial sizes that will grow as needed.
-        val initialSize = math.min(partFile.length, 1024L * 1024L) // 1MB or file size
-        val initialRows = 1024
+        // Pre-allocate buffers based on the split size for fewer growth copies.
+        // For uncompressed SequenceFiles, the value data is roughly proportional to the
+        // split size. Using a generous initial estimate avoids repeated doubling + copy
+        // operations (each doubling copies all existing data to a new buffer).
+        val splitSize = partFile.length
+        val initialSize = math.max(math.min(splitSize, 256L * 1024L * 1024L), 1024L * 1024L)
+        val estimatedRows = math.max((splitSize / 512).toInt, 1024) // ~512 bytes/record estimate
+        val initialRows = math.min(estimatedRows, 4 * 1024 * 1024) // cap at 4M rows
 
         val keyBufferer = if (wantsKey) {
           Some(new HostBinaryListBufferer(initialSize, initialRows))
@@ -1017,6 +1048,12 @@ class MultiFileCloudSequenceFilePartitionReader(
             Some(new HostBinaryListBufferer(initialSize, initialRows))
           } else None
         }
+
+        // Reusable buffer for extracting value bytes from Hadoop ValueBytes.
+        // This avoids creating a new ByteArrayOutputStream per record (which was
+        // the #1 CPU-side performance bottleneck). DataOutputBuffer.getData() returns
+        // the internal array without copying, unlike ByteArrayOutputStream.toByteArray().
+        val valueDataOut = new DataOutputBuffer()
 
         withResource(keyBufferer) { keyBuf =>
           withResource(valueBufferer) { valBuf =>
@@ -1045,8 +1082,13 @@ class MultiFileCloudSequenceFilePartitionReader(
                   keyBuf.foreach(_.addBytesWritablePayload(keyDataOut.getData, 0, keyLen))
                 }
                 if (wantsValue) {
-                  val valueLen = valueBytes.getSize
-                  valBuf.foreach(_.addValueBytes(valueBytes, valueLen))
+                  // Use reusable DataOutputBuffer instead of per-record ByteArrayOutputStream.
+                  // getData() returns the internal array (zero-copy), then
+                  // addBytesWritablePayload does a single copy to the host buffer.
+                  valueDataOut.reset()
+                  valueBytes.writeUncompressedBytes(valueDataOut)
+                  valBuf.foreach(_.addBytesWritablePayload(
+                    valueDataOut.getData, 0, valueDataOut.getLength))
                 }
                 numRows += 1
               }

@@ -252,6 +252,239 @@ def test_from_protobuf_simple_parquet_binary_round_trip(spark_tmp_path):
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
 
+# =============================================================================
+# Integration Tests with Real Proto Files (nested_proto)
+# =============================================================================
+
+import os
+
+def _get_protobuf_test_resource_path():
+    """获取 protobuf 测试资源目录路径"""
+    # 从当前测试文件路径推导资源目录
+    # integration_tests/src/main/python/protobuf_test.py
+    # -> integration_tests/src/test/resources/protobuf_test/
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    # 从 src/main/python 到 src/test/resources
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
+    return os.path.join(base_dir, "src", "test", "resources", "protobuf_test")
+
+
+def _read_length_prefixed_messages(file_path: str) -> list:
+    """
+    读取 length-prefixed 格式的 protobuf 消息文件
+    每条消息格式: 4字节大端长度 + 消息内容
+    返回: 消息字节列表
+    """
+    messages = []
+    with open(file_path, 'rb') as f:
+        while True:
+            length_bytes = f.read(4)
+            if len(length_bytes) < 4:
+                break
+            length = struct.unpack('>I', length_bytes)[0]
+            data = f.read(length)
+            if len(data) < length:
+                break
+            messages.append(data)
+    return messages
+
+
+def _load_nested_proto_descriptor(spark, resource_base: str):
+    """
+    加载 nested_proto 的描述文件
+    优先使用预生成的 .desc 文件，如果不存在则尝试编译
+    """
+    desc_file = os.path.join(resource_base, "nested_proto", "generated", "main_log.desc")
+    
+    if not os.path.exists(desc_file):
+        # 尝试编译 proto 文件
+        proto_dir = os.path.join(resource_base, "nested_proto")
+        os.makedirs(os.path.dirname(desc_file), exist_ok=True)
+        
+        import subprocess
+        result = subprocess.run([
+            'protoc',
+            f'--descriptor_set_out={desc_file}',
+            '--include_imports',
+            f'-I{proto_dir}',
+            os.path.join(proto_dir, 'main_log.proto')
+        ], capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to compile proto: {result.stderr}")
+    
+    with open(desc_file, 'rb') as f:
+        return f.read()
+
+
+def _generate_nested_proto_test_data(resource_base: str, encoding: str, count: int = 50):
+    """
+    生成 nested_proto 测试数据
+    如果预生成的文件存在则读取，否则动态生成
+    """
+    import sys
+    
+    # 检查预生成的测试数据文件
+    pb_file = os.path.join(resource_base, "nested_proto", "generated", 
+                           f"main_log_{encoding}_{count}.pb")
+    
+    if os.path.exists(pb_file):
+        return _read_length_prefixed_messages(pb_file)
+    
+    # 动态生成（需要 generate_test_data.py）
+    generator_path = os.path.join(resource_base, "generate_test_data.py")
+    if not os.path.exists(generator_path):
+        raise FileNotFoundError(
+            f"Test data file not found: {pb_file}\n"
+            f"Please run gen_nested_proto_data.sh to generate test data first."
+        )
+    
+    # 动态导入生成器
+    sys.path.insert(0, resource_base)
+    try:
+        from generate_test_data import ProtobufDataGenerator
+        
+        desc_file = os.path.join(resource_base, "nested_proto", "generated", "main_log.desc")
+        generator = ProtobufDataGenerator(encoding=encoding, seed=42)
+        generator.load_descriptor_set(desc_file)
+        
+        messages = []
+        for _ in range(count):
+            data = generator.generate_message("MainLogRecord")
+            messages.append(data)
+        return messages
+    finally:
+        sys.path.remove(resource_base)
+
+@pytest.mark.skip(reason="Support pending")
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_nested_proto(spark_tmp_path):
+    """
+    Integration test with real nested proto files.
+    Tests complex nested structure with multiple imported proto files.
+    """
+    from_protobuf = _try_import_from_protobuf()
+    if from_protobuf is None:
+        pytest.skip("from_protobuf not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM not available")
+
+    resource_base = _get_protobuf_test_resource_path()
+    desc_file = os.path.join(resource_base, "nested_proto", "generated", "main_log.desc")
+    
+    # 检查描述文件是否存在
+    if not os.path.exists(desc_file):
+        gen_script = os.path.join(resource_base, "gen_nested_proto_data.sh")
+        pytest.skip(f"Descriptor file not found: {desc_file}. "
+                   f"Please run the script first:\n"
+                   f"  cd {resource_base} && ./gen_nested_proto_data.sh\n"
+                   f"Or directly: bash {gen_script}")
+    
+    message_name = "com.test.proto.sample.MainLogRecord"
+    
+    # 加载描述文件
+    with open(desc_file, 'rb') as desc_fp:
+        desc_bytes = desc_fp.read()
+    
+    # 复制描述文件到临时路径（供某些 Spark 版本使用）
+    desc_path = spark_tmp_path + "/main_log.desc"
+    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
+    
+    # 生成或加载测试数据
+    try:
+        # 默认使用 utf8
+        test_messages = _generate_nested_proto_test_data(resource_base, 'utf8', count=50)
+    except FileNotFoundError as e:
+        pytest.skip(str(e))
+    
+    def run_on_spark(spark):
+        # 创建包含二进制 protobuf 数据的 DataFrame
+        rows = [(msg,) for msg in test_messages] + [(None,)]
+        df = spark.createDataFrame(rows, schema="bin binary")
+        
+        sig = inspect.signature(from_protobuf)
+        if "binaryDescriptorSet" in sig.parameters:
+            decoded = from_protobuf(
+                f.col("bin"), message_name,
+                binaryDescriptorSet=bytearray(desc_bytes))
+        else:
+            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
+        
+        # 直接比较整个 decoded struct，会递归比较所有嵌套字段
+        return df.select(decoded.alias("decoded"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skip(reason="Support pending")
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_nested_proto_with_options(spark_tmp_path):
+    """
+    Integration test with real nested proto files using options.
+    Tests passing options like 'enums.as.ints'.
+    """
+    from_protobuf = _try_import_from_protobuf()
+    if from_protobuf is None:
+        pytest.skip("from_protobuf not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM not available")
+
+    resource_base = _get_protobuf_test_resource_path()
+    desc_file = os.path.join(resource_base, "nested_proto", "generated", "main_log.desc")
+    
+    # Check if descriptor file exists
+    if not os.path.exists(desc_file):
+        gen_script = os.path.join(resource_base, "gen_nested_proto_data.sh")
+        pytest.skip(f"Descriptor file not found: {desc_file}. "
+                   f"Please run the script first:\n"
+                   f"  cd {resource_base} && ./gen_nested_proto_data.sh\n"
+                   f"Or directly: bash {gen_script}")
+    
+    message_name = "com.test.proto.sample.MainLogRecord"
+    
+    with open(desc_file, 'rb') as desc_fp:
+        desc_bytes = desc_fp.read()
+    
+    desc_path = spark_tmp_path + "/main_log.desc"
+    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
+    
+    try:
+        test_messages = _generate_nested_proto_test_data(resource_base, 'utf8', count=50)
+    except FileNotFoundError as e:
+        pytest.skip(str(e))
+    
+    def run_on_spark(spark):
+        rows = [(msg,) for msg in test_messages] + [(None,)]
+        df = spark.createDataFrame(rows, schema="bin binary")
+        
+        options = {"enums.as.ints": "true"}
+        sig = inspect.signature(from_protobuf)
+        
+        # Check signature to see how to pass options
+        if "binaryDescriptorSet" in sig.parameters:
+            if "options" in sig.parameters:
+                decoded = from_protobuf(
+                    f.col("bin"), message_name,
+                    binaryDescriptorSet=bytearray(desc_bytes),
+                    options=options)
+            else:
+                # Fallback if options param is missing but binaryDescriptorSet exists (unlikely in newer versions)
+                decoded = from_protobuf(
+                    f.col("bin"), message_name,
+                    binaryDescriptorSet=bytearray(desc_bytes))
+        else:
+            if "options" in sig.parameters:
+                decoded = from_protobuf(f.col("bin"), message_name, desc_path, options)
+            else:
+                decoded = from_protobuf(f.col("bin"), message_name, desc_path)
+        
+        return df.select(decoded.alias("decoded"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
 def test_from_protobuf_simple_null_input_returns_null(spark_tmp_path):

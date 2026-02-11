@@ -160,7 +160,7 @@ class SequenceFileBinaryFileFormat extends FileFormat with Serializable {
             // 2. Read the record
             // 3. If posBeforeRead >= end AND syncSeen (from this read), DISCARD the record
             // This ensures each record is processed by exactly one split.
-            // Note: For block-compressed files, effectiveEnd is Long.MaxValue so we read all records.
+            // Note: For block-compressed files, effectiveEnd is Long.MaxValue to read all records
             val posBeforeRead = reader.getPosition
             val recLen = reader.nextRaw(keyBuf, valueBytes)
             if (recLen < 0) {

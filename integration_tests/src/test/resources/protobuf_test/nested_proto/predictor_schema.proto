@@ -1,0 +1,80 @@
+package com.test.proto.sample;
+
+// 预测Schema - 用于测试多层Schema嵌套结构
+
+// ========== 主Schema结构 ==========
+message PredictorSchema {
+    optional SchemaTypeA type_a_schema = 1;      // 嵌套
+    optional SchemaTypeB type_b_schema = 2;      // 嵌套
+    optional SchemaTypeC type_c_schema = 3;      // 嵌套(含repeated)
+}
+
+// ========== TypeA Query Schema ==========
+message TypeAQuerySchema {
+    optional string keyword = 1;            // 关键词
+    optional string session_id = 2;         // 会话id
+}
+
+// ========== TypeA Pair Schema ==========
+message TypeAPairSchema {
+    optional string record_id = 1;          // 记录id
+    optional string item_id = 2;            // 条目id
+}
+
+// ========== TypeA Schema ==========
+message SchemaTypeA {
+    optional TypeAQuerySchema query_schema = 1;   // query级别schema
+    repeated TypeAPairSchema pair_schema = 2;     // pair列表 - repeated嵌套
+}
+
+// ========== TypeB Query Schema ==========
+message TypeBQuerySchema {
+    optional string profile_tag_id = 1;     // 画像tag id
+    optional string entity_id = 2;          // 实体id
+}
+
+// ========== TypeB Style Element ==========
+message TypeBStyleElem {
+    optional string template_id = 1;        // 模板id
+    optional string material_id = 2;        // 素材id
+}
+
+// ========== TypeB Style Schema ==========
+message TypeBStyleSchema {
+    repeated TypeBStyleElem values = 1;     // 元素列表 - repeated嵌套
+}
+
+// ========== TypeB Schema ==========
+message SchemaTypeB {
+    optional TypeBQuerySchema query_schema = 1;     // query级别schema
+    repeated TypeBStyleSchema style_schema = 2;     // style列表 - repeated嵌套
+}
+
+// ========== TypeC Query Schema ==========
+message TypeCQuerySchema {
+    optional string keyword = 1;            // 关键词
+    optional string category = 2;           // 分类
+}
+
+// ========== TypeC Pair Schema ==========
+message TypeCPairSchema {
+    optional string item_id = 1;            // 条目id
+    optional string target_url = 2;         // 目标url
+}
+
+// ========== TypeC Style Element (空结构测试) ==========
+message TypeCStyleElem {
+    // 空message - 用于测试空结构
+}
+
+// ========== TypeC Style Schema ==========
+message TypeCStyleSchema {
+    repeated TypeCStyleElem values = 1;     // 空元素列表
+}
+
+// ========== TypeC Schema (完整三层结构) ==========
+message SchemaTypeC {
+    optional TypeCQuerySchema query_schema = 1;     // query schema
+    repeated TypeCPairSchema pair_schema = 2;       // pair列表
+    repeated TypeCStyleSchema style_schema = 3;     // style列表
+}

@@ -1,0 +1,27 @@
+package com.test.proto.sample;
+
+// 模块B响应字段
+message ModuleBResField { 
+    optional uint32 type_code = 1;        // uint32
+    optional string extra_info = 2;       // string
+}
+
+// 块元素 - 测试repeated基础类型
+message BlockElement {
+    optional uint64 element_id = 1;       // uint64
+    repeated uint64 ref_ids = 2;          // repeated uint64
+}
+
+// 块信息 - 测试repeated嵌套message
+message BlockInfo {
+    optional uint64 block_id = 1;         // uint64
+    repeated BlockElement elements = 2;   // repeated message
+}
+
+// 模块B详情字段
+message ModuleBDetailField {
+    repeated uint32 tags = 1;             // repeated uint32
+    optional uint64 item_id = 2;          // uint64
+    optional string name = 3;             // string
+    repeated BlockInfo blocks = 4;        // repeated message
+}

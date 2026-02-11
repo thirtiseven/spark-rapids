@@ -1,0 +1,101 @@
+package com.test.proto.sample;
+
+import "module_a_res.proto";
+import "module_b_res.proto";
+import "device_req.proto";
+
+// ========== 枚举类型测试 ==========
+enum SourceType {
+    WEB    = 0;   // 网页
+    APP    = 1;   // 应用
+    MOBILE = 4;   // 移动端
+}
+
+enum ChannelType {
+    CHANNEL_A = 0;
+    CHANNEL_B = 1;
+}
+
+// ========== 主日志结构 ==========
+message MainLogRecord {
+    // required字段
+    required SourceType source = 1;           // required枚举
+    required uint64 timestamp = 2;            // required uint64
+    
+    // optional基础类型 - 每种1个
+    optional string user_id = 3;              // string
+    optional int64 account_id = 4;            // int64
+    optional fixed32 client_ip = 5;           // fixed32
+    
+    // 嵌套message
+    optional LogContent log_content = 6;
+}
+
+// ========== 日志内容(多层嵌套) ==========
+message LogContent {
+    optional BasicInfo basic_info = 1;
+    repeated ChannelInfo channel_list = 2;
+    repeated DataSourceField source_list = 3;
+}
+
+// ========== 基础信息(三层嵌套) ==========
+message BasicInfo {
+    optional RequestInfo request_info = 1;
+    optional ExtendedReqInfo extended_req_info = 2;
+    optional ServerAddedField server_added_field = 3;
+}
+
+// ========== 请求信息 ==========
+message RequestInfo {
+    optional uint32 page_num = 1;                   // uint32
+    optional string channel_code = 2;               // string
+    repeated uint32 experiment_ids = 3;             // repeated uint32
+    optional bool is_filtered = 4;                  // bool
+}
+
+// ========== 扩展请求信息(跨文件import) ==========
+message ExtendedReqInfo {
+    optional DeviceReqField device_req_field = 1;   // 引用外部proto
+}
+
+// ========== 服务端添加字段 ==========
+message ServerAddedField {
+    optional uint32 region_code = 1;                // uint32
+    optional string flow_type = 2;                  // string
+    optional int32 filter_result = 3;               // int32
+    repeated int32 hit_rule_list = 4;               // repeated int32
+    optional uint64 request_time = 5;               // uint64
+    optional bool skip_flag = 6;                    // bool
+}
+
+// ========== 渠道信息 ==========
+message ChannelInfo {
+    optional int32 channel_id = 1;
+    optional ModuleAResField module_a_res = 2;      // 引用外部proto
+}
+
+// ========== 数据源渠道信息 ==========
+message SrcChannelInfo {
+    optional int32 channel_id = 1;
+    optional ModuleASrcResField module_a_src_res = 2;  // 引用外部proto
+}
+
+// ========== 数据源字段 ==========
+message DataSourceField {
+    optional uint32 source_id = 1;
+    repeated SrcChannelInfo src_channel_list = 2;
+    optional string billing_name = 3;
+    repeated ItemDetailField item_list = 4;
+    optional bool is_free = 5;
+}
+
+// ========== 条目详情字段 ==========
+message ItemDetailField {
+    optional uint32 rank = 1;                       // uint32
+    optional uint64 record_id = 2;                  // uint64
+    optional string keyword = 3;                    // string
+    
+    // 跨文件message引用
+    optional ModuleADetailField module_a_detail = 4;
+    optional ModuleBDetailField module_b_detail = 5;
+}

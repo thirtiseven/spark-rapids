@@ -411,7 +411,7 @@ class GpuGetArrayStructFieldsMeta(
 
   def convertToGpu(child: Expression): GpuExpression = {
     // Check the global protobuf pruned field registry to remap ordinal
-    val runtimeOrd = GpuFromProtobufNested.getPrunedOrdinal(expr.field.name)
+    val runtimeOrd = GpuFromProtobuf.getPrunedOrdinal(expr.field.name)
     GpuGetArrayStructFields(child, expr.field, expr.ordinal, expr.numFields,
       expr.containsNull, runtimeOrd)
   }
@@ -442,7 +442,7 @@ case class GpuGetArrayStructFields(
     val fieldView = withResource(base.getChildColumnView(0)) { structView =>
       val actualChildren = structView.getNumChildren
       // Handle nested schema projection (Option A): the actual struct may have
-      // fewer children than numFields if GpuFromProtobufNested pruned the schema.
+      // fewer children than numFields if GpuFromProtobuf pruned the schema.
       // Use runtimeOrdinal (if set) when the struct was pruned.
       val effectiveOrdinal = if (runtimeOrdinal >= 0 && actualChildren < numFields) {
         runtimeOrdinal

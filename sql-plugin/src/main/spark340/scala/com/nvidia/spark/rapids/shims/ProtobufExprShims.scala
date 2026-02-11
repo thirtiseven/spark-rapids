@@ -45,7 +45,7 @@ import org.apache.spark.sql.catalyst.expressions.{
   AttributeReference, Expression, GetArrayStructFields, GetStructField, UnaryExpression
 }
 import org.apache.spark.sql.execution.ProjectExec
-import org.apache.spark.sql.rapids.{GpuFromProtobuf, GpuFromProtobufNested}
+import org.apache.spark.sql.rapids.GpuFromProtobuf
 import org.apache.spark.sql.types._
 
 /**
@@ -123,47 +123,25 @@ object ProtobufExprShims {
 
         // Full schema from the expression (must match original dataType for compatibility)
         private var fullSchema: StructType = _
-        // Indices into fullSchema for fields that will be decoded by GPU
-        private var decodedFieldIndices: Array[Int] = _
-        private var fieldNumbers: Array[Int] = _
-        // cudfTypeIds contains type IDs for ALL fields in fullSchema (for the new optimized API)
-        private var cudfTypeIds: Array[Int] = _
-        // cudfTypeScales: encodings for decoded fields (parallel to decodedFieldIndices)
-        private var cudfTypeScales: Array[Int] = _
-        // isRequired: whether each decoded field is required (parallel to decodedFieldIndices)
-        private var isRequired: Array[Boolean] = _
-        // hasDefaultValue: whether each decoded field has a default value
-        private var hasDefaultValue: Array[Boolean] = _
-        // defaultInts: default values for int/long/enum fields (0 if no default)
-        private var defaultInts: Array[Long] = _
-        // defaultFloats: default values for float/double fields (0.0 if no default)
-        private var defaultFloats: Array[Double] = _
-        // defaultBools: default values for bool fields (false if no default)
-        private var defaultBools: Array[Boolean] = _
-        // defaultStrings: default values for string/bytes fields (null if no default)
-        private var defaultStrings: Array[Array[Byte]] = _
-        // enumValidValues: valid enum values for each decoded field (null if not an enum)
-        private var enumValidValues: Array[Array[Int]] = _
         private var failOnErrors: Boolean = _
 
-        // Variables for nested API (used when schema has nested or repeated fields)
-        private var useNestedApi: Boolean = false
-        private var nestedFieldNumbers: Array[Int] = _
-        private var nestedParentIndices: Array[Int] = _
-        private var nestedDepthLevels: Array[Int] = _
-        private var nestedWireTypes: Array[Int] = _
-        private var nestedOutputTypeIds: Array[Int] = _
-        private var nestedEncodings: Array[Int] = _
-        private var nestedIsRepeated: Array[Boolean] = _
-        private var nestedIsRequired: Array[Boolean] = _
-        private var nestedHasDefaultValue: Array[Boolean] = _
-        private var nestedDefaultInts: Array[Long] = _
-        private var nestedDefaultFloats: Array[Double] = _
-        private var nestedDefaultBools: Array[Boolean] = _
-        private var nestedDefaultStrings: Array[Array[Byte]] = _
-        private var nestedEnumValidValues: Array[Array[Int]] = _
+        // Flattened schema variables for GPU decoding
+        private var flatFieldNumbers: Array[Int] = _
+        private var flatParentIndices: Array[Int] = _
+        private var flatDepthLevels: Array[Int] = _
+        private var flatWireTypes: Array[Int] = _
+        private var flatOutputTypeIds: Array[Int] = _
+        private var flatEncodings: Array[Int] = _
+        private var flatIsRepeated: Array[Boolean] = _
+        private var flatIsRequired: Array[Boolean] = _
+        private var flatHasDefaultValue: Array[Boolean] = _
+        private var flatDefaultInts: Array[Long] = _
+        private var flatDefaultFloats: Array[Double] = _
+        private var flatDefaultBools: Array[Boolean] = _
+        private var flatDefaultStrings: Array[Array[Byte]] = _
+        private var flatEnumValidValues: Array[Array[Int]] = _
         // Indices in fullSchema for top-level fields that were decoded (for schema projection)
-        private var nestedDecodedTopLevelIndices: Array[Int] = _
+        private var decodedTopLevelIndices: Array[Int] = _
 
         override def tagExprForGpu(): Unit = {
           fullSchema = e.dataType match {
@@ -244,99 +222,8 @@ object ProtobufExprShims {
           val indicesToDecode = fullSchema.fields.zipWithIndex.collect {
             case (sf, idx) if requiredFieldNames.contains(sf.name) => idx
           }
-          decodedFieldIndices = indicesToDecode
 
-          // Step 5: Build cudfTypeIds for ALL fields in fullSchema
-          // For unsupported types (nested struct, array, etc.), use INT8 as placeholder.
-          // These placeholder columns will be replaced with properly typed null columns in Scala.
-          cudfTypeIds = fullSchema.fields.map { sf =>
-            GpuFromProtobuf.sparkTypeToCudfIdOpt(sf.dataType)
-              .getOrElse(DType.INT8.getTypeId.getNativeId)  // placeholder for unsupported types
-          }
-
-          // Step 6: Build arrays for decoded fields only (parallel to decodedFieldIndices)
-          val fnums = new Array[Int](indicesToDecode.length)
-          val scales = new Array[Int](indicesToDecode.length)
-          val required = new Array[Boolean](indicesToDecode.length)
-          val hasDefaults = new Array[Boolean](indicesToDecode.length)
-          val defInts = new Array[Long](indicesToDecode.length)
-          val defFloats = new Array[Double](indicesToDecode.length)
-          val defBools = new Array[Boolean](indicesToDecode.length)
-          val defStrings = new Array[Array[Byte]](indicesToDecode.length)
-          val enumVals = new Array[Array[Int]](indicesToDecode.length)
-
-          indicesToDecode.zipWithIndex.foreach { case (schemaIdx, arrIdx) =>
-            val sf = fullSchema.fields(schemaIdx)
-            val info = fieldsInfoMap(sf.name)
-            fnums(arrIdx) = info.fieldNumber
-            scales(arrIdx) = info.encoding
-            required(arrIdx) = info.isRequired
-            hasDefaults(arrIdx) = info.hasDefaultValue
-
-            // Convert default value to the appropriate JNI type
-            if (info.hasDefaultValue && info.defaultValue.isDefined) {
-              val defVal = info.defaultValue.get
-              sf.dataType match {
-                case BooleanType =>
-                  defBools(arrIdx) = defVal.asInstanceOf[java.lang.Boolean]
-                case IntegerType | LongType =>
-                  // Protobuf returns Integer for int32, Long for int64
-                  defInts(arrIdx) = defVal match {
-                    case i: java.lang.Integer => i.longValue()
-                    case l: java.lang.Long => l.longValue()
-                    case _ => 0L
-                  }
-                case FloatType =>
-                  defFloats(arrIdx) = defVal.asInstanceOf[java.lang.Float].doubleValue()
-                case DoubleType =>
-                  defFloats(arrIdx) = defVal.asInstanceOf[java.lang.Double]
-                case StringType =>
-                  // Protobuf returns String, convert to UTF-8 bytes
-                  val str = defVal.asInstanceOf[String]
-                  defStrings(arrIdx) = if (str != null) str.getBytes("UTF-8") else null
-                case BinaryType =>
-                  // Protobuf returns ByteString, convert to byte array
-                  defStrings(arrIdx) = Try {
-                    invoke0[Array[Byte]](defVal.asInstanceOf[AnyRef], "toByteArray")
-                  }.getOrElse(null)
-                case _ =>
-                  // For other types (enums as ints, etc.)
-                  defVal match {
-                    case enumVal: AnyRef if info.protoTypeName == "ENUM" =>
-                      defInts(arrIdx) = Try {
-                        invoke0[java.lang.Integer](enumVal, "getNumber").longValue()
-                      }.getOrElse(0L)
-                    case _ => // leave as default (0)
-                  }
-              }
-            }
-
-            // Store enum valid values if this is an enum field
-            info.enumValues match {
-              case Some(values) => enumVals(arrIdx) = values.toArray.sorted
-              case None => enumVals(arrIdx) = null
-            }
-          }
-
-          fieldNumbers = fnums
-          cudfTypeScales = scales
-          isRequired = required
-          hasDefaultValue = hasDefaults
-          defaultInts = defInts
-          defaultFloats = defFloats
-          defaultBools = defBools
-          defaultStrings = defStrings
-          enumValidValues = enumVals
-
-          // Check if we need the nested API (for repeated fields or nested messages)
-          // Only check fields that will actually be decoded, not all fields in the schema
-          useNestedApi = indicesToDecode.exists { idx =>
-            val sf = fullSchema.fields(idx)
-            val info = fieldsInfoMap(sf.name)
-            info.isRepeated || info.protoTypeName == "MESSAGE"
-          }
-
-          // Double-check: verify all fields to be decoded are actually supported
+          // Verify all fields to be decoded are actually supported
           // (This catches edge cases where field analysis might have issues)
           val unsupportedInDecode = indicesToDecode.filter { idx =>
             val sf = fullSchema.fields(idx)
@@ -353,8 +240,10 @@ object ProtobufExprShims {
             return
           }
 
-          if (useNestedApi) {
-            // Build flattened schema for nested API
+          // Step 5: Build flattened schema for GPU decoding.
+          // The flattened schema represents nested fields with parent indices.
+          // For pure scalar schemas, all fields are top-level (parentIdx == -1, depth == 0).
+          {
             val flatFields = mutable.ArrayBuffer[FlattenedFieldDescriptor]()
 
             // Helper to add a field and its children recursively
@@ -521,29 +410,29 @@ object ProtobufExprShims {
             // This significantly reduces GPU memory and computation for schemas with many
             // fields when only a few are needed. The Scala layer will post-process the
             // output to insert null columns for non-decoded fields.
-            nestedDecodedTopLevelIndices = indicesToDecode
+            decodedTopLevelIndices = indicesToDecode
             indicesToDecode.foreach { schemaIdx =>
               val sf = fullSchema.fields(schemaIdx)
               val info = fieldsInfoMap(sf.name)
               addFieldWithChildren(sf, info, -1, 0, msgDesc)
             }
 
-            // Populate nested API variables
+            // Populate flattened schema variables
             val flat = flatFields.toArray
-            nestedFieldNumbers = flat.map(_.fieldNumber)
-            nestedParentIndices = flat.map(_.parentIdx)
-            nestedDepthLevels = flat.map(_.depth)
-            nestedWireTypes = flat.map(_.wireType)
-            nestedOutputTypeIds = flat.map(_.outputTypeId)
-            nestedEncodings = flat.map(_.encoding)
-            nestedIsRepeated = flat.map(_.isRepeated)
-            nestedIsRequired = flat.map(_.isRequired)
-            nestedHasDefaultValue = flat.map(_.hasDefaultValue)
-            nestedDefaultInts = flat.map(_.defaultInt)
-            nestedDefaultFloats = flat.map(_.defaultFloat)
-            nestedDefaultBools = flat.map(_.defaultBool)
-            nestedDefaultStrings = flat.map(_.defaultString)
-            nestedEnumValidValues = flat.map(_.enumValidValues)
+            flatFieldNumbers = flat.map(_.fieldNumber)
+            flatParentIndices = flat.map(_.parentIdx)
+            flatDepthLevels = flat.map(_.depth)
+            flatWireTypes = flat.map(_.wireType)
+            flatOutputTypeIds = flat.map(_.outputTypeId)
+            flatEncodings = flat.map(_.encoding)
+            flatIsRepeated = flat.map(_.isRepeated)
+            flatIsRequired = flat.map(_.isRequired)
+            flatHasDefaultValue = flat.map(_.hasDefaultValue)
+            flatDefaultInts = flat.map(_.defaultInt)
+            flatDefaultFloats = flat.map(_.defaultFloat)
+            flatDefaultBools = flat.map(_.defaultBool)
+            flatDefaultStrings = flat.map(_.defaultString)
+            flatEnumValidValues = flat.map(_.enumValidValues)
           }
         }
 
@@ -964,57 +853,50 @@ object ProtobufExprShims {
         }
 
         override def convertToGpu(child: Expression): GpuExpression = {
-          if (useNestedApi) {
-            // Build nested pruned fields map for ALL struct types (both repeated and non-repeated).
-            // For repeated message fields (ArrayType(StructType)), pruning is handled via
-            // ordinal remapping in GpuGetArrayStructFieldsMeta (Option A) instead of expansion.
-            val prunedFieldsMap: Map[String, Seq[String]] = nestedFieldRequirements.collect {
-              case (fieldName, Some(childNames)) =>
-                val fieldIdx = fullSchema.fieldIndex(fieldName)
-                val childSchema = fullSchema.fields(fieldIdx).dataType match {
-                  case st: StructType => st
-                  case ArrayType(st: StructType, _) => st
-                  case _ => null
-                }
-                if (childSchema != null) {
-                  // Preserve the original field order
-                  val orderedNames = childSchema.fields
-                    .map(_.name)
-                    .filter(childNames.contains)
-                    .toSeq
-                  fieldName -> orderedNames
-                } else {
-                  fieldName -> childNames.toSeq
-                }
-            }
-
-            // Register pruned field ordinal mappings for GpuGetArrayStructFieldsMeta.
-            // For each pruned ArrayType(StructType) field, map child field names to their
-            // ordinal in the pruned struct so runtime column access uses correct indices.
-            val ordinalMappings = prunedFieldsMap.flatMap { case (parentName, childNames) =>
-              val fieldIdx = fullSchema.fieldIndex(parentName)
-              fullSchema.fields(fieldIdx).dataType match {
-                case ArrayType(_: StructType, _) =>
-                  childNames.zipWithIndex.map { case (name, idx) => name -> idx }
-                case _ => Seq.empty
+          // Build pruned fields map for ALL struct types (both repeated and non-repeated).
+          // For repeated message fields (ArrayType(StructType)), pruning is handled via
+          // ordinal remapping in GpuGetArrayStructFieldsMeta (Option A) instead of expansion.
+          val prunedFieldsMap: Map[String, Seq[String]] = nestedFieldRequirements.collect {
+            case (fieldName, Some(childNames)) =>
+              val fieldIdx = fullSchema.fieldIndex(fieldName)
+              val childSchema = fullSchema.fields(fieldIdx).dataType match {
+                case st: StructType => st
+                case ArrayType(st: StructType, _) => st
+                case _ => null
               }
-            }
-            if (ordinalMappings.nonEmpty) {
-              GpuFromProtobufNested.registerPrunedFields(ordinalMappings)
-            }
-
-            GpuFromProtobufNested(
-              fullSchema, nestedDecodedTopLevelIndices, nestedFieldNumbers, nestedParentIndices,
-              nestedDepthLevels, nestedWireTypes, nestedOutputTypeIds, nestedEncodings,
-              nestedIsRepeated, nestedIsRequired, nestedHasDefaultValue, nestedDefaultInts,
-              nestedDefaultFloats, nestedDefaultBools, nestedDefaultStrings, nestedEnumValidValues,
-              prunedFieldsMap, failOnErrors, child)
-          } else {
-            GpuFromProtobuf(
-              fullSchema, decodedFieldIndices, fieldNumbers, cudfTypeIds, cudfTypeScales,
-              isRequired, hasDefaultValue, defaultInts, defaultFloats, defaultBools,
-              defaultStrings, enumValidValues, failOnErrors, child)
+              if (childSchema != null) {
+                // Preserve the original field order
+                val orderedNames = childSchema.fields
+                  .map(_.name)
+                  .filter(childNames.contains)
+                  .toSeq
+                fieldName -> orderedNames
+              } else {
+                fieldName -> childNames.toSeq
+              }
           }
+
+          // Register pruned field ordinal mappings for GpuGetArrayStructFieldsMeta.
+          // For each pruned ArrayType(StructType) field, map child field names to their
+          // ordinal in the pruned struct so runtime column access uses correct indices.
+          val ordinalMappings = prunedFieldsMap.flatMap { case (parentName, childNames) =>
+            val fieldIdx = fullSchema.fieldIndex(parentName)
+            fullSchema.fields(fieldIdx).dataType match {
+              case ArrayType(_: StructType, _) =>
+                childNames.zipWithIndex.map { case (name, idx) => name -> idx }
+              case _ => Seq.empty
+            }
+          }
+          if (ordinalMappings.nonEmpty) {
+            GpuFromProtobuf.registerPrunedFields(ordinalMappings)
+          }
+
+          GpuFromProtobuf(
+            fullSchema, decodedTopLevelIndices, flatFieldNumbers, flatParentIndices,
+            flatDepthLevels, flatWireTypes, flatOutputTypeIds, flatEncodings,
+            flatIsRepeated, flatIsRequired, flatHasDefaultValue, flatDefaultInts,
+            flatDefaultFloats, flatDefaultBools, flatDefaultStrings, flatEnumValidValues,
+            prunedFieldsMap, failOnErrors, child)
         }
       }
     )

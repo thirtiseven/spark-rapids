@@ -2,7 +2,7 @@ package com.test.proto.sample;
 
 option java_outer_classname = "DeviceReqBean";
 
-// 设备请求字段
+// Device request field
 message DeviceReqField { 
     optional int32 os_type = 1;           // int32
     optional bytes device_id = 2;         // bytes

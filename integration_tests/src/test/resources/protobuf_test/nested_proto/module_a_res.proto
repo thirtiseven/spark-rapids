@@ -4,67 +4,67 @@ option java_outer_classname = "ModuleARes";
 
 import "predictor_schema.proto";
 
-// ========== 测试default默认值 ==========
+// ========== Test default values ==========
 message PartnerInfo {
-    optional string token = 1 [default = ""];      // 默认空字符串
-    optional uint64 partner_id = 2 [default = 0];  // 默认0
+    optional string token = 1 [default = ""];      // default empty string
+    optional uint64 partner_id = 2 [default = 0];  // default 0
 }
 
-// ========== 测试坐标结构(简单嵌套) ==========
+// ========== Test coordinate structure (simple nesting) ==========
 message Coordinate {
-    optional double x = 1;    // x坐标 - double类型
-    optional double y = 2;    // y坐标 - double类型
+    optional double x = 1;    // x coordinate - double
+    optional double y = 2;    // y coordinate - double
 }
 
-// ========== 测试多层嵌套 ==========
+// ========== Test multi-level nesting ==========
 message LocationPoint {
-    optional uint32 frequency = 1;              // 频次 - uint32
-    optional Coordinate coord = 2;              // 坐标 - 嵌套message
-    optional uint64 timestamp = 3;              // 时间戳 - uint64
+    optional uint32 frequency = 1;              // frequency - uint32
+    optional Coordinate coord = 2;              // coordinate - nested message
+    optional uint64 timestamp = 3;              // timestamp - uint64
 }
 
-// ========== 测试变更日志 ==========
+// ========== Test change log ==========
 message ChangeLog {
-    optional uint32 value_before = 1;           // 变更前值
-    optional string parameters = 2;             // 参数
+    optional uint32 value_before = 1;           // value before change
+    optional string parameters = 2;             // parameters
 }
 
-// ========== 测试价格变更日志 ==========
+// ========== Test price change log ==========
 message PriceLog {
     optional uint32 price_before = 1;
 }
 
-// ========== 模块A响应级别字段 ==========
+// ========== Module A response-level fields ==========
 message ModuleAResField {
-    optional string route_tag = 1;                  // 路由tag - string
-    optional int32 status_tag = 2;                  // 状态tag - int32
-    optional uint32 region_id = 3;                  // 地区id - uint32
-    repeated string experiment_ids = 4;             // 实验id列表 - repeated string
-    optional double quality_score = 5;              // 质量分 - double
-    repeated LocationPoint location_points = 6;    // 位置点 - repeated嵌套message
-    repeated uint64 interest_ids = 7;               // 兴趣id列表 - repeated uint64
+    optional string route_tag = 1;                  // route tag - string
+    optional int32 status_tag = 2;                  // status tag - int32
+    optional uint32 region_id = 3;                  // region id - uint32
+    repeated string experiment_ids = 4;             // experiment id list - repeated string
+    optional double quality_score = 5;              // quality score - double
+    repeated LocationPoint location_points = 6;    // location points - repeated nested message
+    repeated uint64 interest_ids = 7;               // interest id list - repeated uint64
 }
 
-// ========== 模块A数据源响应字段 ==========
+// ========== Module A source response field ==========
 message ModuleASrcResField {
-    optional uint32 match_type = 1;    // 匹配类型
+    optional uint32 match_type = 1;    // match type
 }
 
-// ========== KV键值对 ==========
+// ========== Key-value pair ==========
 message KVPair {
-    optional bytes key = 1;      // 键 - bytes
-    optional bytes value = 2;    // 值 - bytes
+    optional bytes key = 1;      // key - bytes
+    optional bytes value = 2;    // value - bytes
 }
 
-// ========== 样式配置 ==========
+// ========== Style configuration ==========
 message StyleConfig {
-    optional uint32 style_id = 1;        // 样式id
-    repeated KVPair kv_pairs = 2;        // kv对列表 - repeated嵌套message
+    optional uint32 style_id = 1;        // style id
+    repeated KVPair kv_pairs = 2;        // kv pair list - repeated nested message
 }
 
-// ========== 模块A详情字段(核心复杂结构) ==========
+// ========== Module A detail field (core complex structure) ==========
 message ModuleADetailField {
-    // 基础类型 - 每种保留1-2个
+    // scalar types - one or two of each
     optional uint32 type_code = 1;          // uint32
     optional uint64 item_id = 2;            // uint64
     optional int32 strategy_type = 3;       // int32
@@ -73,18 +73,18 @@ message ModuleADetailField {
     optional string title = 6;              // string
     optional bool is_valid = 7;             // bool
     optional float score_ratio = 8;         // float
-    
-    // repeated基础类型
+
+    // repeated scalar types
     repeated uint32 template_ids = 9;       // repeated uint32
     repeated uint64 material_ids = 10;      // repeated uint64
-    
-    // repeated嵌套message
+
+    // repeated nested messages
     repeated StyleConfig styles = 11;       // repeated message
     repeated ChangeLog change_logs = 12;    // repeated message
-    
-    // 嵌套message
-    optional PartnerInfo partner_info = 13; // 嵌套message
-    
-    // 跨文件import
-    optional PredictorSchema predictor_schema = 14;  // 引用外部proto
+
+    // nested message
+    optional PartnerInfo partner_info = 13; // nested message
+
+    // cross-file import
+    optional PredictorSchema predictor_schema = 14;  // reference to external proto
 }

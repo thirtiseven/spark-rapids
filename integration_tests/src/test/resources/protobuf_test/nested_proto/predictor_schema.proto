@@ -1,80 +1,80 @@
 package com.test.proto.sample;
 
-// 预测Schema - 用于测试多层Schema嵌套结构
+// Predictor schema - tests multi-level schema nesting
 
-// ========== 主Schema结构 ==========
+// ========== Main schema structure ==========
 message PredictorSchema {
-    optional SchemaTypeA type_a_schema = 1;      // 嵌套
-    optional SchemaTypeB type_b_schema = 2;      // 嵌套
-    optional SchemaTypeC type_c_schema = 3;      // 嵌套(含repeated)
+    optional SchemaTypeA type_a_schema = 1;      // nested
+    optional SchemaTypeB type_b_schema = 2;      // nested
+    optional SchemaTypeC type_c_schema = 3;      // nested (with repeated)
 }
 
 // ========== TypeA Query Schema ==========
 message TypeAQuerySchema {
-    optional string keyword = 1;            // 关键词
-    optional string session_id = 2;         // 会话id
+    optional string keyword = 1;            // keyword
+    optional string session_id = 2;         // session id
 }
 
 // ========== TypeA Pair Schema ==========
 message TypeAPairSchema {
-    optional string record_id = 1;          // 记录id
-    optional string item_id = 2;            // 条目id
+    optional string record_id = 1;          // record id
+    optional string item_id = 2;            // item id
 }
 
 // ========== TypeA Schema ==========
 message SchemaTypeA {
-    optional TypeAQuerySchema query_schema = 1;   // query级别schema
-    repeated TypeAPairSchema pair_schema = 2;     // pair列表 - repeated嵌套
+    optional TypeAQuerySchema query_schema = 1;   // query-level schema
+    repeated TypeAPairSchema pair_schema = 2;     // pair list - repeated nested
 }
 
 // ========== TypeB Query Schema ==========
 message TypeBQuerySchema {
-    optional string profile_tag_id = 1;     // 画像tag id
-    optional string entity_id = 2;          // 实体id
+    optional string profile_tag_id = 1;     // profile tag id
+    optional string entity_id = 2;          // entity id
 }
 
 // ========== TypeB Style Element ==========
 message TypeBStyleElem {
-    optional string template_id = 1;        // 模板id
-    optional string material_id = 2;        // 素材id
+    optional string template_id = 1;        // template id
+    optional string material_id = 2;        // material id
 }
 
 // ========== TypeB Style Schema ==========
 message TypeBStyleSchema {
-    repeated TypeBStyleElem values = 1;     // 元素列表 - repeated嵌套
+    repeated TypeBStyleElem values = 1;     // element list - repeated nested
 }
 
 // ========== TypeB Schema ==========
 message SchemaTypeB {
-    optional TypeBQuerySchema query_schema = 1;     // query级别schema
-    repeated TypeBStyleSchema style_schema = 2;     // style列表 - repeated嵌套
+    optional TypeBQuerySchema query_schema = 1;     // query-level schema
+    repeated TypeBStyleSchema style_schema = 2;     // style list - repeated nested
 }
 
 // ========== TypeC Query Schema ==========
 message TypeCQuerySchema {
-    optional string keyword = 1;            // 关键词
-    optional string category = 2;           // 分类
+    optional string keyword = 1;            // keyword
+    optional string category = 2;           // category
 }
 
 // ========== TypeC Pair Schema ==========
 message TypeCPairSchema {
-    optional string item_id = 1;            // 条目id
-    optional string target_url = 2;         // 目标url
+    optional string item_id = 1;            // item id
+    optional string target_url = 2;         // target url
 }
 
-// ========== TypeC Style Element (空结构测试) ==========
+// ========== TypeC Style Element (empty structure test) ==========
 message TypeCStyleElem {
-    // 空message - 用于测试空结构
+    // empty message - tests empty structure handling
 }
 
 // ========== TypeC Style Schema ==========
 message TypeCStyleSchema {
-    repeated TypeCStyleElem values = 1;     // 空元素列表
+    repeated TypeCStyleElem values = 1;     // empty element list
 }
 
-// ========== TypeC Schema (完整三层结构) ==========
+// ========== TypeC Schema (full three-level structure) ==========
 message SchemaTypeC {
     optional TypeCQuerySchema query_schema = 1;     // query schema
-    repeated TypeCPairSchema pair_schema = 2;       // pair列表
-    repeated TypeCStyleSchema style_schema = 3;     // style列表
+    repeated TypeCPairSchema pair_schema = 2;       // pair list
+    repeated TypeCStyleSchema style_schema = 3;     // style list
 }

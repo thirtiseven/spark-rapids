@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import inspect
+import os
+import struct
 
 import pytest
 
@@ -256,153 +258,217 @@ def test_from_protobuf_simple_parquet_binary_round_trip(spark_tmp_path):
 # Integration Tests with Real Proto Files (nested_proto)
 # =============================================================================
 
-import os
+import random as _random
 
-def _get_protobuf_test_resource_path():
-    """获取 protobuf 测试资源目录路径"""
-    # 从当前测试文件路径推导资源目录
-    # integration_tests/src/main/python/protobuf_test.py
-    # -> integration_tests/src/test/resources/protobuf_test/
+
+def _load_nested_proto_desc_resource():
+    """Load the pre-compiled nested proto descriptor file.
+
+    The .desc file is checked into the repository under
+    integration_tests/src/test/resources/protobuf_test/nested_proto/generated/.
+    Returns the raw bytes or None if the file does not exist.
+    """
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    # 从 src/main/python 到 src/test/resources
     base_dir = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))
-    return os.path.join(base_dir, "src", "test", "resources", "protobuf_test")
+    desc_file = os.path.join(base_dir, "src", "test", "resources",
+                             "protobuf_test", "nested_proto", "generated",
+                             "main_log.desc")
+    if not os.path.exists(desc_file):
+        return None
+    with open(desc_file, 'rb') as fp:
+        return fp.read()
 
 
-def _read_length_prefixed_messages(file_path: str) -> list:
+def _resolve_message_descriptor_jvm(spark, desc_bytes, full_message_name):
+    """Parse a FileDescriptorSet via JVM and resolve a message Descriptor.
+
+    Handles cross-file dependencies automatically.  The *desc_bytes* must
+    originate from a ``protoc --include_imports`` invocation so that all
+    transitive dependencies are present.
     """
-    读取 length-prefixed 格式的 protobuf 消息文件
-    每条消息格式: 4字节大端长度 + 消息内容
-    返回: 消息字节列表
+    jvm = spark.sparkContext._jvm
+    DP = jvm.com.google.protobuf.DescriptorProtos
+    Descriptors = jvm.com.google.protobuf.Descriptors
+
+    fds = DP.FileDescriptorSet.parseFrom(desc_bytes)
+
+    fd_class = jvm.java.lang.Class.forName(
+        "com.google.protobuf.Descriptors$FileDescriptor")
+
+    # Build FileDescriptor objects in order (protoc outputs deps first)
+    built = {}  # file name -> FileDescriptor
+    for i in range(fds.getFileCount()):
+        fp = fds.getFile(i)
+        dep_count = fp.getDependencyCount()
+        dep_array = jvm.java.lang.reflect.Array.newInstance(fd_class, dep_count)
+        for j in range(dep_count):
+            dep_name = fp.getDependency(j)
+            jvm.java.lang.reflect.Array.set(dep_array, j, built[dep_name])
+        built[fp.getName()] = Descriptors.FileDescriptor.buildFrom(fp, dep_array)
+
+    # Search all file descriptors for the target message
+    for fd in built.values():
+        msg_types = fd.getMessageTypes()
+        for idx in range(msg_types.size()):
+            msg = msg_types.get(idx)
+            if msg.getFullName() == full_message_name:
+                return msg
+
+    raise ValueError(
+        "Message '{}' not found in descriptor set".format(full_message_name))
+
+
+def _encode_varint(value):
+    """Encode an unsigned integer as a protobuf varint."""
+    buf = bytearray()
+    while value >= 128:
+        buf.append((value & 0x7F) | 0x80)
+        value >>= 7
+    buf.append(value)
+    return bytes(buf)
+
+
+def _encode_raw_float_field(field_number, float_val):
+    """Encode a protobuf Float field as raw wire-format bytes.
+
+    py4j always converts Python ``float`` to ``java.lang.Double``, so we
+    cannot pass a ``java.lang.Float`` through ``DynamicMessage.setField``.
+    Instead we encode the field manually and merge the bytes later.
     """
+    key = (field_number << 3) | 5  # wire type 5 = 32-bit
+    return _encode_varint(key) + struct.pack('<f', float_val)
+
+
+def _build_random_dynamic_message(jvm, rng, msg_desc, depth=0):
+    """Recursively build a random DynamicMessage for the given descriptor."""
+    DM = jvm.com.google.protobuf.DynamicMessage
+    builder = DM.newBuilder(msg_desc)
+    raw_float_bytes = bytearray()  # accumulate wire-encoded Float fields
+
+    field_count = msg_desc.getFields().size()
+    for i in range(field_count):
+        field = msg_desc.getFields().get(i)
+
+        # Skip optional/repeated fields randomly (10%); never skip required
+        if not field.isRequired() and rng.random() < 0.1:
+            continue
+
+        # Cap nesting depth to avoid extreme recursion on deeply-nested schemas
+        if depth > 6 and field.getJavaType().toString() == "MESSAGE":
+            continue
+
+        # Float fields need special handling (see _encode_raw_float_field)
+        if field.getJavaType().toString() == "FLOAT":
+            if field.isRepeated():
+                for _ in range(rng.randint(0, 3)):
+                    raw_float_bytes.extend(
+                        _encode_raw_float_field(field.getNumber(),
+                                                rng.uniform(-1e3, 1e3)))
+            else:
+                raw_float_bytes.extend(
+                    _encode_raw_float_field(field.getNumber(),
+                                            rng.uniform(-1e3, 1e3)))
+            continue
+
+        if field.isRepeated():
+            n = rng.randint(0, 3)
+            for _ in range(n):
+                value = _random_field_value(jvm, rng, field, depth)
+                if value is not None:
+                    builder.addRepeatedField(field, value)
+        else:
+            value = _random_field_value(jvm, rng, field, depth)
+            if value is not None:
+                builder.setField(field, value)
+
+    if raw_float_bytes:
+        # Merge the wire-encoded Float fields into the message
+        merged = bytes(builder.build().toByteArray()) + bytes(raw_float_bytes)
+        return DM.parseFrom(msg_desc, merged)
+    return builder.build()
+
+
+def _random_field_value(jvm, rng, field, depth):
+    """Generate a random value appropriate for *field*'s Java type.
+
+    FLOAT is handled separately in ``_build_random_dynamic_message`` because
+    py4j cannot transport ``java.lang.Float`` without auto-promoting it to
+    ``java.lang.Double``.
+    """
+    java_type = field.getJavaType().toString()
+
+    if java_type == "BOOLEAN":
+        return bool(rng.random() > 0.5)
+    elif java_type == "INT":
+        # Keep within signed 32-bit range so py4j maps to Java Integer
+        return rng.randint(-(2 ** 31), 2 ** 31 - 1)
+    elif java_type == "LONG":
+        # Explicit Long wrapping so py4j does not downcast to Integer
+        return jvm.java.lang.Long(rng.randint(-(2 ** 53), 2 ** 53))
+    elif java_type == "DOUBLE":
+        return float(rng.uniform(-1e6, 1e6))
+    elif java_type == "STRING":
+        length = rng.randint(1, 20)
+        return ''.join(chr(rng.randint(ord('a'), ord('z'))) for _ in range(length))
+    elif java_type == "BYTE_STRING":
+        length = rng.randint(1, 20)
+        data = bytes(rng.randint(0, 255) for _ in range(length))
+        return jvm.com.google.protobuf.ByteString.copyFrom(data)
+    elif java_type == "ENUM":
+        enum_type = field.getEnumType()
+        values = enum_type.getValues()
+        return values.get(rng.randint(0, values.size() - 1))
+    elif java_type == "MESSAGE":
+        return _build_random_dynamic_message(
+            jvm, rng, field.getMessageType(), depth + 1)
+    return None
+
+
+def _generate_random_protobuf_messages_jvm(spark, desc_bytes, message_name,
+                                           count=50, seed=42):
+    """Generate random protobuf binary messages using the JVM protobuf library.
+
+    Returns a list of Python ``bytes`` objects, one per serialized message.
+    Uses ``DynamicMessage`` so no compiled Java classes are needed -- only the
+    descriptor bytes from ``protoc --include_imports``.
+    """
+    jvm = spark.sparkContext._jvm
+    msg_desc = _resolve_message_descriptor_jvm(spark, desc_bytes, message_name)
+    rng = _random.Random(seed)
+
     messages = []
-    with open(file_path, 'rb') as f:
-        while True:
-            length_bytes = f.read(4)
-            if len(length_bytes) < 4:
-                break
-            length = struct.unpack('>I', length_bytes)[0]
-            data = f.read(length)
-            if len(data) < length:
-                break
-            messages.append(data)
+    for _ in range(count):
+        msg = _build_random_dynamic_message(jvm, rng, msg_desc)
+        messages.append(bytes(msg.toByteArray()))
     return messages
 
 
-def _load_nested_proto_descriptor(spark, resource_base: str):
-    """
-    加载 nested_proto 的描述文件
-    优先使用预生成的 .desc 文件，如果不存在则尝试编译
-    """
-    desc_file = os.path.join(resource_base, "nested_proto", "generated", "main_log.desc")
-    
-    if not os.path.exists(desc_file):
-        # 尝试编译 proto 文件
-        proto_dir = os.path.join(resource_base, "nested_proto")
-        os.makedirs(os.path.dirname(desc_file), exist_ok=True)
-        
-        import subprocess
-        result = subprocess.run([
-            'protoc',
-            f'--descriptor_set_out={desc_file}',
-            '--include_imports',
-            f'-I{proto_dir}',
-            os.path.join(proto_dir, 'main_log.proto')
-        ], capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to compile proto: {result.stderr}")
-    
-    with open(desc_file, 'rb') as f:
-        return f.read()
-
-
-def _generate_nested_proto_test_data(resource_base: str, encoding: str, count: int = 50):
-    """
-    生成 nested_proto 测试数据
-    如果预生成的文件存在则读取，否则动态生成
-    """
-    import sys
-    
-    # 检查预生成的测试数据文件
-    pb_file = os.path.join(resource_base, "nested_proto", "generated", 
-                           f"main_log_{encoding}_{count}.pb")
-    
-    if os.path.exists(pb_file):
-        return _read_length_prefixed_messages(pb_file)
-    
-    # 动态生成（需要 generate_test_data.py）
-    generator_path = os.path.join(resource_base, "generate_test_data.py")
-    if not os.path.exists(generator_path):
-        raise FileNotFoundError(
-            f"Test data file not found: {pb_file}\n"
-            f"Please run gen_nested_proto_data.sh to generate test data first."
-        )
-    
-    # 动态导入生成器
-    sys.path.insert(0, resource_base)
-    try:
-        from generate_test_data import ProtobufDataGenerator
-        
-        desc_file = os.path.join(resource_base, "nested_proto", "generated", "main_log.desc")
-        generator = ProtobufDataGenerator(encoding=encoding, seed=42)
-        generator.load_descriptor_set(desc_file)
-        
-        messages = []
-        for _ in range(count):
-            data = generator.generate_message("MainLogRecord")
-            messages.append(data)
-        return messages
-    finally:
-        sys.path.remove(resource_base)
-
-@pytest.mark.skip(reason="Support pending")
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
 def test_from_protobuf_nested_proto(spark_tmp_path):
-    """
-    Integration test with real nested proto files.
-    Tests complex nested structure with multiple imported proto files.
-    """
+    """Integration test with real nested proto: multi-level nesting, cross-file imports, enums."""
     from_protobuf = _try_import_from_protobuf()
     if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
+        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
     if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
+        pytest.skip("spark-protobuf JVM module is not available on the classpath")
 
-    resource_base = _get_protobuf_test_resource_path()
-    desc_file = os.path.join(resource_base, "nested_proto", "generated", "main_log.desc")
-    
-    # 检查描述文件是否存在
-    if not os.path.exists(desc_file):
-        gen_script = os.path.join(resource_base, "gen_nested_proto_data.sh")
-        pytest.skip(f"Descriptor file not found: {desc_file}. "
-                   f"Please run the script first:\n"
-                   f"  cd {resource_base} && ./gen_nested_proto_data.sh\n"
-                   f"Or directly: bash {gen_script}")
-    
-    message_name = "com.test.proto.sample.MainLogRecord"
-    
-    # 加载描述文件
-    with open(desc_file, 'rb') as desc_fp:
-        desc_bytes = desc_fp.read()
-    
-    # 复制描述文件到临时路径（供某些 Spark 版本使用）
+    desc_bytes = _load_nested_proto_desc_resource()
+    if desc_bytes is None:
+        pytest.skip("nested_proto descriptor not found; run gen_nested_proto_data.sh first")
+
     desc_path = spark_tmp_path + "/main_log.desc"
     with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
-    
-    # 生成或加载测试数据
-    try:
-        # 默认使用 utf8
-        test_messages = _generate_nested_proto_test_data(resource_base, 'utf8', count=50)
-    except FileNotFoundError as e:
-        pytest.skip(str(e))
-    
+
+    message_name = "com.test.proto.sample.MainLogRecord"
+    test_messages = with_cpu_session(
+        lambda spark: _generate_random_protobuf_messages_jvm(
+            spark, desc_bytes, message_name, count=50, seed=42))
+
     def run_on_spark(spark):
-        # 创建包含二进制 protobuf 数据的 DataFrame
         rows = [(msg,) for msg in test_messages] + [(None,)]
         df = spark.createDataFrame(rows, schema="bin binary")
-        
+
         sig = inspect.signature(from_protobuf)
         if "binaryDescriptorSet" in sig.parameters:
             decoded = from_protobuf(
@@ -410,59 +476,41 @@ def test_from_protobuf_nested_proto(spark_tmp_path):
                 binaryDescriptorSet=bytearray(desc_bytes))
         else:
             decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
-        # 直接比较整个 decoded struct，会递归比较所有嵌套字段
+
         return df.select(decoded.alias("decoded"))
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
 
-@pytest.mark.skip(reason="Support pending")
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
 def test_from_protobuf_nested_proto_with_options(spark_tmp_path):
-    """
-    Integration test with real nested proto files using options.
-    Tests passing options like 'enums.as.ints'.
-    """
+    """Integration test with nested proto and ``enums.as.ints`` option."""
     from_protobuf = _try_import_from_protobuf()
     if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
+        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
     if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
+        pytest.skip("spark-protobuf JVM module is not available on the classpath")
 
-    resource_base = _get_protobuf_test_resource_path()
-    desc_file = os.path.join(resource_base, "nested_proto", "generated", "main_log.desc")
-    
-    # Check if descriptor file exists
-    if not os.path.exists(desc_file):
-        gen_script = os.path.join(resource_base, "gen_nested_proto_data.sh")
-        pytest.skip(f"Descriptor file not found: {desc_file}. "
-                   f"Please run the script first:\n"
-                   f"  cd {resource_base} && ./gen_nested_proto_data.sh\n"
-                   f"Or directly: bash {gen_script}")
-    
-    message_name = "com.test.proto.sample.MainLogRecord"
-    
-    with open(desc_file, 'rb') as desc_fp:
-        desc_bytes = desc_fp.read()
-    
+    desc_bytes = _load_nested_proto_desc_resource()
+    if desc_bytes is None:
+        pytest.skip("nested_proto descriptor not found; run gen_nested_proto_data.sh first")
+
     desc_path = spark_tmp_path + "/main_log.desc"
     with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
-    
-    try:
-        test_messages = _generate_nested_proto_test_data(resource_base, 'utf8', count=50)
-    except FileNotFoundError as e:
-        pytest.skip(str(e))
-    
+
+    message_name = "com.test.proto.sample.MainLogRecord"
+    test_messages = with_cpu_session(
+        lambda spark: _generate_random_protobuf_messages_jvm(
+            spark, desc_bytes, message_name, count=50, seed=42))
+
+    options = {"enums.as.ints": "true"}
+
     def run_on_spark(spark):
         rows = [(msg,) for msg in test_messages] + [(None,)]
         df = spark.createDataFrame(rows, schema="bin binary")
-        
-        options = {"enums.as.ints": "true"}
+
         sig = inspect.signature(from_protobuf)
-        
-        # Check signature to see how to pass options
         if "binaryDescriptorSet" in sig.parameters:
             if "options" in sig.parameters:
                 decoded = from_protobuf(
@@ -470,16 +518,16 @@ def test_from_protobuf_nested_proto_with_options(spark_tmp_path):
                     binaryDescriptorSet=bytearray(desc_bytes),
                     options=options)
             else:
-                # Fallback if options param is missing but binaryDescriptorSet exists (unlikely in newer versions)
                 decoded = from_protobuf(
                     f.col("bin"), message_name,
                     binaryDescriptorSet=bytearray(desc_bytes))
         else:
             if "options" in sig.parameters:
-                decoded = from_protobuf(f.col("bin"), message_name, desc_path, options)
+                decoded = from_protobuf(
+                    f.col("bin"), message_name, desc_path, options)
             else:
                 decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+
         return df.select(decoded.alias("decoded"))
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
@@ -844,6 +892,137 @@ def test_from_protobuf_enum_unknown_value(spark_tmp_path):
             decoded.getField("color").alias("color"),
             decoded.getField("count").alias("count")
         )
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+# =============================================================================
+# Enum-as-String Tests (default enum behaviour without enums.as.ints)
+# =============================================================================
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_enum_as_string(spark_tmp_path):
+    """
+    Test enum field decoded as string name (default behaviour, no enums.as.ints).
+    GPU should decode enum varint values into their enum name strings.
+    """
+    from_protobuf = _try_import_from_protobuf()
+    if from_protobuf is None:
+        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM module is not available on the classpath")
+
+    desc_path = spark_tmp_path + "/enum_as_string.desc"
+    message_name = "test.WithEnum"
+
+    desc_bytes = with_cpu_session(_build_enum_descriptor_set_bytes)
+    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
+
+    # Row 0: color=GREEN(1), count=42, name="test"
+    # Row 1: color=RED(0), count=100, name missing
+    # Row 2: color=BLUE(2), count=200, name="hello"
+    # Row 3: color missing, count=300, name="world"
+    # Row 4: null input
+    test_data_row0 = bytes([
+        0x08, 0x01,  # color = GREEN (1)
+        0x10, 0x2A,  # count = 42
+        0x1A, 0x04, 0x74, 0x65, 0x73, 0x74,  # name = "test"
+    ])
+    test_data_row1 = bytes([
+        0x08, 0x00,  # color = RED (0)
+        0x10, 0x64,  # count = 100
+    ])
+    test_data_row2 = bytes([
+        0x08, 0x02,  # color = BLUE (2)
+        0x10, 0xC8, 0x01,  # count = 200
+        0x1A, 0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F,  # name = "hello"
+    ])
+    test_data_row3 = bytes([
+        0x10, 0xAC, 0x02,  # count = 300
+        0x1A, 0x05, 0x77, 0x6F, 0x72, 0x6C, 0x64,  # name = "world"
+    ])
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(test_data_row0,), (test_data_row1,), (test_data_row2,),
+             (test_data_row3,), (None,)],
+            schema="bin binary",
+        )
+        sig = inspect.signature(from_protobuf)
+        # No options -> default enum-as-string behaviour
+        if "binaryDescriptorSet" in sig.parameters:
+            decoded = from_protobuf(
+                f.col("bin"),
+                message_name,
+                binaryDescriptorSet=bytearray(desc_bytes),
+            )
+        else:
+            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
+        return df.select(
+            decoded.getField("color").alias("color"),
+            decoded.getField("count").alias("count"),
+            decoded.getField("name").alias("name")
+        )
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_enum_as_string_unknown_value(spark_tmp_path):
+    """
+    Test that unknown enum values null the entire struct row in PERMISSIVE mode
+    when enums are decoded as strings (default behaviour).
+    """
+    from_protobuf = _try_import_from_protobuf()
+    if from_protobuf is None:
+        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM module is not available on the classpath")
+
+    desc_path = spark_tmp_path + "/enum_as_string_unknown.desc"
+    message_name = "test.WithEnum"
+
+    desc_bytes = with_cpu_session(_build_enum_descriptor_set_bytes)
+    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
+
+    # Row 0: color=GREEN(1), count=10  -> valid
+    # Row 1: color=999 (unknown), count=20  -> entire row nulled (PERMISSIVE)
+    # Row 2: color=BLUE(2), count=30  -> valid
+    test_data_valid = bytes([0x08, 0x01, 0x10, 0x0A])
+    test_data_unknown = bytes([0x08, 0xE7, 0x07, 0x10, 0x14])
+    test_data_valid2 = bytes([0x08, 0x02, 0x10, 0x1E])
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(test_data_valid,), (test_data_unknown,), (test_data_valid2,)],
+            schema="bin binary",
+        )
+        sig = inspect.signature(from_protobuf)
+        # Must use PERMISSIVE mode; Spark CPU defaults to FAILFAST and throws on
+        # unknown enum values instead of returning null.
+        options = {"mode": "PERMISSIVE"}
+        if "binaryDescriptorSet" in sig.parameters:
+            if "options" in sig.parameters:
+                decoded = from_protobuf(
+                    f.col("bin"),
+                    message_name,
+                    binaryDescriptorSet=bytearray(desc_bytes),
+                    options=options,
+                )
+            else:
+                decoded = from_protobuf(
+                    f.col("bin"),
+                    message_name,
+                    binaryDescriptorSet=bytearray(desc_bytes),
+                )
+        else:
+            if "options" in sig.parameters:
+                decoded = from_protobuf(f.col("bin"), message_name, desc_path, options)
+            else:
+                decoded = from_protobuf(f.col("bin"), message_name, desc_path)
+        return df.select(decoded.alias("decoded"))
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
@@ -2257,8 +2436,6 @@ def _build_packed_repeated_descriptor_set_bytes(spark):
     return bytes(fds.toByteArray())
 
 
-import struct
-
 # Packed repeated field test configurations: (field_name, field_key, packed_data, id_value)
 _packed_repeated_test_configs = [
     ("int_values", 0x12, bytes([0x01, 0x02, 0x03, 0x7F, 0x80, 0x01]), 1),  # [1,2,3,127,128]
@@ -2606,7 +2783,6 @@ def test_from_protobuf_signed_integers(spark_tmp_path):
     with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
         spark, desc_path, desc_bytes))
 
-    import struct
     # si32 = -1 (zigzag: 1), si64 = -100 (zigzag: 199)
     # sf32 = -12345, sf64 = -9876543210
     test_data_negative = bytes([
@@ -2712,7 +2888,6 @@ def test_from_protobuf_fixed_integers(spark_tmp_path):
     with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
         spark, desc_path, desc_bytes))
 
-    import struct
     # fx32 = 0xDEADBEEF, fx64 = 0x123456789ABCDEF0
     test_data = bytes([0x0D]) + struct.pack("<I", 0xDEADBEEF) + \
                 bytes([0x11]) + struct.pack("<Q", 0x123456789ABCDEF0)

@@ -57,6 +57,7 @@ import org.apache.spark.sql.types._
  * @param defaultBools Default bool values
  * @param defaultStrings Default string/bytes values
  * @param enumValidValues Valid enum values for each field
+ * @param enumNames Enum value names for enum-as-string fields. Parallel to enumValidValues.
  * @param nestedPrunedFields For nested schema projection: maps top-level field name to the
  *                           ordered list of decoded child field names. Only present for fields
  *                           where children were pruned. If empty map, no nested pruning.
@@ -79,6 +80,7 @@ case class GpuFromProtobuf(
     defaultBools: Array[Boolean],
     defaultStrings: Array[Array[Byte]],
     enumValidValues: Array[Array[Int]],
+    enumNames: Array[Array[Array[Byte]]],
     nestedPrunedFields: Map[String, Seq[String]],
     failOnErrors: Boolean,
     child: Expression)
@@ -151,6 +153,7 @@ case class GpuFromProtobuf(
         defaultBools,
         defaultStrings,
         enumValidValues,
+        enumNames,
         failOnErrors)
     } catch {
       case e: CudfException if failOnErrors =>
@@ -262,6 +265,7 @@ object GpuFromProtobuf {
   val ENC_DEFAULT = 0
   val ENC_FIXED   = 1
   val ENC_ZIGZAG  = 2
+  val ENC_ENUM_STRING = 3
 
   // Thread-local registry for pruned field ordinal mappings.
   // When GpuFromProtobuf is created with nested pruning, it registers

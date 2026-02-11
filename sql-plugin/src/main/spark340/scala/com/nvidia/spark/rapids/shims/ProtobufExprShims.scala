@@ -61,8 +61,10 @@ private[shims] case class ProtobufFieldInfo(
     isRequired: Boolean,
     hasDefaultValue: Boolean,
     defaultValue: Option[Any],  // Stored as protobuf-java type, will be converted for JNI
-    // Valid enum values (only for ENUM fields with enumsAsInts)
+    // Valid enum values for ENUM fields (used for validation)
     enumValues: Option[Set[Int]] = None,
+    // Enum value-name mapping for ENUM -> STRING decoding (enumsAsInts=false)
+    enumNames: Option[Map[Int, String]] = None,
     isRepeated: Boolean = false  // Whether this is a repeated field
 )
 
@@ -84,7 +86,8 @@ private[shims] case class FlattenedFieldDescriptor(
     defaultFloat: Double,
     defaultBool: Boolean,
     defaultString: Array[Byte],
-    enumValidValues: Array[Int]
+    enumValidValues: Array[Int],
+    enumNames: Array[Array[Byte]]
 )
 
 /**
@@ -140,6 +143,7 @@ object ProtobufExprShims {
         private var flatDefaultBools: Array[Boolean] = _
         private var flatDefaultStrings: Array[Array[Byte]] = _
         private var flatEnumValidValues: Array[Array[Int]] = _
+        private var flatEnumNames: Array[Array[Array[Byte]]] = _
         // Indices in fullSchema for top-level fields that were decoded (for schema projection)
         private var decodedTopLevelIndices: Array[Int] = _
 
@@ -306,6 +310,10 @@ object ProtobufExprShims {
               }
 
               val enumValsArr = info.enumValues.map(_.toArray.sorted).orNull
+              val enumNamesArr = info.enumNames.map { nameMap =>
+                val sorted = nameMap.toSeq.sortBy(_._1)
+                sorted.map { case (_, enumName) => enumName.getBytes("UTF-8") }.toArray
+              }.orNull
 
               flatFields += FlattenedFieldDescriptor(
                 fieldNumber = info.fieldNumber,
@@ -321,7 +329,8 @@ object ProtobufExprShims {
                 defaultFloat = defFloat,
                 defaultBool = defBool,
                 defaultString = defString,
-                enumValidValues = enumValsArr
+                enumValidValues = enumValsArr,
+                enumNames = enumNamesArr
               )
 
               // For nested struct types (including repeated message = ArrayType(StructType)), 
@@ -395,6 +404,7 @@ object ProtobufExprShims {
                         hasDefaultValue = childHasDefault,
                         defaultValue = None,
                         enumValues = None,
+                        enumNames = None,
                         isRepeated = childIsRepeated
                       )
 
@@ -433,6 +443,7 @@ object ProtobufExprShims {
             flatDefaultBools = flat.map(_.defaultBool)
             flatDefaultStrings = flat.map(_.defaultString)
             flatEnumValidValues = flat.map(_.enumValidValues)
+            flatEnumNames = flat.map(_.enumNames)
           }
         }
 
@@ -484,20 +495,28 @@ object ProtobufExprShims {
             val (isSupported, unsupportedReason, encoding) =
               checkFieldSupport(sf.dataType, protoTypeName, isRepeated, enumsAsInts)
 
-            // Extract enum values if this is an enum field with enumsAsInts enabled
-            val enumVals: Option[Set[Int]] = if (protoTypeName == "ENUM" && enumsAsInts) {
-              Try {
-                val enumType = invoke0[AnyRef](fd, "getEnumType")
-                val values = invoke0[java.util.List[_]](enumType, "getValues")
-                import scala.collection.JavaConverters._
-                val intSet: Set[Int] = values.asScala.map { v =>
-                  invoke0[java.lang.Integer](v.asInstanceOf[AnyRef], "getNumber").intValue()
-                }.toSet
-                intSet
-              }.toOption
-            } else {
-              None
-            }
+            // Extract enum values and (for enumsAsInts=false) value-name mapping.
+            val (enumVals, enumNameMap): (Option[Set[Int]], Option[Map[Int, String]]) =
+              if (protoTypeName == "ENUM") {
+                Try {
+                  val enumType = invoke0[AnyRef](fd, "getEnumType")
+                  val values = invoke0[java.util.List[_]](enumType, "getValues")
+                  import scala.collection.JavaConverters._
+                  val pairs = values.asScala.map { v =>
+                    val ev = v.asInstanceOf[AnyRef]
+                    val num = invoke0[java.lang.Integer](ev, "getNumber").intValue()
+                    val name = invoke0[String](ev, "getName")
+                    (num, name)
+                  }
+                  if (enumsAsInts) {
+                    (Some(pairs.map(_._1).toSet), None)
+                  } else {
+                    (Some(pairs.map(_._1).toSet), Some(pairs.toMap))
+                  }
+                }.getOrElse((None, None))
+              } else {
+                (None, None)
+              }
 
             result(sf.name) = ProtobufFieldInfo(
               fieldNumber = fieldNumber,
@@ -510,6 +529,7 @@ object ProtobufExprShims {
               hasDefaultValue = hasDefault,
               defaultValue = defaultVal,
               enumValues = enumVals,
+              enumNames = enumNameMap,
               isRepeated = isRepeated
             )
           }
@@ -603,6 +623,7 @@ object ProtobufExprShims {
             case (StringType, "STRING") => Some(GpuFromProtobuf.ENC_DEFAULT)
             case (BinaryType, "BYTES") => Some(GpuFromProtobuf.ENC_DEFAULT)
             case (IntegerType, "ENUM") if enumsAsInts => Some(GpuFromProtobuf.ENC_DEFAULT)
+            case (StringType, "ENUM") if !enumsAsInts => Some(GpuFromProtobuf.ENC_ENUM_STRING)
             case _ => None
           }
 
@@ -896,6 +917,7 @@ object ProtobufExprShims {
             flatDepthLevels, flatWireTypes, flatOutputTypeIds, flatEncodings,
             flatIsRepeated, flatIsRequired, flatHasDefaultValue, flatDefaultInts,
             flatDefaultFloats, flatDefaultBools, flatDefaultStrings, flatEnumValidValues,
+            flatEnumNames,
             prunedFieldsMap, failOnErrors, child)
         }
       }

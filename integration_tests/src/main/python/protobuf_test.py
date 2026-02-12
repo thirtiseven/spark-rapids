@@ -20,9 +20,9 @@ import pytest
 
 from asserts import assert_gpu_and_cpu_are_equal_collect
 from data_gen import (
-    BooleanGen, IntegerGen, LongGen, FloatGen, DoubleGen, StringGen,
-    ProtobufSimpleMessageRowGen, ProtobufNestedMessageRowGen, 
-    ProtobufRepeatedFieldRowGen, gen_df, idfn
+    BooleanGen, IntegerGen, LongGen, FloatGen, DoubleGen, StringGen, BinaryGen,
+    ProtobufMessageGen, PbScalar, PbNested, PbRepeated, PbRepeatedMessage,
+    encode_pb_message, gen_df, idfn
 )
 from marks import ignore_order
 from spark_session import with_cpu_session, is_before_spark_340
@@ -31,57 +31,45 @@ import pyspark.sql.functions as f
 pytestmark = [pytest.mark.premerge_ci_1]
 
 
-# =============================================================================
-# Test Data Configurations for Parametrized Tests
-# =============================================================================
-
 # Random data generation configurations for simple scalars
 _random_scalar_test_configs = [
-    # (test_id, data_gen_config, data_length)
+    # (test_id, data_gen_config)
     ("all_types", [
-        ("b", 1, BooleanGen()),
-        ("i32", 2, IntegerGen()),
-        ("i64", 3, LongGen()),
-        ("f32", 4, FloatGen()),
-        ("f64", 5, DoubleGen()),
-        ("s", 6, StringGen()),
-    ], 100),
+        PbScalar("b", 1, BooleanGen()),
+        PbScalar("i32", 2, IntegerGen()),
+        PbScalar("i64", 3, LongGen()),
+        PbScalar("f32", 4, FloatGen()),
+        PbScalar("f64", 5, DoubleGen()),
+        PbScalar("s", 6, StringGen()),
+    ]),
     ("integers_edge_cases", [
-        ("b", 1, BooleanGen()),
-        ("i32", 2, IntegerGen(
+        PbScalar("b", 1, BooleanGen()),
+        PbScalar("i32", 2, IntegerGen(
             min_val=-2147483648, max_val=2147483647,
             special_cases=[-2147483648, -1, 0, 1, 2147483647])),
-        ("i64", 3, LongGen(
+        PbScalar("i64", 3, LongGen(
             min_val=-9223372036854775808, max_val=9223372036854775807,
             special_cases=[-9223372036854775808, -1, 0, 1, 9223372036854775807])),
-        ("f32", 4, FloatGen()),
-        ("f64", 5, DoubleGen()),
-        ("s", 6, StringGen()),
-    ], 200),
+        PbScalar("f32", 4, FloatGen()),
+        PbScalar("f64", 5, DoubleGen()),
+        PbScalar("s", 6, StringGen()),
+    ]),
     ("floats_edge_cases", [
-        ("b", 1, BooleanGen()),
-        ("i32", 2, IntegerGen()),
-        ("i64", 3, LongGen()),
-        ("f32", 4, FloatGen(no_nans=True, special_cases=[-0.0, 0.0, 1.0, -1.0])),
-        ("f64", 5, DoubleGen(no_nans=True, special_cases=[-0.0, 0.0, 1.0, -1.0])),
-        ("s", 6, StringGen()),
-    ], 100),
-    ("nullable_fields", [
-        ("b", 1, BooleanGen(nullable=True)),
-        ("i32", 2, IntegerGen(nullable=True)),
-        ("i64", 3, LongGen(nullable=True)),
-        ("f32", 4, FloatGen(nullable=True)),
-        ("f64", 5, DoubleGen(nullable=True)),
-        ("s", 6, StringGen(nullable=True)),
-    ], 100),
+        PbScalar("b", 1, BooleanGen()),
+        PbScalar("i32", 2, IntegerGen()),
+        PbScalar("i64", 3, LongGen()),
+        PbScalar("f32", 4, FloatGen(no_nans=True, special_cases=[-0.0, 0.0, 1.0, -1.0])),
+        PbScalar("f64", 5, DoubleGen(no_nans=True, special_cases=[-0.0, 0.0, 1.0, -1.0])),
+        PbScalar("s", 6, StringGen()),
+    ]),
     ("large_dataset", [
-        ("b", 1, BooleanGen()),
-        ("i32", 2, IntegerGen()),
-        ("i64", 3, LongGen()),
-        ("f32", 4, FloatGen()),
-        ("f64", 5, DoubleGen()),
-        ("s", 6, StringGen(pattern="[a-z]{0,50}")),
-    ], 2048),
+        PbScalar("b", 1, BooleanGen()),
+        PbScalar("i32", 2, IntegerGen()),
+        PbScalar("i64", 3, LongGen()),
+        PbScalar("f32", 4, FloatGen()),
+        PbScalar("f64", 5, DoubleGen()),
+        PbScalar("s", 6, StringGen(pattern="[a-z]{0,50}")),
+    ]),
 ]
 
 
@@ -116,6 +104,44 @@ def _spark_protobuf_jvm_available(spark) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Shared fixture and helpers to reduce per-test boilerplate
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def from_protobuf_fn():
+    """Skip the entire module if from_protobuf or the JVM module is unavailable."""
+    fn = _try_import_from_protobuf()
+    if fn is None:
+        pytest.skip("from_protobuf not available")
+    if not with_cpu_session(_spark_protobuf_jvm_available):
+        pytest.skip("spark-protobuf JVM not available")
+    return fn
+
+
+def _setup_protobuf_desc(spark_tmp_path, desc_name, build_fn):
+    """Build descriptor bytes via JVM, write to HDFS, return (desc_path, desc_bytes)."""
+    desc_path = spark_tmp_path + "/" + desc_name
+    desc_bytes = with_cpu_session(build_fn)
+    with_cpu_session(
+        lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
+    return desc_path, desc_bytes
+
+
+def _call_from_protobuf(from_protobuf_fn, col, message_name,
+                         desc_path, desc_bytes, options=None):
+    """Call from_protobuf using the right API variant."""
+    sig = inspect.signature(from_protobuf_fn)
+    if "binaryDescriptorSet" in sig.parameters:
+        kw = dict(binaryDescriptorSet=bytearray(desc_bytes))
+        if options is not None:
+            kw["options"] = options
+        return from_protobuf_fn(col, message_name, **kw)
+    if options is not None and "options" in sig.parameters:
+        return from_protobuf_fn(col, message_name, desc_path, options)
+    return from_protobuf_fn(col, message_name, desc_path)
+
+
 def _build_simple_descriptor_set_bytes(spark):
     """
     Build a FileDescriptorSet for:
@@ -130,20 +156,7 @@ def _build_simple_descriptor_set_bytes(spark):
         optional string s   = 6;
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("simple.proto") \
-        .setPackage("test")
-    # Some Spark distributions bring an older protobuf-java where FileDescriptorProto.Builder
-    # does not expose setSyntax(String). For this test we only need proto2 semantics, and
-    # leaving syntax unset is sufficient/compatible.
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        # If setSyntax is unavailable (older protobuf-java), we intentionally leave syntax unset.
-        pass
+    D, fd = _new_proto2_file(spark, "simple.proto")
 
     msg = D.DescriptorProto.newBuilder().setName("Simple")
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
@@ -184,35 +197,39 @@ def _write_bytes_to_hadoop_path(spark, path_str, data_bytes):
         out.close()
 
 
+def _new_proto2_file(spark, name):
+    """Create a proto2 FileDescriptorProto builder with common defaults."""
+    D = spark.sparkContext._jvm.com.google.protobuf.DescriptorProtos
+    fd = D.FileDescriptorProto.newBuilder() \
+        .setName(name) \
+        .setPackage("test")
+    try:
+        fd = fd.setSyntax("proto2")
+    except Exception:
+        pass
+    return D, fd
+
+
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_simple_parquet_binary_round_trip(spark_tmp_path):
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
-
+def test_from_protobuf_simple_parquet_binary_round_trip(spark_tmp_path, from_protobuf_fn):
     data_path = spark_tmp_path + "/PROTOBUF_SIMPLE_PARQUET/"
-    desc_path = spark_tmp_path + "/simple.desc"
     message_name = "test.Simple"
-
-    # Generate descriptor bytes once using the JVM (no protoc dependency)
-    desc_bytes = with_cpu_session(_build_simple_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "simple.desc", _build_simple_descriptor_set_bytes)
 
     # Build a DF with scalar columns + binary protobuf column and write to parquet
-    row_gen = ProtobufSimpleMessageRowGen([
-        ("b", 1, BooleanGen(nullable=True)),
-        ("i32", 2, IntegerGen(nullable=True, min_val=0, max_val=1 << 20)),
-        ("i64", 3, LongGen(nullable=True, min_val=0, max_val=1 << 40, special_cases=[])),
-        ("f32", 4, FloatGen(nullable=True, no_nans=True)),
-        ("f64", 5, DoubleGen(nullable=True, no_nans=True)),
-        ("s", 6, StringGen(nullable=True)),
+    row_gen = ProtobufMessageGen([
+        PbScalar("b", 1, BooleanGen(nullable=True)),
+        PbScalar("i32", 2, IntegerGen(nullable=True, min_val=0, max_val=1 << 20)),
+        PbScalar("i64", 3, LongGen(nullable=True, min_val=0, max_val=1 << 40, special_cases=[])),
+        PbScalar("f32", 4, FloatGen(nullable=True, no_nans=True)),
+        PbScalar("f64", 5, DoubleGen(nullable=True, no_nans=True)),
+        PbScalar("s", 6, StringGen(nullable=True)),
     ], binary_col_name="bin")
 
     def write_parquet(spark):
-        df = gen_df(spark, row_gen, length=512)
+        df = gen_df(spark, row_gen)
         df.write.mode("overwrite").parquet(data_path)
 
     with_cpu_session(write_parquet)
@@ -228,13 +245,9 @@ def test_from_protobuf_simple_parquet_binary_round_trip(spark_tmp_path):
             f.col("f64").alias("f64"),
             f.col("s").alias("s"),
         ).alias("expected")
-
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(f.col("bin"), message_name, binaryDescriptorSet=bytearray(desc_bytes)).alias("decoded")
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path).alias("decoded")
-
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name,
+            desc_path, desc_bytes).alias("decoded")
         rows = df.select(expected, decoded).collect()
         for r in rows:
             assert r["expected"] == r["decoded"]
@@ -244,21 +257,11 @@ def test_from_protobuf_simple_parquet_binary_round_trip(spark_tmp_path):
     # Main assertion: CPU and GPU results match for from_protobuf on a binary column read from parquet
     def run_on_spark(spark):
         df = spark.read.parquet(data_path)
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(f.col("bin"), message_name, binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(decoded.alias("decoded"))
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-# =============================================================================
-# Integration Tests with Real Proto Files (nested_proto)
-# =============================================================================
-
-import random as _random
 
 
 def _load_nested_proto_desc_resource():
@@ -279,180 +282,203 @@ def _load_nested_proto_desc_resource():
         return fp.read()
 
 
-def _resolve_message_descriptor_jvm(spark, desc_bytes, full_message_name):
-    """Parse a FileDescriptorSet via JVM and resolve a message Descriptor.
+def _build_main_log_record_fields():
+    """Build PbField tree matching MainLogRecord schema from nested proto files."""
+    u32 = lambda: IntegerGen(min_val=0, max_val=100000)
+    u64 = lambda: LongGen(min_val=0, max_val=(1 << 50))
 
-    Handles cross-file dependencies automatically.  The *desc_bytes* must
-    originate from a ``protoc --include_imports`` invocation so that all
-    transitive dependencies are present.
-    """
-    jvm = spark.sparkContext._jvm
-    DP = jvm.com.google.protobuf.DescriptorProtos
-    Descriptors = jvm.com.google.protobuf.Descriptors
+    type_a_query_schema = [
+        PbScalar("keyword", 1, StringGen()),
+        PbScalar("session_id", 2, StringGen()),
+    ]
+    type_a_pair_schema = [
+        PbScalar("record_id", 1, StringGen()),
+        PbScalar("item_id", 2, StringGen()),
+    ]
+    schema_type_a = [
+        PbNested("query_schema", 1, type_a_query_schema),
+        PbRepeatedMessage("pair_schema", 2, type_a_pair_schema, min_len=0, max_len=3),
+    ]
 
-    fds = DP.FileDescriptorSet.parseFrom(desc_bytes)
+    type_b_query_schema = [
+        PbScalar("profile_tag_id", 1, StringGen()),
+        PbScalar("entity_id", 2, StringGen()),
+    ]
+    type_b_style_elem = [
+        PbScalar("template_id", 1, StringGen()),
+        PbScalar("material_id", 2, StringGen()),
+    ]
+    type_b_style_schema = [
+        PbRepeatedMessage("values", 1, type_b_style_elem, min_len=0, max_len=3),
+    ]
+    schema_type_b = [
+        PbNested("query_schema", 1, type_b_query_schema),
+        PbRepeatedMessage("style_schema", 2, type_b_style_schema, min_len=0, max_len=3),
+    ]
 
-    fd_class = jvm.java.lang.Class.forName(
-        "com.google.protobuf.Descriptors$FileDescriptor")
+    type_c_query_schema = [
+        PbScalar("keyword", 1, StringGen()),
+        PbScalar("category", 2, StringGen()),
+    ]
+    type_c_pair_schema = [
+        PbScalar("item_id", 1, StringGen()),
+        PbScalar("target_url", 2, StringGen()),
+    ]
+    type_c_style_schema = [
+        PbRepeatedMessage("values", 1, [], min_len=0, max_len=3),
+    ]
+    schema_type_c = [
+        PbNested("query_schema", 1, type_c_query_schema),
+        PbRepeatedMessage("pair_schema", 2, type_c_pair_schema, min_len=0, max_len=3),
+        PbRepeatedMessage("style_schema", 3, type_c_style_schema, min_len=0, max_len=3),
+    ]
+    predictor_schema = [
+        PbNested("type_a_schema", 1, schema_type_a),
+        PbNested("type_b_schema", 2, schema_type_b),
+        PbNested("type_c_schema", 3, schema_type_c),
+    ]
 
-    # Build FileDescriptor objects in order (protoc outputs deps first)
-    built = {}  # file name -> FileDescriptor
-    for i in range(fds.getFileCount()):
-        fp = fds.getFile(i)
-        dep_count = fp.getDependencyCount()
-        dep_array = jvm.java.lang.reflect.Array.newInstance(fd_class, dep_count)
-        for j in range(dep_count):
-            dep_name = fp.getDependency(j)
-            jvm.java.lang.reflect.Array.set(dep_array, j, built[dep_name])
-        built[fp.getName()] = Descriptors.FileDescriptor.buildFrom(fp, dep_array)
+    device_req_field = [
+        PbScalar("os_type", 1, IntegerGen()),
+        PbScalar("device_id", 2, BinaryGen(min_length=0, max_length=16)),
+    ]
+    partner_info = [
+        PbScalar("token", 1, StringGen()),
+        PbScalar("partner_id", 2, u64()),
+    ]
+    coordinate = [
+        PbScalar("x", 1, DoubleGen()),
+        PbScalar("y", 2, DoubleGen()),
+    ]
+    location_point = [
+        PbScalar("frequency", 1, u32()),
+        PbNested("coord", 2, coordinate),
+        PbScalar("timestamp", 3, u64()),
+    ]
+    change_log = [
+        PbScalar("value_before", 1, u32()),
+        PbScalar("parameters", 2, StringGen()),
+    ]
+    kv_pair = [
+        PbScalar("key", 1, BinaryGen(min_length=0, max_length=16)),
+        PbScalar("value", 2, BinaryGen(min_length=0, max_length=16)),
+    ]
+    style_config = [
+        PbScalar("style_id", 1, u32()),
+        PbRepeatedMessage("kv_pairs", 2, kv_pair, min_len=0, max_len=3),
+    ]
+    module_a_res = [
+        PbScalar("route_tag", 1, StringGen()),
+        PbScalar("status_tag", 2, IntegerGen()),
+        PbScalar("region_id", 3, u32()),
+        PbRepeated("experiment_ids", 4, StringGen(), packed=False, min_len=0, max_len=3),
+        PbScalar("quality_score", 5, DoubleGen()),
+        PbRepeatedMessage("location_points", 6, location_point, min_len=0, max_len=3),
+        PbRepeated("interest_ids", 7, u64(), packed=False, min_len=0, max_len=3),
+    ]
+    module_a_src_res = [
+        PbScalar("match_type", 1, u32()),
+    ]
+    module_a_detail = [
+        PbScalar("type_code", 1, u32()),
+        PbScalar("item_id", 2, u64()),
+        PbScalar("strategy_type", 3, IntegerGen()),
+        PbScalar("min_value", 4, LongGen()),
+        PbScalar("target_url", 5, BinaryGen(min_length=0, max_length=24)),
+        PbScalar("title", 6, StringGen()),
+        PbScalar("is_valid", 7, BooleanGen()),
+        PbScalar("score_ratio", 8, FloatGen()),
+        PbRepeated("template_ids", 9, u32(), packed=False, min_len=0, max_len=3),
+        PbRepeated("material_ids", 10, u64(), packed=False, min_len=0, max_len=3),
+        PbRepeatedMessage("styles", 11, style_config, min_len=0, max_len=3),
+        PbRepeatedMessage("change_logs", 12, change_log, min_len=0, max_len=3),
+        PbNested("partner_info", 13, partner_info),
+        PbNested("predictor_schema", 14, predictor_schema),
+    ]
 
-    # Search all file descriptors for the target message
-    for fd in built.values():
-        msg_types = fd.getMessageTypes()
-        for idx in range(msg_types.size()):
-            msg = msg_types.get(idx)
-            if msg.getFullName() == full_message_name:
-                return msg
+    block_element = [
+        PbScalar("element_id", 1, u64()),
+        PbRepeated("ref_ids", 2, u64(), packed=False, min_len=0, max_len=3),
+    ]
+    block_info = [
+        PbScalar("block_id", 1, u64()),
+        PbRepeatedMessage("elements", 2, block_element, min_len=0, max_len=3),
+    ]
+    module_b_detail = [
+        PbRepeated("tags", 1, u32(), packed=False, min_len=0, max_len=3),
+        PbScalar("item_id", 2, u64()),
+        PbScalar("name", 3, StringGen()),
+        PbRepeatedMessage("blocks", 4, block_info, min_len=0, max_len=3),
+    ]
 
-    raise ValueError(
-        "Message '{}' not found in descriptor set".format(full_message_name))
+    request_info = [
+        PbScalar("page_num", 1, u32()),
+        PbScalar("channel_code", 2, StringGen()),
+        PbRepeated("experiment_ids", 3, u32(), packed=False, min_len=0, max_len=3),
+        PbScalar("is_filtered", 4, BooleanGen()),
+    ]
+    extended_req_info = [
+        PbNested("device_req_field", 1, device_req_field),
+    ]
+    server_added_field = [
+        PbScalar("region_code", 1, u32()),
+        PbScalar("flow_type", 2, StringGen()),
+        PbScalar("filter_result", 3, IntegerGen()),
+        PbRepeated("hit_rule_list", 4, IntegerGen(), packed=False, min_len=0, max_len=3),
+        PbScalar("request_time", 5, u64()),
+        PbScalar("skip_flag", 6, BooleanGen()),
+    ]
+    basic_info = [
+        PbNested("request_info", 1, request_info),
+        PbNested("extended_req_info", 2, extended_req_info),
+        PbNested("server_added_field", 3, server_added_field),
+    ]
 
+    channel_info = [
+        PbScalar("channel_id", 1, IntegerGen()),
+        PbNested("module_a_res", 2, module_a_res),
+    ]
+    src_channel_info = [
+        PbScalar("channel_id", 1, IntegerGen()),
+        PbNested("module_a_src_res", 2, module_a_src_res),
+    ]
+    item_detail_field = [
+        PbScalar("rank", 1, u32()),
+        PbScalar("record_id", 2, u64()),
+        PbScalar("keyword", 3, StringGen()),
+        PbNested("module_a_detail", 4, module_a_detail),
+        PbNested("module_b_detail", 5, module_b_detail),
+    ]
+    data_source_field = [
+        PbScalar("source_id", 1, u32()),
+        PbRepeatedMessage("src_channel_list", 2, src_channel_info, min_len=0, max_len=3),
+        PbScalar("billing_name", 3, StringGen()),
+        PbRepeatedMessage("item_list", 4, item_detail_field, min_len=0, max_len=3),
+        PbScalar("is_free", 5, BooleanGen()),
+    ]
+    log_content = [
+        PbNested("basic_info", 1, basic_info),
+        PbRepeatedMessage("channel_list", 2, channel_info, min_len=0, max_len=3),
+        PbRepeatedMessage("source_list", 3, data_source_field, min_len=0, max_len=3),
+    ]
 
-def _encode_varint(value):
-    """Encode an unsigned integer as a protobuf varint."""
-    buf = bytearray()
-    while value >= 128:
-        buf.append((value & 0x7F) | 0x80)
-        value >>= 7
-    buf.append(value)
-    return bytes(buf)
-
-
-def _encode_raw_float_field(field_number, float_val):
-    """Encode a protobuf Float field as raw wire-format bytes.
-
-    py4j always converts Python ``float`` to ``java.lang.Double``, so we
-    cannot pass a ``java.lang.Float`` through ``DynamicMessage.setField``.
-    Instead we encode the field manually and merge the bytes later.
-    """
-    key = (field_number << 3) | 5  # wire type 5 = 32-bit
-    return _encode_varint(key) + struct.pack('<f', float_val)
-
-
-def _build_random_dynamic_message(jvm, rng, msg_desc, depth=0):
-    """Recursively build a random DynamicMessage for the given descriptor."""
-    DM = jvm.com.google.protobuf.DynamicMessage
-    builder = DM.newBuilder(msg_desc)
-    raw_float_bytes = bytearray()  # accumulate wire-encoded Float fields
-
-    field_count = msg_desc.getFields().size()
-    for i in range(field_count):
-        field = msg_desc.getFields().get(i)
-
-        # Skip optional/repeated fields randomly (10%); never skip required
-        if not field.isRequired() and rng.random() < 0.1:
-            continue
-
-        # Cap nesting depth to avoid extreme recursion on deeply-nested schemas
-        if depth > 6 and field.getJavaType().toString() == "MESSAGE":
-            continue
-
-        # Float fields need special handling (see _encode_raw_float_field)
-        if field.getJavaType().toString() == "FLOAT":
-            if field.isRepeated():
-                for _ in range(rng.randint(0, 3)):
-                    raw_float_bytes.extend(
-                        _encode_raw_float_field(field.getNumber(),
-                                                rng.uniform(-1e3, 1e3)))
-            else:
-                raw_float_bytes.extend(
-                    _encode_raw_float_field(field.getNumber(),
-                                            rng.uniform(-1e3, 1e3)))
-            continue
-
-        if field.isRepeated():
-            n = rng.randint(0, 3)
-            for _ in range(n):
-                value = _random_field_value(jvm, rng, field, depth)
-                if value is not None:
-                    builder.addRepeatedField(field, value)
-        else:
-            value = _random_field_value(jvm, rng, field, depth)
-            if value is not None:
-                builder.setField(field, value)
-
-    if raw_float_bytes:
-        # Merge the wire-encoded Float fields into the message
-        merged = bytes(builder.build().toByteArray()) + bytes(raw_float_bytes)
-        return DM.parseFrom(msg_desc, merged)
-    return builder.build()
-
-
-def _random_field_value(jvm, rng, field, depth):
-    """Generate a random value appropriate for *field*'s Java type.
-
-    FLOAT is handled separately in ``_build_random_dynamic_message`` because
-    py4j cannot transport ``java.lang.Float`` without auto-promoting it to
-    ``java.lang.Double``.
-    """
-    java_type = field.getJavaType().toString()
-
-    if java_type == "BOOLEAN":
-        return bool(rng.random() > 0.5)
-    elif java_type == "INT":
-        # Keep within signed 32-bit range so py4j maps to Java Integer
-        return rng.randint(-(2 ** 31), 2 ** 31 - 1)
-    elif java_type == "LONG":
-        # Explicit Long wrapping so py4j does not downcast to Integer
-        return jvm.java.lang.Long(rng.randint(-(2 ** 53), 2 ** 53))
-    elif java_type == "DOUBLE":
-        return float(rng.uniform(-1e6, 1e6))
-    elif java_type == "STRING":
-        length = rng.randint(1, 20)
-        return ''.join(chr(rng.randint(ord('a'), ord('z'))) for _ in range(length))
-    elif java_type == "BYTE_STRING":
-        length = rng.randint(1, 20)
-        data = bytes(rng.randint(0, 255) for _ in range(length))
-        return jvm.com.google.protobuf.ByteString.copyFrom(data)
-    elif java_type == "ENUM":
-        enum_type = field.getEnumType()
-        values = enum_type.getValues()
-        return values.get(rng.randint(0, values.size() - 1))
-    elif java_type == "MESSAGE":
-        return _build_random_dynamic_message(
-            jvm, rng, field.getMessageType(), depth + 1)
-    return None
-
-
-def _generate_random_protobuf_messages_jvm(spark, desc_bytes, message_name,
-                                           count=50, seed=42):
-    """Generate random protobuf binary messages using the JVM protobuf library.
-
-    Returns a list of Python ``bytes`` objects, one per serialized message.
-    Uses ``DynamicMessage`` so no compiled Java classes are needed -- only the
-    descriptor bytes from ``protoc --include_imports``.
-    """
-    jvm = spark.sparkContext._jvm
-    msg_desc = _resolve_message_descriptor_jvm(spark, desc_bytes, message_name)
-    rng = _random.Random(seed)
-
-    messages = []
-    for _ in range(count):
-        msg = _build_random_dynamic_message(jvm, rng, msg_desc)
-        messages.append(bytes(msg.toByteArray()))
-    return messages
+    return [
+        PbScalar(
+            "source", 1,
+            IntegerGen(min_val=0, max_val=1, nullable=False, special_cases=[4])),
+        PbScalar("timestamp", 2, LongGen(min_val=0, max_val=(1 << 50), nullable=False)),
+        PbScalar("user_id", 3, StringGen()),
+        PbScalar("account_id", 4, LongGen()),
+        PbScalar("client_ip", 5, IntegerGen(min_val=0, max_val=0x7FFFFFFF), encoding='fixed'),
+        PbNested("log_content", 6, log_content),
+    ]
 
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@pytest.mark.parametrize("options", [None, {"enums.as.ints": "true"}])
 @ignore_order(local=True)
-def test_from_protobuf_nested_proto(spark_tmp_path):
+def test_from_protobuf_customer_heavy_nested_proto(spark_tmp_path, from_protobuf_fn, options):
     """Integration test with real nested proto: multi-level nesting, cross-file imports, enums."""
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
-
     desc_bytes = _load_nested_proto_desc_resource()
     if desc_bytes is None:
         pytest.skip("nested_proto descriptor not found; run gen_nested_proto_data.sh first")
@@ -461,110 +487,15 @@ def test_from_protobuf_nested_proto(spark_tmp_path):
     with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
 
     message_name = "com.test.proto.sample.MainLogRecord"
-    test_messages = with_cpu_session(
-        lambda spark: _generate_random_protobuf_messages_jvm(
-            spark, desc_bytes, message_name, count=50, seed=42))
+    data_gen = ProtobufMessageGen(_build_main_log_record_fields())
 
     def run_on_spark(spark):
-        rows = [(msg,) for msg in test_messages] + [(None,)]
-        df = spark.createDataFrame(rows, schema="bin binary")
+        generated = gen_df(spark, data_gen).select("bin")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes,
+            options=options)
 
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-
-        return df.select(decoded.alias("decoded"))
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_nested_proto_with_options(spark_tmp_path):
-    """Integration test with nested proto and ``enums.as.ints`` option."""
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
-
-    desc_bytes = _load_nested_proto_desc_resource()
-    if desc_bytes is None:
-        pytest.skip("nested_proto descriptor not found; run gen_nested_proto_data.sh first")
-
-    desc_path = spark_tmp_path + "/main_log.desc"
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
-
-    message_name = "com.test.proto.sample.MainLogRecord"
-    test_messages = with_cpu_session(
-        lambda spark: _generate_random_protobuf_messages_jvm(
-            spark, desc_bytes, message_name, count=50, seed=42))
-
-    options = {"enums.as.ints": "true"}
-
-    def run_on_spark(spark):
-        rows = [(msg,) for msg in test_messages] + [(None,)]
-        df = spark.createDataFrame(rows, schema="bin binary")
-
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            if "options" in sig.parameters:
-                decoded = from_protobuf(
-                    f.col("bin"), message_name,
-                    binaryDescriptorSet=bytearray(desc_bytes),
-                    options=options)
-            else:
-                decoded = from_protobuf(
-                    f.col("bin"), message_name,
-                    binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            if "options" in sig.parameters:
-                decoded = from_protobuf(
-                    f.col("bin"), message_name, desc_path, options)
-            else:
-                decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-
-        return df.select(decoded.alias("decoded"))
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_simple_null_input_returns_null(spark_tmp_path):
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
-
-    desc_path = spark_tmp_path + "/simple_null_input.desc"
-    message_name = "test.Simple"
-
-    # Generate descriptor bytes once using the JVM (no protoc dependency)
-    desc_bytes = with_cpu_session(_build_simple_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
-
-    # Spark's ProtobufDataToCatalyst is NullIntolerant (null input -> null output).
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(None,), (bytes([0x08, 0x01, 0x10, 0x7B]),)],  # b=true, i32=123
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"),
-                message_name,
-                binaryDescriptorSet=bytearray(desc_bytes),
-            )
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        return df.select(decoded.alias("decoded"))
+        return generated.select(decoded.alias("decoded"))
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
@@ -584,16 +515,7 @@ def _build_nested_descriptor_set_bytes(spark):
         optional int64  simple_long = 4;
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("nested.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "nested.proto")
 
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
 
@@ -656,48 +578,26 @@ def _build_nested_descriptor_set_bytes(spark):
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_schema_projection_simple_fields_only(spark_tmp_path):
+def test_from_protobuf_schema_projection_simple_fields_only(spark_tmp_path, from_protobuf_fn):
     """
     Test schema projection: when only simple fields are selected from a protobuf message
     that also contains unsupported types (nested message), GPU should be able to decode
     just the simple fields without falling back to CPU.
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
-
-    desc_path = spark_tmp_path + "/nested.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "nested.desc", _build_nested_descriptor_set_bytes)
     message_name = "test.WithNested"
 
-    desc_bytes = with_cpu_session(_build_nested_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
-
-    # Create test data: protobuf binary with simple fields set
-    # Field 1 (simple_int): varint 42 -> 0x08 0x2A
-    # Field 2 (simple_str): length-delimited "hello" -> 0x12 0x05 h e l l o
-    # Field 4 (simple_long): varint 12345 -> 0x20 0xB9 0x60
-    test_data = bytes([
-        0x08, 0x2A,  # simple_int = 42
-        0x12, 0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F,  # simple_str = "hello"
-        0x20, 0xB9, 0x60,  # simple_long = 12345
+    data_gen = ProtobufMessageGen([
+        PbScalar("simple_int", 1, IntegerGen()),
+        PbScalar("simple_str", 2, StringGen()),
+        PbScalar("simple_long", 4, LongGen()),
     ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"),
-                message_name,
-                binaryDescriptorSet=bytearray(desc_bytes),
-            )
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         # Only select simple fields, not the nested_msg field
         return df.select(
             decoded.getField("simple_int").alias("simple_int"),
@@ -724,16 +624,7 @@ def _build_enum_descriptor_set_bytes(spark):
         optional string name = 3;
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("enum.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "enum.proto")
 
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
 
@@ -782,246 +673,72 @@ def _build_enum_descriptor_set_bytes(spark):
 
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@pytest.mark.parametrize("enum_case", [
+    "as_int",
+    "unknown_as_int",
+    "as_string",
+    "unknown_as_string",
+], ids=lambda x: x)
 @ignore_order(local=True)
-def test_from_protobuf_enum_as_int(spark_tmp_path):
-    """
-    Test enum field decoded as integer with enums.as.ints=true option.
-    GPU should decode enum fields as INT32 values matching CPU behavior.
-    """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
-
-    desc_path = spark_tmp_path + "/enum.desc"
+def test_from_protobuf_enum_cases(spark_tmp_path, from_protobuf_fn, enum_case):
+    """Parametrized enum decoding tests for int/string modes and unknown values."""
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "enum.desc", _build_enum_descriptor_set_bytes)
     message_name = "test.WithEnum"
 
-    desc_bytes = with_cpu_session(_build_enum_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
+    _ef_full = [
+        PbScalar("color", 1, IntegerGen()),
+        PbScalar("count", 2, IntegerGen()),
+        PbScalar("name", 3, StringGen()),
+    ]
+    _ef_partial = [PbScalar("color", 1, IntegerGen()), PbScalar("count", 2, IntegerGen())]
 
-    # Create test data with various enum values:
-    # Row 0: color=GREEN(1), count=42, name="test"
-    # Row 1: color=RED(0), count=100, name missing
-    # Row 2: color missing, count=200, name="hello"
-    # Row 3: null input
-    test_data_row0 = bytes([
-        0x08, 0x01,  # color = GREEN (1)
-        0x10, 0x2A,  # count = 42
-        0x1A, 0x04, 0x74, 0x65, 0x73, 0x74,  # name = "test"
-    ])
-    test_data_row1 = bytes([
-        0x08, 0x00,  # color = RED (0)
-        0x10, 0x64,  # count = 100
-    ])
-    test_data_row2 = bytes([
-        0x10, 0xC8, 0x01,  # count = 200
-        0x1A, 0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F,  # name = "hello"
-    ])
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data_row0,), (test_data_row1,), (test_data_row2,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
+    if enum_case == "as_int":
+        rows = [
+            (encode_pb_message(_ef_full, [1, 42, "test"]),),
+            (encode_pb_message(_ef_full, [0, 100, None]),),
+            (encode_pb_message(_ef_full, [None, 200, "hello"]),),
+            (None,),
+        ]
         options = {"enums.as.ints": "true"}
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"),
-                message_name,
-                binaryDescriptorSet=bytearray(desc_bytes),
-                options=options
-            )
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path, options)
-        return df.select(
-            decoded.getField("color").alias("color"),
-            decoded.getField("count").alias("count"),
-            decoded.getField("name").alias("name")
-        )
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_enum_unknown_value(spark_tmp_path):
-    """
-    Test that unknown enum values (not defined in enum) null the entire struct row.
-    Both GPU and CPU implementations (PERMISSIVE mode) null the entire row when
-    an unknown enum value is encountered.
-    """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
-
-    desc_path = spark_tmp_path + "/enum_unknown.desc"
-    message_name = "test.WithEnum"
-
-    desc_bytes = with_cpu_session(_build_enum_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
-
-    # Create test data with unknown enum value (999 is not defined in Color enum)
-    # 999 encoded as varint: 0xE7 0x07
-    test_data = bytes([
-        0x08, 0xE7, 0x07,  # color = 999 (unknown value)
-        0x10, 0x2A,  # count = 42
-    ])
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        # Use PERMISSIVE mode to allow unknown enum values to pass through
+        select_mode = "fields3"
+    elif enum_case == "unknown_as_int":
+        rows = [(encode_pb_message(_ef_partial, [999, 42]),)]
         options = {"enums.as.ints": "true", "mode": "PERMISSIVE"}
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"),
-                message_name,
-                binaryDescriptorSet=bytearray(desc_bytes),
-                options=options
-            )
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path, options)
-        return df.select(
-            decoded.getField("color").alias("color"),
-            decoded.getField("count").alias("count")
-        )
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-# =============================================================================
-# Enum-as-String Tests (default enum behaviour without enums.as.ints)
-# =============================================================================
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_enum_as_string(spark_tmp_path):
-    """
-    Test enum field decoded as string name (default behaviour, no enums.as.ints).
-    GPU should decode enum varint values into their enum name strings.
-    """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
-
-    desc_path = spark_tmp_path + "/enum_as_string.desc"
-    message_name = "test.WithEnum"
-
-    desc_bytes = with_cpu_session(_build_enum_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
-
-    # Row 0: color=GREEN(1), count=42, name="test"
-    # Row 1: color=RED(0), count=100, name missing
-    # Row 2: color=BLUE(2), count=200, name="hello"
-    # Row 3: color missing, count=300, name="world"
-    # Row 4: null input
-    test_data_row0 = bytes([
-        0x08, 0x01,  # color = GREEN (1)
-        0x10, 0x2A,  # count = 42
-        0x1A, 0x04, 0x74, 0x65, 0x73, 0x74,  # name = "test"
-    ])
-    test_data_row1 = bytes([
-        0x08, 0x00,  # color = RED (0)
-        0x10, 0x64,  # count = 100
-    ])
-    test_data_row2 = bytes([
-        0x08, 0x02,  # color = BLUE (2)
-        0x10, 0xC8, 0x01,  # count = 200
-        0x1A, 0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F,  # name = "hello"
-    ])
-    test_data_row3 = bytes([
-        0x10, 0xAC, 0x02,  # count = 300
-        0x1A, 0x05, 0x77, 0x6F, 0x72, 0x6C, 0x64,  # name = "world"
-    ])
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data_row0,), (test_data_row1,), (test_data_row2,),
-             (test_data_row3,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        # No options -> default enum-as-string behaviour
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"),
-                message_name,
-                binaryDescriptorSet=bytearray(desc_bytes),
-            )
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        return df.select(
-            decoded.getField("color").alias("color"),
-            decoded.getField("count").alias("count"),
-            decoded.getField("name").alias("name")
-        )
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_enum_as_string_unknown_value(spark_tmp_path):
-    """
-    Test that unknown enum values null the entire struct row in PERMISSIVE mode
-    when enums are decoded as strings (default behaviour).
-    """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
-
-    desc_path = spark_tmp_path + "/enum_as_string_unknown.desc"
-    message_name = "test.WithEnum"
-
-    desc_bytes = with_cpu_session(_build_enum_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
-
-    # Row 0: color=GREEN(1), count=10  -> valid
-    # Row 1: color=999 (unknown), count=20  -> entire row nulled (PERMISSIVE)
-    # Row 2: color=BLUE(2), count=30  -> valid
-    test_data_valid = bytes([0x08, 0x01, 0x10, 0x0A])
-    test_data_unknown = bytes([0x08, 0xE7, 0x07, 0x10, 0x14])
-    test_data_valid2 = bytes([0x08, 0x02, 0x10, 0x1E])
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data_valid,), (test_data_unknown,), (test_data_valid2,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        # Must use PERMISSIVE mode; Spark CPU defaults to FAILFAST and throws on
-        # unknown enum values instead of returning null.
+        select_mode = "fields2"
+    elif enum_case == "as_string":
+        rows = [
+            (encode_pb_message(_ef_full, [1, 42, "test"]),),
+            (encode_pb_message(_ef_full, [0, 100, None]),),
+            (encode_pb_message(_ef_full, [2, 200, "hello"]),),
+            (encode_pb_message(_ef_full, [None, 300, "world"]),),
+            (None,),
+        ]
+        options = None
+        select_mode = "fields3"
+    else:
+        rows = [
+            (encode_pb_message(_ef_partial, [1, 10]),),
+            (encode_pb_message(_ef_partial, [999, 20]),),
+            (encode_pb_message(_ef_partial, [2, 30]),),
+        ]
         options = {"mode": "PERMISSIVE"}
-        if "binaryDescriptorSet" in sig.parameters:
-            if "options" in sig.parameters:
-                decoded = from_protobuf(
-                    f.col("bin"),
-                    message_name,
-                    binaryDescriptorSet=bytearray(desc_bytes),
-                    options=options,
-                )
-            else:
-                decoded = from_protobuf(
-                    f.col("bin"),
-                    message_name,
-                    binaryDescriptorSet=bytearray(desc_bytes),
-                )
-        else:
-            if "options" in sig.parameters:
-                decoded = from_protobuf(f.col("bin"), message_name, desc_path, options)
-            else:
-                decoded = from_protobuf(f.col("bin"), message_name, desc_path)
+        select_mode = "decoded"
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(rows, schema="bin binary")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes,
+            options=options)
+        if select_mode == "fields3":
+            return df.select(
+                decoded.getField("color").alias("color"),
+                decoded.getField("count").alias("count"),
+                decoded.getField("name").alias("name"))
+        if select_mode == "fields2":
+            return df.select(
+                decoded.getField("color").alias("color"),
+                decoded.getField("count").alias("count"))
         return df.select(decoded.alias("decoded"))
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
@@ -1038,16 +755,7 @@ def _build_required_field_descriptor_set_bytes(spark):
         optional int32 count = 3;
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("required.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "required.proto")
 
     label_required = D.FieldDescriptorProto.Label.LABEL_REQUIRED
     label_optional = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
@@ -1089,49 +797,33 @@ def _build_required_field_descriptor_set_bytes(spark):
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_required_field_present(spark_tmp_path):
+def test_from_protobuf_required_field_present(spark_tmp_path, from_protobuf_fn):
     """
     Test that required fields decode correctly when present.
     GPU should produce same results as CPU.
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
-
-    desc_path = spark_tmp_path + "/required.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "required.desc", _build_required_field_descriptor_set_bytes)
     message_name = "test.WithRequired"
-
-    desc_bytes = with_cpu_session(_build_required_field_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
 
     # Create test data with required field present
     # Row 0: id=100, name="test", count=42
     # Row 1: id=200, name missing, count missing
-    test_data_row0 = bytes([
-        0x08, 0x64,  # id = 100
-        0x12, 0x04, 0x74, 0x65, 0x73, 0x74,  # name = "test"
-        0x18, 0x2A,  # count = 42
-    ])
-    test_data_row1 = bytes([
-        0x08, 0xC8, 0x01,  # id = 200
-    ])
+    _rf = [
+        PbScalar("id", 1, LongGen()),
+        PbScalar("name", 2, StringGen()),
+        PbScalar("count", 3, IntegerGen()),
+    ]
+    test_data_row0 = encode_pb_message(_rf, [100, "test", 42])
+    test_data_row1 = encode_pb_message(_rf, [200, None, None])
 
     def run_on_spark(spark):
         df = spark.createDataFrame(
             [(test_data_row0,), (test_data_row1,)],
             schema="bin binary",
         )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"),
-                message_name,
-                binaryDescriptorSet=bytearray(desc_bytes)
-            )
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(
             decoded.getField("id").alias("id"),
             decoded.getField("name").alias("name"),
@@ -1155,16 +847,7 @@ def _build_default_value_descriptor_set_bytes(spark):
     available via the simple DescriptorProtos API. For testing, we rely on proto2
     implicit behavior where hasDefaultValue() returns true for optional fields.
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("defaults.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "defaults.proto")
 
     label_optional = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
 
@@ -1203,154 +886,50 @@ def _build_default_value_descriptor_set_bytes(spark):
 
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@pytest.mark.parametrize("default_case", [
+    "field_present",
+    "missing_fields",
+    "string_default_only",
+], ids=lambda x: x)
 @ignore_order(local=True)
-def test_from_protobuf_default_values_field_present(spark_tmp_path):
-    """
-    Test that when fields with defaults are present, the actual values are used.
-    This validates the GPU correctly decodes present values (not using defaults).
-    """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
-
-    desc_path = spark_tmp_path + "/defaults.desc"
+def test_from_protobuf_default_values_cases(spark_tmp_path, from_protobuf_fn, default_case):
+    """Parametrized tests for proto2 default-value behavior."""
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "defaults.desc", _build_default_value_descriptor_set_bytes)
     message_name = "test.WithDefaults"
 
-    desc_bytes = with_cpu_session(_build_default_value_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
+    _df = [
+        PbScalar("count", 1, IntegerGen()),
+        PbScalar("name", 2, StringGen()),
+        PbScalar("flag", 3, BooleanGen()),
+    ]
 
-    # Create test data where all fields are present (actual values, not defaults)
-    test_data = bytes([
-        0x08, 0x64,  # count = 100 (not the default 42)
-        0x12, 0x04, 0x74, 0x65, 0x73, 0x74,  # name = "test" (not "unknown")
-        0x18, 0x00,  # flag = false (not true)
-    ])
+    if default_case == "field_present":
+        rows = [(encode_pb_message(_df, [100, "test", False]),)]
+        select_mode = "all"
+    elif default_case == "missing_fields":
+        rows = [
+            (encode_pb_message(_df, [None, None, None]),),
+            (encode_pb_message(_df, [100, None, None]),),
+        ]
+        select_mode = "all"
+    else:
+        rows = [(encode_pb_message(_df, [42, None, True]),)]
+        select_mode = "name_only"
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"),
-                message_name,
-                binaryDescriptorSet=bytearray(desc_bytes)
-            )
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        return df.select(
-            decoded.getField("count").alias("count"),
-            decoded.getField("name").alias("name"),
-            decoded.getField("flag").alias("flag")
-        )
+        df = spark.createDataFrame(rows, schema="bin binary")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
+        if select_mode == "all":
+            return df.select(
+                decoded.getField("count").alias("count"),
+                decoded.getField("name").alias("name"),
+                decoded.getField("flag").alias("flag"))
+        return df.select(decoded.getField("name").alias("name"))
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_default_values_missing_fields(spark_tmp_path):
-    """
-    Test that when fields with defaults are missing, the default values are filled in.
-    This validates the GPU correctly fills default values for missing fields.
-    """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
-
-    desc_path = spark_tmp_path + "/defaults.desc"
-    message_name = "test.WithDefaults"
-
-    desc_bytes = with_cpu_session(_build_default_value_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
-
-    # Create test data where all fields are MISSING (should use defaults)
-    # Empty protobuf message
-    test_data_empty = bytes([])
-    
-    # Partial message: only count field is present
-    test_data_partial = bytes([
-        0x08, 0x64,  # count = 100
-    ])
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data_empty,), (test_data_partial,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"),
-                message_name,
-                binaryDescriptorSet=bytearray(desc_bytes)
-            )
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        return df.select(
-            decoded.getField("count").alias("count"),
-            decoded.getField("name").alias("name"),
-            decoded.getField("flag").alias("flag")
-        )
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_string_default_value(spark_tmp_path):
-    """
-    Test string default value specifically.
-    """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
-
-    desc_path = spark_tmp_path + "/defaults.desc"
-    message_name = "test.WithDefaults"
-
-    desc_bytes = with_cpu_session(_build_default_value_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
-
-    # Create test data where only non-string fields are present
-    # name field is missing, should use default "unknown"
-    test_data = bytes([
-        0x08, 0x2A,  # count = 42
-        0x18, 0x01,  # flag = true
-    ])
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"),
-                message_name,
-                binaryDescriptorSet=bytearray(desc_bytes)
-            )
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        return df.select(
-            decoded.getField("name").alias("name")
-        )
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-# =============================================================================
-# Enhanced Protobuf Tests with Random Data Generation
-# =============================================================================
 
 def _build_all_scalars_descriptor_set_bytes(spark):
     """
@@ -1368,16 +947,7 @@ def _build_all_scalars_descriptor_set_bytes(spark):
         optional fixed64 fx64 = 10;
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("all_scalars.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "all_scalars.proto")
 
     msg = D.DescriptorProto.newBuilder().setName("AllScalars")
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
@@ -1409,6 +979,31 @@ def _build_all_scalars_descriptor_set_bytes(spark):
     return bytes(fds.toByteArray())
 
 
+def _build_scalar_bytes_descriptor_set_bytes(spark):
+    """
+    Build a FileDescriptorSet for:
+      message ScalarBytes {
+        optional bytes payload = 1;
+      }
+    """
+    D, fd = _new_proto2_file(spark, "scalar_bytes.proto")
+    label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
+
+    msg = D.DescriptorProto.newBuilder().setName("ScalarBytes")
+    msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("payload")
+            .setNumber(1)
+            .setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_BYTES)
+            .build()
+    )
+    fd.addMessageType(msg.build())
+
+    fds = D.FileDescriptorSet.newBuilder().addFile(fd.build()).build()
+    return bytes(fds.toByteArray())
+
+
 def _scalar_test_id(config):
     """Generate stable test ID using only the first element (test name)."""
     return config[0] if isinstance(config, tuple) else str(config)
@@ -1417,38 +1012,25 @@ def _scalar_test_id(config):
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @pytest.mark.parametrize("test_config", _random_scalar_test_configs, ids=_scalar_test_id)
 @ignore_order(local=True)
-def test_from_protobuf_random_scalars(spark_tmp_path, test_config):
+def test_from_protobuf_random_scalars(spark_tmp_path, from_protobuf_fn, test_config):
     """
     Parametrized test for from_protobuf with randomly generated scalar data.
-    Covers: all types, integer edge cases, float edge cases, nullable fields, large datasets.
+    Covers: all types, integer edge cases, float edge cases, large datasets.
     """
-    test_id, field_configs, data_length = test_config
-    
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
+    test_id, field_configs = test_config
 
-    desc_path = spark_tmp_path + "/simple.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "simple.desc", _build_simple_descriptor_set_bytes)
     message_name = "test.Simple"
 
-    desc_bytes = with_cpu_session(_build_simple_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
-
-    data_gen = ProtobufSimpleMessageRowGen(field_configs)
+    data_gen = ProtobufMessageGen(field_configs)
 
     def run_on_spark(spark):
-        df = gen_df(spark, data_gen, length=data_length)
-        
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
+
         # Select all decoded fields
         return df.select(
             decoded.getField("b").alias("b"),
@@ -1463,46 +1045,35 @@ def test_from_protobuf_random_scalars(spark_tmp_path, test_config):
 
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)  
-def test_from_protobuf_nullable_fields(spark_tmp_path):
-    """
-    Test from_protobuf with nullable fields - some rows have missing fields.
-    """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("pyspark.sql.protobuf.functions.from_protobuf is not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM module is not available on the classpath")
+@ignore_order(local=True)
+def test_from_protobuf_all_scalar_types(spark_tmp_path, from_protobuf_fn):
+    """Decode all scalar wire encodings together in one message."""
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "all_scalars.desc", _build_all_scalars_descriptor_set_bytes)
+    message_name = "test.AllScalars"
 
-    desc_path = spark_tmp_path + "/simple.desc"
-    message_name = "test.Simple"
-
-    desc_bytes = with_cpu_session(_build_simple_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(spark, desc_path, desc_bytes))
-
-    # Generate data with high null probability
-    data_gen = ProtobufSimpleMessageRowGen([
-        ("b", 1, BooleanGen(nullable=True)),
-        ("i32", 2, IntegerGen(nullable=True)),
-        ("i64", 3, LongGen(nullable=True)),
-        ("f32", 4, FloatGen(nullable=True)),
-        ("f64", 5, DoubleGen(nullable=True)),
-        ("s", 6, StringGen(nullable=True)),
+    data_gen = ProtobufMessageGen([
+        PbScalar("b", 1, BooleanGen()),
+        PbScalar("i32", 2, IntegerGen()),
+        PbScalar("i64", 3, LongGen()),
+        PbScalar("f32", 4, FloatGen()),
+        PbScalar("f64", 5, DoubleGen()),
+        PbScalar("s", 6, StringGen()),
+        PbScalar("si32", 7, IntegerGen(
+            special_cases=[-1, 0, 1, -2147483648, 2147483647]), encoding='zigzag'),
+        PbScalar("si64", 8, LongGen(
+            special_cases=[-1, 0, 1, -9223372036854775808, 9223372036854775807]),
+            encoding='zigzag'),
+        PbScalar("fx32", 9, IntegerGen(
+            special_cases=[0, 1, -1, 2147483647, -2147483648]), encoding='fixed'),
+        PbScalar("fx64", 10, LongGen(
+            special_cases=[0, 1, -1]), encoding='fixed'),
     ])
 
     def run_on_spark(spark):
-        df = gen_df(spark, data_gen, length=100)
-        
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"),
-                message_name,
-                binaryDescriptorSet=bytearray(desc_bytes),
-            )
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(
             decoded.getField("b").alias("b"),
             decoded.getField("i32").alias("i32"),
@@ -1510,14 +1081,58 @@ def test_from_protobuf_nullable_fields(spark_tmp_path):
             decoded.getField("f32").alias("f32"),
             decoded.getField("f64").alias("f64"),
             decoded.getField("s").alias("s"),
+            decoded.getField("si32").alias("si32"),
+            decoded.getField("si64").alias("si64"),
+            decoded.getField("fx32").alias("fx32"),
+            decoded.getField("fx64").alias("fx64"),
         )
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
 
-# =============================================================================
-# Nested and Repeated Field Integration Tests
-# =============================================================================
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_scalar_bytes(spark_tmp_path, from_protobuf_fn):
+    """Decode optional bytes scalar field, including empty bytes."""
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "scalar_bytes.desc", _build_scalar_bytes_descriptor_set_bytes)
+    message_name = "test.ScalarBytes"
+
+    data_gen = ProtobufMessageGen([
+        PbScalar("payload", 1, BinaryGen(min_length=0, max_length=16)),
+    ])
+
+    def run_on_spark(spark):
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
+        return df.select(decoded.getField("payload").alias("payload"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_duplicate_fields(spark_tmp_path, from_protobuf_fn):
+    """Duplicate non-repeated field should follow protobuf last-one-wins semantics."""
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "simple.desc", _build_simple_descriptor_set_bytes)
+    message_name = "test.Simple"
+
+    # i32 (field 2) appears twice in row0 and three times in row1.
+    test_data_row0 = bytes([0x10, 0x01, 0x10, 0x2A])
+    test_data_row1 = bytes([0x10, 0x03, 0x10, 0x04, 0x10, 0x05])
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(test_data_row0,), (test_data_row1,), (None,)],
+            schema="bin binary")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
+        return df.select(decoded.getField("i32").alias("i32"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
 
 def _build_repeated_int_descriptor_set_bytes(spark):
     """
@@ -1527,16 +1142,7 @@ def _build_repeated_int_descriptor_set_bytes(spark):
         repeated int32 values = 2;
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("repeated_int.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "repeated_int.proto")
 
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
     label_rep = D.FieldDescriptorProto.Label.LABEL_REPEATED
@@ -1566,58 +1172,23 @@ def _build_repeated_int_descriptor_set_bytes(spark):
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_repeated_int32(spark_tmp_path):
+def test_from_protobuf_repeated_int32(spark_tmp_path, from_protobuf_fn):
     """
     Test decoding repeated int32 field (ArrayType of integers).
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/repeated_int.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "repeated_int.desc", _build_repeated_int_descriptor_set_bytes)
     message_name = "test.WithRepeatedInt"
 
-    desc_bytes = with_cpu_session(_build_repeated_int_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    # Create test data:
-    # id = 1, values = [10, 20, 30]
-    # Field 1 (id): varint 1 -> 0x08 0x01
-    # Field 2 (values): repeated varint 10, 20, 30 -> 0x10 0x0A, 0x10 0x14, 0x10 0x1E
-    test_data_1 = bytes([
-        0x08, 0x01,  # id = 1
-        0x10, 0x0A,  # values[0] = 10
-        0x10, 0x14,  # values[1] = 20
-        0x10, 0x1E,  # values[2] = 30
-    ])
-    
-    # id = 2, values = [] (empty array)
-    test_data_2 = bytes([
-        0x08, 0x02,  # id = 2
-    ])
-    
-    # id = 3, values = [100]
-    test_data_3 = bytes([
-        0x08, 0x03,  # id = 3
-        0x10, 0x64,  # values[0] = 100
+    data_gen = ProtobufMessageGen([
+        PbScalar("id", 1, IntegerGen()),
+        PbRepeated("values", 2, IntegerGen(), min_len=0, max_len=10),
     ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data_1,), (test_data_2,), (test_data_3,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(
             decoded.getField("id").alias("id"),
             decoded.getField("values").alias("values"),
@@ -1634,16 +1205,7 @@ def _build_repeated_string_descriptor_set_bytes(spark):
         repeated string tags = 2;
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("repeated_string.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "repeated_string.proto")
 
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
     label_rep = D.FieldDescriptorProto.Label.LABEL_REPEATED
@@ -1673,50 +1235,23 @@ def _build_repeated_string_descriptor_set_bytes(spark):
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_repeated_string(spark_tmp_path):
+def test_from_protobuf_repeated_string(spark_tmp_path, from_protobuf_fn):
     """
     Test decoding repeated string field (ArrayType of strings).
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/repeated_string.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "repeated_string.desc", _build_repeated_string_descriptor_set_bytes)
     message_name = "test.WithRepeatedString"
 
-    desc_bytes = with_cpu_session(_build_repeated_string_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    # Create test data:
-    # name = "item1", tags = ["a", "b", "c"]
-    test_data_1 = bytes([
-        0x0A, 0x05, 0x69, 0x74, 0x65, 0x6D, 0x31,  # name = "item1"
-        0x12, 0x01, 0x61,  # tags[0] = "a"
-        0x12, 0x01, 0x62,  # tags[1] = "b"
-        0x12, 0x01, 0x63,  # tags[2] = "c"
-    ])
-    
-    # name = "item2", tags = []
-    test_data_2 = bytes([
-        0x0A, 0x05, 0x69, 0x74, 0x65, 0x6D, 0x32,  # name = "item2"
+    data_gen = ProtobufMessageGen([
+        PbScalar("name", 1, StringGen()),
+        PbRepeated("tags", 2, StringGen(), min_len=0, max_len=5),
     ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data_1,), (test_data_2,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(
             decoded.getField("name").alias("name"),
             decoded.getField("tags").alias("tags"),
@@ -1727,62 +1262,25 @@ def test_from_protobuf_repeated_string(spark_tmp_path):
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_nested_message(spark_tmp_path):
+def test_from_protobuf_nested_message(spark_tmp_path, from_protobuf_fn):
     """
     Test decoding nested message field (StructType).
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/nested.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "nested.desc", _build_nested_descriptor_set_bytes)
     message_name = "test.WithNested"
 
-    desc_bytes = with_cpu_session(_build_nested_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    # Create test data with nested message:
-    # simple_int = 42, simple_str = "hello", nested_msg = {x: 100}, simple_long = 999
-    # Field 1: varint 42 -> 0x08 0x2A
-    # Field 2: len-delim "hello" -> 0x12 0x05 h e l l o
-    # Field 3: len-delim nested {x=100} -> 0x1A 0x02 0x08 0x64
-    # Field 4: varint 999 -> 0x20 0xE7 0x07
-    test_data_with_nested = bytes([
-        0x08, 0x2A,  # simple_int = 42
-        0x12, 0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F,  # simple_str = "hello"
-        0x1A, 0x02, 0x08, 0x64,  # nested_msg = {x: 100}
-        0x20, 0xE7, 0x07,  # simple_long = 999
-    ])
-    
-    # Test with empty nested message
-    test_data_empty_nested = bytes([
-        0x08, 0x01,  # simple_int = 1
-        0x1A, 0x00,  # nested_msg = {} (empty)
-    ])
-    
-    # Test without nested message
-    test_data_no_nested = bytes([
-        0x08, 0x02,  # simple_int = 2
-        0x12, 0x05, 0x77, 0x6F, 0x72, 0x6C, 0x64,  # simple_str = "world"
+    data_gen = ProtobufMessageGen([
+        PbScalar("simple_int", 1, IntegerGen()),
+        PbScalar("simple_str", 2, StringGen(nullable=True)),
+        PbNested("nested_msg", 3, [PbScalar("x", 1, IntegerGen())]),
+        PbScalar("simple_long", 4, LongGen()),
     ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data_with_nested,), (test_data_empty_nested,), 
-             (test_data_no_nested,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         # Select all fields including nested
         return df.select(
             decoded.getField("simple_int").alias("simple_int"),
@@ -1796,41 +1294,25 @@ def test_from_protobuf_nested_message(spark_tmp_path):
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_nested_message_field_access(spark_tmp_path):
+def test_from_protobuf_nested_message_field_access(spark_tmp_path, from_protobuf_fn):
     """
     Test accessing fields within nested message.
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/nested.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "nested.desc", _build_nested_descriptor_set_bytes)
     message_name = "test.WithNested"
 
-    desc_bytes = with_cpu_session(_build_nested_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    test_data = bytes([
-        0x08, 0x2A,  # simple_int = 42
-        0x1A, 0x02, 0x08, 0x64,  # nested_msg = {x: 100}
+    data_gen = ProtobufMessageGen([
+        PbScalar("simple_int", 1, IntegerGen()),
+        PbScalar("simple_str", 2, StringGen(nullable=True)),
+        PbNested("nested_msg", 3, [PbScalar("x", 1, IntegerGen())]),
+        PbScalar("simple_long", 4, LongGen()),
     ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         # Access nested field directly
         return df.select(
             decoded.getField("simple_int").alias("simple_int"),
@@ -1855,16 +1337,7 @@ def _build_deep_nested_descriptor_set_bytes(spark):
         optional Middle middle = 2;
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("deep_nested.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "deep_nested.proto")
 
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
 
@@ -1928,50 +1401,26 @@ def _build_deep_nested_descriptor_set_bytes(spark):
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_deep_nested(spark_tmp_path):
+def test_from_protobuf_deep_nested(spark_tmp_path, from_protobuf_fn):
     """
     Test decoding deeply nested messages (3 levels).
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/deep_nested.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "deep_nested.desc", _build_deep_nested_descriptor_set_bytes)
     message_name = "test.Outer"
 
-    desc_bytes = with_cpu_session(_build_deep_nested_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    # Outer{id=1, middle=Middle{name="test", inner=Inner{value=42}}}
-    # Inner{value=42}: 0x08 0x2A (2 bytes)
-    # Middle{name="test", inner=...}: 0x0A 0x04 t e s t, 0x12 0x02 <inner> 
-    # Outer{id=1, middle=...}: 0x08 0x01, 0x12 <len> <middle>
-    inner_bytes = bytes([0x08, 0x2A])  # value = 42
-    middle_bytes = bytes([
-        0x0A, 0x04, 0x74, 0x65, 0x73, 0x74,  # name = "test"
-        0x12, len(inner_bytes)
-    ]) + inner_bytes
-    outer_bytes = bytes([
-        0x08, 0x01,  # id = 1
-        0x12, len(middle_bytes)
-    ]) + middle_bytes
+    data_gen = ProtobufMessageGen([
+        PbScalar("id", 1, IntegerGen()),
+        PbNested("middle", 2, [
+            PbScalar("name", 1, StringGen()),
+            PbNested("inner", 2, [PbScalar("value", 1, IntegerGen())]),
+        ]),
+    ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(outer_bytes,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(
             decoded.getField("id").alias("id"),
             decoded.getField("middle").alias("middle"),
@@ -1992,16 +1441,7 @@ def _build_repeated_message_descriptor_set_bytes(spark):
         repeated Item items = 2;
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("repeated_message.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "repeated_message.proto")
 
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
     label_rep = D.FieldDescriptorProto.Label.LABEL_REPEATED
@@ -2053,49 +1493,26 @@ def _build_repeated_message_descriptor_set_bytes(spark):
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_repeated_message(spark_tmp_path):
+def test_from_protobuf_repeated_message(spark_tmp_path, from_protobuf_fn):
     """
     Test decoding repeated message field (ArrayType of StructType).
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/repeated_message.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "repeated_message.desc", _build_repeated_message_descriptor_set_bytes)
     message_name = "test.Container"
 
-    desc_bytes = with_cpu_session(_build_repeated_message_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    # Container{title="list", items=[Item{id=1,name="a"}, Item{id=2,name="b"}]}
-    item1 = bytes([0x08, 0x01, 0x12, 0x01, 0x61])  # id=1, name="a"
-    item2 = bytes([0x08, 0x02, 0x12, 0x01, 0x62])  # id=2, name="b"
-    test_data = bytes([
-        0x0A, 0x04, 0x6C, 0x69, 0x73, 0x74,  # title = "list"
-        0x12, len(item1)
-    ]) + item1 + bytes([0x12, len(item2)]) + item2
-    
-    # Empty items array
-    test_data_empty = bytes([
-        0x0A, 0x05, 0x65, 0x6D, 0x70, 0x74, 0x79,  # title = "empty"
+    data_gen = ProtobufMessageGen([
+        PbScalar("title", 1, StringGen()),
+        PbRepeatedMessage("items", 2, [
+            PbScalar("id", 1, IntegerGen()),
+            PbScalar("name", 2, StringGen()),
+        ], min_len=0, max_len=5),
     ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data,), (test_data_empty,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(
             decoded.getField("title").alias("title"),
             decoded.getField("items").alias("items"),
@@ -2103,10 +1520,6 @@ def test_from_protobuf_repeated_message(spark_tmp_path):
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
-
-# =============================================================================
-# Complex Nested Type Tests
-# =============================================================================
 
 def _build_nested_with_repeated_descriptor_set_bytes(spark):
     """
@@ -2121,16 +1534,7 @@ def _build_nested_with_repeated_descriptor_set_bytes(spark):
         optional NestedWithRepeated nested = 2;
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("nested_with_repeated.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "nested_with_repeated.proto")
 
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
     label_rep = D.FieldDescriptorProto.Label.LABEL_REPEATED
@@ -2165,62 +1569,30 @@ def _build_nested_with_repeated_descriptor_set_bytes(spark):
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_nested_with_repeated(spark_tmp_path):
+def test_from_protobuf_nested_with_repeated(spark_tmp_path, from_protobuf_fn):
     """
     Test decoding nested message that contains repeated fields.
     Schema: OuterWithNestedRepeated { id, nested: NestedWithRepeated { name, values[], count } }
     This tests StructType containing StructType containing ArrayType.
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/nested_with_repeated.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "nested_with_repeated.desc",
+        _build_nested_with_repeated_descriptor_set_bytes)
     message_name = "test.OuterWithNestedRepeated"
 
-    desc_bytes = with_cpu_session(_build_nested_with_repeated_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    # NestedWithRepeated{name="test", values=[1,2,3], count=3}
-    # name: 0x0A 0x04 "test"
-    # values: 0x10 0x01, 0x10 0x02, 0x10 0x03
-    # count: 0x18 0x03
-    nested_bytes = bytes([
-        0x0A, 0x04, 0x74, 0x65, 0x73, 0x74,  # name = "test"
-        0x10, 0x01,  # values = 1
-        0x10, 0x02,  # values = 2
-        0x10, 0x03,  # values = 3
-        0x18, 0x03,  # count = 3
-    ])
-    
-    # OuterWithNestedRepeated{id=42, nested=...}
-    outer_bytes = bytes([
-        0x08, 0x2A,  # id = 42
-        0x12, len(nested_bytes)
-    ]) + nested_bytes
-
-    # Empty nested
-    empty_nested_bytes = bytes([
-        0x08, 0x01,  # id = 1
-        0x12, 0x00,  # nested = {} (empty)
+    data_gen = ProtobufMessageGen([
+        PbScalar("id", 1, IntegerGen()),
+        PbNested("nested", 2, [
+            PbScalar("name", 1, StringGen()),
+            PbRepeated("values", 2, IntegerGen(), min_len=0, max_len=5),
+            PbScalar("count", 3, IntegerGen()),
+        ]),
     ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(outer_bytes,), (empty_nested_bytes,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(
             decoded.getField("id").alias("id"),
             decoded.getField("nested").alias("nested"),
@@ -2245,16 +1617,7 @@ def _build_repeated_with_nested_descriptor_set_bytes(spark):
         repeated ItemWithNested items = 2;
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("repeated_with_nested.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "repeated_with_nested.proto")
 
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
     label_rep = D.FieldDescriptorProto.Label.LABEL_REPEATED
@@ -2297,69 +1660,30 @@ def _build_repeated_with_nested_descriptor_set_bytes(spark):
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_repeated_with_nested(spark_tmp_path):
+def test_from_protobuf_repeated_with_nested(spark_tmp_path, from_protobuf_fn):
     """
     Test decoding repeated message that contains nested message.
     Schema: ContainerWithNestedItems { title, items[]: ItemWithNested { id, inner: Inner { value }, name } }
     This tests ArrayType(StructType(StructType)) - nested struct inside repeated message.
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/repeated_with_nested.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "repeated_with_nested.desc",
+        _build_repeated_with_nested_descriptor_set_bytes)
     message_name = "test.ContainerWithNestedItems"
 
-    desc_bytes = with_cpu_session(_build_repeated_with_nested_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    # Inner{value=100}: 0x08 0x64
-    inner1 = bytes([0x08, 0x64])  # value = 100
-    inner2 = bytes([0x08, 0xC8, 0x01])  # value = 200
-    
-    # ItemWithNested{id=1, inner={value=100}, name="first"}
-    item1 = bytes([
-        0x08, 0x01,  # id = 1
-        0x12, len(inner1)
-    ]) + inner1 + bytes([
-        0x1A, 0x05, 0x66, 0x69, 0x72, 0x73, 0x74,  # name = "first"
-    ])
-    
-    # ItemWithNested{id=2, inner={value=200}, name="second"}
-    item2 = bytes([
-        0x08, 0x02,  # id = 2
-        0x12, len(inner2)
-    ]) + inner2 + bytes([
-        0x1A, 0x06, 0x73, 0x65, 0x63, 0x6F, 0x6E, 0x64,  # name = "second"
-    ])
-
-    # ContainerWithNestedItems{title="container", items=[item1, item2]}
-    test_data = bytes([
-        0x0A, 0x09, 0x63, 0x6F, 0x6E, 0x74, 0x61, 0x69, 0x6E, 0x65, 0x72,  # title = "container"
-        0x12, len(item1)
-    ]) + item1 + bytes([0x12, len(item2)]) + item2
-
-    # Empty items
-    empty_data = bytes([
-        0x0A, 0x05, 0x65, 0x6D, 0x70, 0x74, 0x79,  # title = "empty"
+    data_gen = ProtobufMessageGen([
+        PbScalar("title", 1, StringGen()),
+        PbRepeatedMessage("items", 2, [
+            PbScalar("id", 1, IntegerGen()),
+            PbNested("inner", 2, [PbScalar("value", 1, IntegerGen())]),
+            PbScalar("name", 3, StringGen()),
+        ], min_len=0, max_len=3),
     ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data,), (empty_data,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(
             decoded.getField("title").alias("title"),
             decoded.getField("items").alias("items"),
@@ -2368,34 +1692,24 @@ def test_from_protobuf_repeated_with_nested(spark_tmp_path):
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
 
-# =============================================================================
-# Packed Repeated Fields Tests
-# =============================================================================
-
 def _build_packed_repeated_descriptor_set_bytes(spark):
     """
-    Build a FileDescriptorSet for message with packed repeated fields:
+    Build a FileDescriptorSet for message with packed repeated fields (proto2):
       message WithPackedRepeated {
         optional int32 id = 1;
         repeated int32 int_values = 2 [packed=true];
         repeated double double_values = 3 [packed=true];
         repeated bool bool_values = 4 [packed=true];
       }
-    Note: In proto3, repeated numeric fields are packed by default.
+    Uses proto2 with FieldOptions.packed=true (not proto3).
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("packed_repeated.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto3")  # proto3 has packed by default
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "packed_repeated.proto")
 
     label_rep = D.FieldDescriptorProto.Label.LABEL_REPEATED
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
+
+    # Build FieldOptions with packed=true for repeated numeric fields
+    packed_opts = D.FieldOptions.newBuilder().setPacked(True).build()
 
     msg = D.DescriptorProto.newBuilder().setName("WithPackedRepeated")
     msg.addField(
@@ -2412,6 +1726,7 @@ def _build_packed_repeated_descriptor_set_bytes(spark):
             .setNumber(2)
             .setLabel(label_rep)
             .setType(D.FieldDescriptorProto.Type.TYPE_INT32)
+            .setOptions(packed_opts)
             .build()
     )
     msg.addField(
@@ -2420,6 +1735,7 @@ def _build_packed_repeated_descriptor_set_bytes(spark):
             .setNumber(3)
             .setLabel(label_rep)
             .setType(D.FieldDescriptorProto.Type.TYPE_DOUBLE)
+            .setOptions(packed_opts)
             .build()
     )
     msg.addField(
@@ -2428,6 +1744,7 @@ def _build_packed_repeated_descriptor_set_bytes(spark):
             .setNumber(4)
             .setLabel(label_rep)
             .setType(D.FieldDescriptorProto.Type.TYPE_BOOL)
+            .setOptions(packed_opts)
             .build()
     )
     fd.addMessageType(msg.build())
@@ -2436,63 +1753,36 @@ def _build_packed_repeated_descriptor_set_bytes(spark):
     return bytes(fds.toByteArray())
 
 
-# Packed repeated field test configurations: (field_name, field_key, packed_data, id_value)
-_packed_repeated_test_configs = [
-    ("int_values", 0x12, bytes([0x01, 0x02, 0x03, 0x7F, 0x80, 0x01]), 1),  # [1,2,3,127,128]
-    ("double_values", 0x1A, struct.pack("<ddd", 1.5, 2.5, 3.5), 2),  # [1.5, 2.5, 3.5]
-    ("bool_values", 0x22, bytes([0x01, 0x00, 0x01, 0x01, 0x00]), 3),  # [T,F,T,T,F]
-]
-
-
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@pytest.mark.parametrize("field_name,field_key,packed_data,id_val", 
-                         _packed_repeated_test_configs, ids=idfn)
 @ignore_order(local=True)
-def test_from_protobuf_packed_repeated(spark_tmp_path, field_name, field_key, 
-                                        packed_data, id_val):
+def test_from_protobuf_packed_repeated(spark_tmp_path, from_protobuf_fn):
     """
-    Parametrized test for packed repeated fields (int, double, bool).
+    Test packed repeated fields (int, double, bool) using DataGen.
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/packed.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "packed.desc", _build_packed_repeated_descriptor_set_bytes)
     message_name = "test.WithPackedRepeated"
 
-    desc_bytes = with_cpu_session(_build_packed_repeated_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    # Build test data: id + packed field
-    test_data = bytes([0x08, id_val, field_key, len(packed_data)]) + packed_data
+    data_gen = ProtobufMessageGen([
+        PbScalar("id", 1, IntegerGen()),
+        PbRepeated("int_values", 2, IntegerGen(), packed=True, min_len=0, max_len=10),
+        PbRepeated("double_values", 3, DoubleGen(), packed=True, min_len=0, max_len=5),
+        PbRepeated("bool_values", 4, BooleanGen(), packed=True, min_len=0, max_len=5),
+    ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(
             decoded.getField("id").alias("id"),
-            decoded.getField(field_name).alias(field_name),
+            decoded.getField("int_values").alias("int_values"),
+            decoded.getField("double_values").alias("double_values"),
+            decoded.getField("bool_values").alias("bool_values"),
         )
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
-
-# =============================================================================
-# More Repeated Field Data Types Tests
-# =============================================================================
 
 def _build_repeated_all_types_descriptor_set_bytes(spark):
     """
@@ -2506,16 +1796,7 @@ def _build_repeated_all_types_descriptor_set_bytes(spark):
         repeated bytes bytes_values = 6;
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("repeated_all.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "repeated_all.proto")
 
     label_rep = D.FieldDescriptorProto.Label.LABEL_REPEATED
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
@@ -2575,120 +1856,59 @@ def _build_repeated_all_types_descriptor_set_bytes(spark):
     return bytes(fds.toByteArray())
 
 
-# Repeated all types test configurations: (field_name, test_data_bytes, id_value)
-_repeated_all_types_test_configs = [
-    ("long_values", bytes([
-        0x08, 0x01,  # id = 1
-        0x10, 0x64,  # long_values[0] = 100
-        0x10, 0xC8, 0x01,  # long_values[1] = 200
-        0x10, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F,  # max int64
-    ])),
-    ("float_values", bytes([0x08, 0x02]) +  # id = 2
-        bytes([0x1D]) + struct.pack("<f", 1.5) +
-        bytes([0x1D]) + struct.pack("<f", -2.5) +
-        bytes([0x1D]) + struct.pack("<f", 0.0)),
-    ("bytes_values", bytes([
-        0x08, 0x03,  # id = 3
-        0x32, 0x02, 0x01, 0x02,  # bytes_values[0] = b"\x01\x02"
-        0x32, 0x03, 0x03, 0x04, 0x05,  # bytes_values[1]
-        0x32, 0x00,  # bytes_values[2] = b"" (empty)
-    ])),
-]
-
-
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@pytest.mark.parametrize("field_name,test_data", _repeated_all_types_test_configs, ids=idfn)
 @ignore_order(local=True)
-def test_from_protobuf_repeated_all_types(spark_tmp_path, field_name, test_data):
-    """Parametrized test for repeated fields of various types (int64, float, bytes)."""
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/repeated_all.desc"
+def test_from_protobuf_repeated_all_types(spark_tmp_path, from_protobuf_fn):
+    """Test repeated fields of various types (int64, float, double, bool, bytes) using DataGen."""
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "repeated_all.desc", _build_repeated_all_types_descriptor_set_bytes)
     message_name = "test.WithRepeatedAllTypes"
 
-    desc_bytes = with_cpu_session(_build_repeated_all_types_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
+    data_gen = ProtobufMessageGen([
+        PbScalar("id", 1, IntegerGen()),
+        PbRepeated("long_values", 2, LongGen()),
+        PbRepeated("float_values", 3, FloatGen()),
+        PbRepeated("double_values", 4, DoubleGen()),
+        PbRepeated("bool_values", 5, BooleanGen()),
+        PbRepeated("bytes_values", 6, BinaryGen()),
+    ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(
             decoded.getField("id").alias("id"),
-            decoded.getField(field_name).alias(field_name),
+            decoded.getField("long_values").alias("long_values"),
+            decoded.getField("float_values").alias("float_values"),
+            decoded.getField("double_values").alias("double_values"),
+            decoded.getField("bool_values").alias("bool_values"),
+            decoded.getField("bytes_values").alias("bytes_values"),
         )
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
 
-# =============================================================================
-# Large Array Tests
-# =============================================================================
-
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_large_repeated_array(spark_tmp_path):
+def test_from_protobuf_large_repeated_array(spark_tmp_path, from_protobuf_fn):
     """
-    Test decoding large repeated field (1000+ elements).
+    Test decoding large repeated field (500-1000 elements).
     Stress test for array handling.
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/repeated_int.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "repeated_int.desc", _build_repeated_int_descriptor_set_bytes)
     message_name = "test.WithRepeatedInt"
 
-    desc_bytes = with_cpu_session(_build_repeated_int_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    # Build protobuf with 1000 elements in repeated field
-    def build_large_array_protobuf():
-        data = bytearray([0x08, 0x01])  # id = 1
-        for i in range(1000):
-            # Encode each value as unpacked repeated field
-            # Field 2, wire type 0 (varint) = 0x10
-            data.append(0x10)
-            # Encode varint for value i
-            val = i
-            while val >= 128:
-                data.append((val & 0x7F) | 0x80)
-                val >>= 7
-            data.append(val)
-        return bytes(data)
-    
-    large_data = build_large_array_protobuf()
+    data_gen = ProtobufMessageGen([
+        PbScalar("id", 1, IntegerGen()),
+        PbRepeated("values", 2, IntegerGen(), min_len=500, max_len=1000),
+    ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(large_data,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(
             decoded.getField("id").alias("id"),
             f.size(decoded.getField("values")).alias("array_size"),
@@ -2696,10 +1916,6 @@ def test_from_protobuf_large_repeated_array(spark_tmp_path):
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
-
-# =============================================================================
-# Signed Integer Encoding Tests (sint32/sint64 with zigzag)
-# =============================================================================
 
 def _build_signed_int_descriptor_set_bytes(spark):
     """
@@ -2711,16 +1927,7 @@ def _build_signed_int_descriptor_set_bytes(spark):
         optional sfixed64 sf64 = 4;  // fixed 8-byte
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("signed_int.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "signed_int.proto")
 
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
 
@@ -2765,51 +1972,31 @@ def _build_signed_int_descriptor_set_bytes(spark):
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_signed_integers(spark_tmp_path):
+def test_from_protobuf_signed_integers(spark_tmp_path, from_protobuf_fn):
     """
     Test decoding signed integer types with zigzag encoding.
     Zigzag: -1 -> 1, 1 -> 2, -2 -> 3, 2 -> 4, etc.
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/signed.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "signed.desc", _build_signed_int_descriptor_set_bytes)
     message_name = "test.WithSignedInts"
 
-    desc_bytes = with_cpu_session(_build_signed_int_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    # si32 = -1 (zigzag: 1), si64 = -100 (zigzag: 199)
-    # sf32 = -12345, sf64 = -9876543210
-    test_data_negative = bytes([
-        0x08, 0x01,  # si32 = -1 (zigzag encoded as 1)
-        0x10, 0xC7, 0x01,  # si64 = -100 (zigzag encoded as 199)
-        0x1D
-    ]) + struct.pack("<i", -12345) + bytes([0x21]) + struct.pack("<q", -9876543210)
-    
-    # Positive values
-    test_data_positive = bytes([
-        0x08, 0x14,  # si32 = 10 (zigzag encoded as 20)
-        0x10, 0xC8, 0x01,  # si64 = 100 (zigzag encoded as 200)
-        0x1D
-    ]) + struct.pack("<i", 12345) + bytes([0x21]) + struct.pack("<q", 9876543210)
+    data_gen = ProtobufMessageGen([
+        PbScalar("si32", 1, IntegerGen(
+            special_cases=[-1, 0, 1, -2147483648, 2147483647]), encoding='zigzag'),
+        PbScalar("si64", 2, LongGen(
+            special_cases=[-1, 0, 1, -9223372036854775808, 9223372036854775807]),
+            encoding='zigzag'),
+        PbScalar("sf32", 3, IntegerGen(
+            special_cases=[0, 1, -1, 2147483647, -2147483648]), encoding='fixed'),
+        PbScalar("sf64", 4, LongGen(
+            special_cases=[0, 1, -1]), encoding='fixed'),
+    ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data_negative,), (test_data_positive,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         
         return df.select(
             decoded.getField("si32").alias("si32"),
@@ -2821,10 +2008,6 @@ def test_from_protobuf_signed_integers(spark_tmp_path):
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
 
-# =============================================================================
-# Fixed Width Integer Tests
-# =============================================================================
-
 def _build_fixed_int_descriptor_set_bytes(spark):
     """
     Build a FileDescriptorSet for message with fixed-width integer types:
@@ -2833,16 +2016,7 @@ def _build_fixed_int_descriptor_set_bytes(spark):
         optional fixed64 fx64 = 2;
       }
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("fixed_int.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "fixed_int.proto")
 
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
 
@@ -2871,40 +2045,25 @@ def _build_fixed_int_descriptor_set_bytes(spark):
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
-def test_from_protobuf_fixed_integers(spark_tmp_path):
+def test_from_protobuf_fixed_integers(spark_tmp_path, from_protobuf_fn):
     """
     Test decoding fixed-width unsigned integer types.
     """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/fixed.desc"
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "fixed.desc", _build_fixed_int_descriptor_set_bytes)
     message_name = "test.WithFixedInts"
 
-    desc_bytes = with_cpu_session(_build_fixed_int_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    # fx32 = 0xDEADBEEF, fx64 = 0x123456789ABCDEF0
-    test_data = bytes([0x0D]) + struct.pack("<I", 0xDEADBEEF) + \
-                bytes([0x11]) + struct.pack("<Q", 0x123456789ABCDEF0)
+    data_gen = ProtobufMessageGen([
+        PbScalar("fx32", 1, IntegerGen(
+            special_cases=[0, 1, -1, 2147483647, -2147483648]), encoding='fixed'),
+        PbScalar("fx64", 2, LongGen(
+            special_cases=[0, 1, -1]), encoding='fixed'),
+    ])
 
     def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(test_data,), (None,)],
-            schema="bin binary",
-        )
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(
             decoded.getField("fx32").alias("fx32"),
             decoded.getField("fx64").alias("fx64"),
@@ -2912,161 +2071,6 @@ def test_from_protobuf_fixed_integers(spark_tmp_path):
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
-
-# =============================================================================
-# Random Data Generation Tests for Nested/Repeated Fields
-# =============================================================================
-
-from data_gen import ProtobufNestedMessageRowGen, ProtobufRepeatedFieldRowGen
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_random_nested_message(spark_tmp_path):
-    """
-    Test from_protobuf with randomly generated nested message data.
-    Uses ProtobufNestedMessageRowGen for random data generation.
-    """
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/nested.desc"
-    message_name = "test.WithNested"
-
-    desc_bytes = with_cpu_session(_build_nested_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    # Generate random nested message data
-    data_gen = ProtobufNestedMessageRowGen(
-        scalar_fields=[
-            ("simple_int", 1, IntegerGen()),
-            ("simple_str", 2, StringGen(pattern="[a-z]{0,20}")),
-            ("simple_long", 4, LongGen()),
-        ],
-        nested_fields=[
-            ("nested_msg", 3, [
-                ("x", 1, IntegerGen()),
-            ])
-        ]
-    )
-
-    def run_on_spark(spark):
-        df = gen_df(spark, data_gen, length=100)
-        
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
-        return df.select(
-            decoded.getField("simple_int").alias("simple_int"),
-            decoded.getField("simple_str").alias("simple_str"),
-            decoded.getField("nested_msg").alias("nested_msg"),
-            decoded.getField("simple_long").alias("simple_long"),
-        )
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_random_repeated_int(spark_tmp_path):
-    """Test from_protobuf with randomly generated repeated int field data."""
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/repeated_int.desc"
-    message_name = "test.WithRepeatedInt"
-
-    desc_bytes = with_cpu_session(_build_repeated_int_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    data_gen = ProtobufRepeatedFieldRowGen(
-        scalar_fields=[("id", 1, IntegerGen())],
-        repeated_fields=[("values", 2, IntegerGen(), False)],
-        min_array_len=0,
-        max_array_len=10
-    )
-
-    def run_on_spark(spark):
-        df = gen_df(spark, data_gen, length=100)
-        
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
-        return df.select(
-            decoded.getField("id").alias("id"),
-            decoded.getField("values").alias("values"),
-        )
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_random_repeated_string(spark_tmp_path):
-    """Test from_protobuf with randomly generated repeated string field data."""
-    from_protobuf = _try_import_from_protobuf()
-    if from_protobuf is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path = spark_tmp_path + "/repeated_string.desc"
-    message_name = "test.WithRepeatedString"
-
-    desc_bytes = with_cpu_session(_build_repeated_string_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-
-    data_gen = ProtobufRepeatedFieldRowGen(
-        scalar_fields=[("name", 1, StringGen(pattern="[a-z]{1,10}"))],
-        repeated_fields=[("tags", 2, StringGen(pattern="[a-z]{0,5}"), False)],
-        min_array_len=0,
-        max_array_len=5
-    )
-
-    def run_on_spark(spark):
-        df = gen_df(spark, data_gen, length=100)
-        
-        sig = inspect.signature(from_protobuf)
-        if "binaryDescriptorSet" in sig.parameters:
-            decoded = from_protobuf(
-                f.col("bin"), message_name,
-                binaryDescriptorSet=bytearray(desc_bytes))
-        else:
-            decoded = from_protobuf(f.col("bin"), message_name, desc_path)
-        
-        return df.select(
-            decoded.getField("name").alias("name"),
-            decoded.getField("tags").alias("tags"),
-        )
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-# =============================================================================
-# Nested Schema Projection Tests
-# =============================================================================
-# These tests verify that when only specific sub-fields of a nested message
-# are accessed (e.g. decoded.detail.a instead of decoded.detail), the GPU decoder
-# correctly prunes unneeded children while still producing correct results.
 
 def _build_schema_projection_descriptor_set_bytes(spark):
     """
@@ -3084,16 +2088,7 @@ def _build_schema_projection_descriptor_set_bytes(spark):
       }
     The Detail message has 3 fields so we can test pruning subsets.
     """
-    jvm = spark.sparkContext._jvm
-    D = jvm.com.google.protobuf.DescriptorProtos
-
-    fd = D.FileDescriptorProto.newBuilder() \
-        .setName("schema_proj.proto") \
-        .setPackage("test")
-    try:
-        fd = fd.setSyntax("proto2")
-    except Exception:
-        pass
+    D, fd = _new_proto2_file(spark, "schema_proj.proto")
 
     label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
     label_rep = D.FieldDescriptorProto.Label.LABEL_REPEATED
@@ -3140,287 +2135,66 @@ def _build_schema_projection_descriptor_set_bytes(spark):
     return bytes(fds.toByteArray())
 
 
-def _encode_varint_proj(value):
-    """Encode an unsigned integer as a protobuf varint."""
-    result = []
-    v = value & 0xFFFFFFFF
-    while v > 0x7F:
-        result.append((v & 0x7F) | 0x80)
-        v >>= 7
-    result.append(v & 0x7F)
-    return bytes(result)
-
-
-def _schema_proj_detail_bytes(a, b, c):
-    """Encode a Detail message: {a: int32, b: int32, c: string}."""
-    parts = []
-    parts.append(bytes([0x08]) + _encode_varint_proj(a))
-    parts.append(bytes([0x10]) + _encode_varint_proj(b))
-    c_bytes = c.encode("utf-8")
-    parts.append(bytes([0x1A]) + _encode_varint_proj(len(c_bytes)) + c_bytes)
-    return b"".join(parts)
-
-
-def _schema_proj_message_bytes(id_val, name_val, detail_a, detail_b, detail_c, items):
-    """Encode a SchemaProj message."""
-    parts = []
-    parts.append(bytes([0x08]) + _encode_varint_proj(id_val))
-    name_bytes = name_val.encode("utf-8")
-    parts.append(bytes([0x12]) + _encode_varint_proj(len(name_bytes)) + name_bytes)
-    detail_bytes = _schema_proj_detail_bytes(detail_a, detail_b, detail_c)
-    parts.append(bytes([0x1A]) + _encode_varint_proj(len(detail_bytes)) + detail_bytes)
-    for (a, b, c) in items:
-        item_bytes = _schema_proj_detail_bytes(a, b, c)
-        parts.append(bytes([0x22]) + _encode_varint_proj(len(item_bytes)) + item_bytes)
-    return b"".join(parts)
-
+# Field descriptors for SchemaProj: {id, name, detail: {a, b, c}, items[]: {a, b, c}}
+_detail_children = [
+    PbScalar("a", 1, IntegerGen()),
+    PbScalar("b", 2, IntegerGen()),
+    PbScalar("c", 3, StringGen()),
+]
+_schema_proj_fields = [
+    PbScalar("id", 1, IntegerGen()),
+    PbScalar("name", 2, StringGen()),
+    PbNested("detail", 3, _detail_children),
+    PbRepeatedMessage("items", 4, _detail_children),
+]
 
 _schema_proj_test_data = [
-    _schema_proj_message_bytes(1, "alice", 10, 20, "d1",
-                               [(100, 200, "i1"), (101, 201, "i2")]),
-    _schema_proj_message_bytes(2, "bob", 30, 40, "d2",
-                               [(300, 400, "i3")]),
-    _schema_proj_message_bytes(3, "carol", 50, 60, "d3", []),
+    encode_pb_message(_schema_proj_fields,
+                      [1, "alice", (10, 20, "d1"), [(100, 200, "i1"), (101, 201, "i2")]]),
+    encode_pb_message(_schema_proj_fields,
+                      [2, "bob", (30, 40, "d2"), [(300, 400, "i3")]]),
+    encode_pb_message(_schema_proj_fields,
+                      [3, "carol", (50, 60, "d3"), []]),
 ]
 
 
-def _setup_schema_proj(spark_tmp_path):
-    """Common setup: build descriptor and return (desc_path, message_name, desc_bytes)."""
-    desc_path = spark_tmp_path + "/schema_proj.desc"
+_schema_proj_cases = [
+    ("nested_single_field", [("id", ("id",)), ("detail_a", ("detail", "a"))]),
+    ("nested_two_fields", [("detail_a", ("detail", "a")), ("detail_c", ("detail", "c"))]),
+    ("whole_struct_no_pruning", [("id", ("id",)), ("detail", ("detail",))]),
+    ("whole_and_subfield", [("detail", ("detail",)), ("detail_a", ("detail", "a"))]),
+    ("scalar_plus_nested", [("id", ("id",)), ("name", ("name",)), ("detail_a", ("detail", "a"))]),
+    ("repeated_msg_single_subfield", [("id", ("id",)), ("items_a", ("items", "a"))]),
+    ("repeated_msg_two_subfields", [("items_a", ("items", "a")), ("items_c", ("items", "c"))]),
+    ("repeated_whole_no_pruning", [("id", ("id",)), ("items", ("items",))]),
+    ("mix_struct_and_repeated", [("id", ("id",)), ("detail_a", ("detail", "a")), ("items_c", ("items", "c"))]),
+]
+
+
+def _get_field_by_path(expr, path):
+    current = expr
+    for name in path:
+        current = current.getField(name)
+    return current
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@pytest.mark.parametrize("case_id,select_specs", _schema_proj_cases, ids=lambda c: c[0] if isinstance(c, tuple) else str(c))
+@ignore_order(local=True)
+def test_from_protobuf_schema_projection_cases(
+        spark_tmp_path, from_protobuf_fn, case_id, select_specs):
+    """Parametrized nested-schema projection tests."""
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "schema_proj.desc", _build_schema_projection_descriptor_set_bytes)
     message_name = "test.SchemaProj"
-    desc_bytes = with_cpu_session(_build_schema_projection_descriptor_set_bytes)
-    with_cpu_session(lambda spark: _write_bytes_to_hadoop_path(
-        spark, desc_path, desc_bytes))
-    return desc_path, message_name, desc_bytes
-
-
-def _decode_schema_proj(df, from_protobuf_fn, desc_path, message_name, desc_bytes):
-    """Apply from_protobuf to a binary DataFrame."""
-    sig = inspect.signature(from_protobuf_fn)
-    if "binaryDescriptorSet" in sig.parameters:
-        return from_protobuf_fn(
-            f.col("bin"), message_name,
-            binaryDescriptorSet=bytearray(desc_bytes))
-    else:
-        return from_protobuf_fn(f.col("bin"), message_name, desc_path)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_schema_proj_nested_single_field(spark_tmp_path):
-    """Select only detail.a from nested struct (prune b, c)."""
-    from_protobuf_fn = _try_import_from_protobuf()
-    if from_protobuf_fn is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
 
     def run_on_spark(spark):
         df = spark.createDataFrame(
             [(d,) for d in _schema_proj_test_data], schema="bin binary")
-        decoded = _decode_schema_proj(
-            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
-        return df.select(
-            decoded.getField("id").alias("id"),
-            decoded.getField("detail").getField("a").alias("detail_a"))
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_schema_proj_nested_two_fields(spark_tmp_path):
-    """Select detail.a and detail.c (prune b)."""
-    from_protobuf_fn = _try_import_from_protobuf()
-    if from_protobuf_fn is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(d,) for d in _schema_proj_test_data], schema="bin binary")
-        decoded = _decode_schema_proj(
-            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
-        return df.select(
-            decoded.getField("detail").getField("a").alias("detail_a"),
-            decoded.getField("detail").getField("c").alias("detail_c"))
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_schema_proj_whole_struct_no_pruning(spark_tmp_path):
-    """Selecting whole nested struct should NOT prune children."""
-    from_protobuf_fn = _try_import_from_protobuf()
-    if from_protobuf_fn is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(d,) for d in _schema_proj_test_data], schema="bin binary")
-        decoded = _decode_schema_proj(
-            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
-        return df.select(
-            decoded.getField("id").alias("id"),
-            decoded.getField("detail").alias("detail"))
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_schema_proj_whole_and_subfield(spark_tmp_path):
-    """Selecting whole struct AND a sub-field: whole struct wins, no pruning."""
-    from_protobuf_fn = _try_import_from_protobuf()
-    if from_protobuf_fn is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(d,) for d in _schema_proj_test_data], schema="bin binary")
-        decoded = _decode_schema_proj(
-            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
-        return df.select(
-            decoded.getField("detail").alias("detail"),
-            decoded.getField("detail").getField("a").alias("detail_a"))
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_schema_proj_scalar_plus_nested(spark_tmp_path):
-    """Top-level scalar + nested sub-field: prune both top-level and nested."""
-    from_protobuf_fn = _try_import_from_protobuf()
-    if from_protobuf_fn is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(d,) for d in _schema_proj_test_data], schema="bin binary")
-        decoded = _decode_schema_proj(
-            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
-        return df.select(
-            decoded.getField("id").alias("id"),
-            decoded.getField("name").alias("name"),
-            decoded.getField("detail").getField("a").alias("detail_a"))
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_schema_proj_repeated_msg_single_subfield(spark_tmp_path):
-    """Select items.a from repeated message (ArrayType(StructType)) -- prune b, c.
-    Tests Option A: GetArrayStructFields ordinal remapping for pruned repeated messages."""
-    from_protobuf_fn = _try_import_from_protobuf()
-    if from_protobuf_fn is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(d,) for d in _schema_proj_test_data], schema="bin binary")
-        decoded = _decode_schema_proj(
-            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
-        # items is repeated Detail {a, b, c} -- select only items.a
-        return df.select(
-            decoded.getField("id").alias("id"),
-            decoded.getField("items").getField("a").alias("items_a"))
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_schema_proj_repeated_msg_two_subfields(spark_tmp_path):
-    """Select items.a and items.c from repeated message -- prune b."""
-    from_protobuf_fn = _try_import_from_protobuf()
-    if from_protobuf_fn is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(d,) for d in _schema_proj_test_data], schema="bin binary")
-        decoded = _decode_schema_proj(
-            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
-        return df.select(
-            decoded.getField("items").getField("a").alias("items_a"),
-            decoded.getField("items").getField("c").alias("items_c"))
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_schema_proj_repeated_whole_no_pruning(spark_tmp_path):
-    """Select whole repeated message -- should NOT prune children."""
-    from_protobuf_fn = _try_import_from_protobuf()
-    if from_protobuf_fn is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(d,) for d in _schema_proj_test_data], schema="bin binary")
-        decoded = _decode_schema_proj(
-            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
-        return df.select(
-            decoded.getField("id").alias("id"),
-            decoded.getField("items").alias("items"))
-
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
-
-
-@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
-@ignore_order(local=True)
-def test_from_protobuf_schema_proj_mix_struct_and_repeated(spark_tmp_path):
-    """Select sub-fields from both non-repeated struct and repeated message."""
-    from_protobuf_fn = _try_import_from_protobuf()
-    if from_protobuf_fn is None:
-        pytest.skip("from_protobuf not available")
-    if not with_cpu_session(_spark_protobuf_jvm_available):
-        pytest.skip("spark-protobuf JVM not available")
-
-    desc_path, message_name, desc_bytes = _setup_schema_proj(spark_tmp_path)
-
-    def run_on_spark(spark):
-        df = spark.createDataFrame(
-            [(d,) for d in _schema_proj_test_data], schema="bin binary")
-        decoded = _decode_schema_proj(
-            df, from_protobuf_fn, desc_path, message_name, desc_bytes)
-        # Mix: detail.a (non-repeated struct) + items.c (repeated message)
-        return df.select(
-            decoded.getField("id").alias("id"),
-            decoded.getField("detail").getField("a").alias("detail_a"),
-            decoded.getField("items").getField("c").alias("items_c"))
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
+        selected = [_get_field_by_path(decoded, path).alias(alias)
+                    for alias, path in select_specs]
+        return df.select(*selected)
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)

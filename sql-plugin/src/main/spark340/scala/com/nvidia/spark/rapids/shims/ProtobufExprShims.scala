@@ -195,6 +195,18 @@ object ProtobufExprShims {
               return
           }
 
+          // Reject proto3 descriptors — GPU decoder only supports proto2 semantics.
+          // proto3 has different null/default-value behavior that the GPU path doesn't handle.
+          val protoSyntax = Try {
+            val fileDesc = invoke0[AnyRef](msgDesc, "getFile")
+            val syntaxObj = invoke0[AnyRef](fileDesc, "getSyntax")
+            typeName(syntaxObj)
+          }.getOrElse("")
+          if (protoSyntax == "PROTO3") {
+            willNotWorkOnGpu("proto3 descriptors are not supported; only proto2 is supported")
+            return
+          }
+
           // Step 1: Analyze all fields and build field info map
           val allFieldsInfo = analyzeAllFields(fullSchema, msgDesc, enumsAsInts, messageName)
           if (allFieldsInfo.isEmpty) {

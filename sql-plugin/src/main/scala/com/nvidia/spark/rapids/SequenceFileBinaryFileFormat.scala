@@ -52,8 +52,7 @@ import org.apache.spark.util.SerializableConfiguration
  *  - BLOCK: Supported WITHOUT splitting (entire file read by one task)
  *
  * INTERNAL USE ONLY: This class is not registered as a public DataSource. It is used internally
- * by [[SequenceFileRDDConversionRule]] to convert RDD-based SequenceFile scans to FileFormat
- * scans that can be GPU-accelerated.
+ * for SequenceFile BinaryType scans that are already represented as FileFormat relations.
  */
 class SequenceFileBinaryFileFormat extends FileFormat with Serializable {
   import SequenceFileBinaryFileFormat._
@@ -64,10 +63,8 @@ class SequenceFileBinaryFileFormat extends FileFormat with Serializable {
       files: Seq[FileStatus]): Option[StructType] = Some(dataSchema)
 
   // SequenceFile supports splitting at sync markers for uncompressed and RECORD-compressed files.
-  // For BLOCK-compressed files, splitting is not safe because sync markers are at block boundaries,
-  // not record boundaries. We detect compression at read time and handle accordingly.
-  // Note: We return true here for general cases; BLOCK compression is handled at read time
-  // by reading the entire file when detected.
+  // For GPU SequenceFile flow, conversion precheck should skip compressed files so this format is
+  // mainly exercised on uncompressed inputs. We still retain runtime handling for safety.
   override def isSplitable(
       sparkSession: SparkSession,
       options: Map[String, String],

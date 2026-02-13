@@ -1688,12 +1688,11 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       s"See $MULTITHREAD_READ_NUM_THREADS and " +
       "spark.rapids.sql.format.sequencefile.multiThreadedRead.maxNumFilesParallel to control " +
       "the number of threads and amount of memory used. " +
-      "By default this is set to AUTO which selects MULTITHREADED for cloud storage and " +
-      "PERFILE for local storage. See spark.rapids.cloudSchemes.")
+      "AUTO is kept for compatibility, but MULTITHREADED is the default for SequenceFile.")
     .stringConf
     .transform(_.toUpperCase(java.util.Locale.ROOT))
     .checkValues(RapidsReaderType.values.map(_.toString))
-    .createWithDefault(RapidsReaderType.AUTO.toString)
+    .createWithDefault(RapidsReaderType.MULTITHREADED.toString)
 
   val SEQUENCEFILE_MULTITHREAD_READ_MAX_NUM_FILES_PARALLEL =
     conf("spark.rapids.sql.format.sequencefile.multiThreadedRead.maxNumFilesParallel")
@@ -1705,17 +1704,11 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .checkValue(v => v > 0, "The maximum number of files must be greater than 0.")
       .createWithDefault(Integer.MAX_VALUE)
 
-  val SEQUENCEFILE_RDD_CONVERSION_ENABLED =
-    conf("spark.rapids.sql.sequenceFile.rddConversion.enabled")
-      .doc("When enabled, automatically converts RDD-based SequenceFile scans " +
-        "(e.g., sc.newAPIHadoopFile with SequenceFileInputFormat) to FileFormat-based scans " +
-        "that can be GPU-accelerated. " +
-        "This is disabled by default because: " +
-        "(1) Compressed SequenceFiles will cause runtime failures since compression can only " +
-        "be detected by reading file headers, not at plan time; " +
-        "(2) Complex RDD transformations between the HadoopRDD and toDF() cannot be converted. " +
-        "If conversion fails or GPU doesn't support the operation, the original RDD scan " +
-        "is preserved (no fallback to CPU FileFormat).")
+  val SEQUENCEFILE_RDD_PHYSICAL_REPLACE_ENABLED =
+    conf("spark.rapids.sql.format.sequencefile.rddScan.physicalReplace.enabled")
+      .doc("Enable physical-plan replacement for SequenceFile RDD scans (RDDScanExec) when " +
+        "the lineage can be safely identified as a simple SequenceFile scan with BinaryType " +
+        "key/value output. Unsupported or risky cases automatically remain on CPU.")
       .booleanConf
       .createWithDefault(false)
 
@@ -3597,6 +3590,10 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
         s"SequenceFile decoding happens on CPU, so coalescing provides no benefit. " +
         s"Use PERFILE, MULTITHREADED, or AUTO instead.")
     }
+    if (readerType == RapidsReaderType.PERFILE) {
+      logWarning("SequenceFile PERFILE reader is deprecated and may be removed in a future " +
+        "release. Prefer MULTITHREADED reader for better CPU/GPU overlap.")
+    }
     readerType == RapidsReaderType.PERFILE
   }
 
@@ -3608,8 +3605,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val maxNumSequenceFilesParallel: Int = get(
     SEQUENCEFILE_MULTITHREAD_READ_MAX_NUM_FILES_PARALLEL)
-
-  lazy val isSequenceFileRDDConversionEnabled: Boolean = get(SEQUENCEFILE_RDD_CONVERSION_ENABLED)
+  lazy val isSequenceFileRDDPhysicalReplaceEnabled: Boolean =
+    get(SEQUENCEFILE_RDD_PHYSICAL_REPLACE_ENABLED)
 
   lazy val isDeltaWriteEnabled: Boolean = get(ENABLE_DELTA_WRITE)
 

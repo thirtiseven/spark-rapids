@@ -79,9 +79,8 @@ class GpuReadSequenceFileBinaryFormat extends FileFormat with GpuReadFileFormatW
   }
 
   // Respect the reader type configuration.
-  // Default is AUTO which selects MULTITHREADED for cloud storage and PERFILE for local.
-  // MULTITHREADED is recommended when reading many files as it allows CPU to keep reading
-  // while GPU is also doing work.
+  // SequenceFile defaults to MULTITHREADED to improve CPU/GPU overlap.
+  // AUTO is still supported for compatibility.
   override def isPerFileReadEnabled(conf: RapidsConf): Boolean = 
       conf.isSequenceFilePerFileReadEnabled
 

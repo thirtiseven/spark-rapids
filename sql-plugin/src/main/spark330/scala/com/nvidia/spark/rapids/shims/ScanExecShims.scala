@@ -67,6 +67,10 @@ object ScanExecShims {
   }
 
   def execs: Map[Class[_ <: SparkPlan], ExecRule[_ <: SparkPlan]] = Seq(
+    GpuOverrides.exec[RDDScanExec](
+      "RDD scan physical replacement for SequenceFile binary rows",
+      ExecChecks(TypeSig.BINARY, TypeSig.BINARY),
+      (scan, conf, p, r) => new SequenceFileRDDScanExecMeta(scan, conf, p, r)),
     GpuOverrides.exec[BatchScanExec](
       "The backend for most file input",
       ExecChecks(

@@ -153,62 +153,6 @@ private[sequencefile] final class HostBinaryListBufferer(
   }
 
   /**
-   * Add value bytes directly from Hadoop's ValueBytes to the buffer.
-   * This extracts the payload from BytesWritable serialization format, skipping the
-   * 4-byte length prefix.
-   *
-   * @param valueBytes the Hadoop ValueBytes containing the raw value data
-   * @param len the expected length of the value (from valueBytes.getSize())
-   */
-  def addValueBytes(valueBytes: SequenceFile.ValueBytes, len: Int): Unit = {
-    if (len < 4) {
-      // Invalid or empty BytesWritable - add empty bytes
-      growOffsetsIfNeeded()
-      val offsetPosition = numRows.toLong * DType.INT32.getSizeInBytes
-      offsetsBuffer.setInt(offsetPosition, dataLocation.toInt)
-      numRows += 1
-      return
-    }
-
-    // Write to a temporary buffer first to read the length prefix
-    val tempOut = new java.io.ByteArrayOutputStream(len)
-    val tempDos = new java.io.DataOutputStream(tempOut)
-    valueBytes.writeUncompressedBytes(tempDos)
-    val rawBytes = tempOut.toByteArray
-
-    // Extract payload from BytesWritable format: 4-byte length prefix + payload
-    val payloadLen = ((rawBytes(0) & 0xFF) << 24) |
-                    ((rawBytes(1) & 0xFF) << 16) |
-                    ((rawBytes(2) & 0xFF) << 8) |
-                    (rawBytes(3) & 0xFF)
-    
-    val actualPayloadLen = if (payloadLen > 0 && payloadLen <= rawBytes.length - 4) {
-      payloadLen
-    } else {
-      0
-    }
-
-    val newEnd = dataLocation + actualPayloadLen
-    if (newEnd > Int.MaxValue) {
-      throw new IllegalStateException(
-        s"Binary column child size $newEnd would exceed INT32 offset limit")
-    }
-    growOffsetsIfNeeded()
-    growDataIfNeeded(newEnd)
-
-    // Record the offset before writing
-    val offsetPosition = numRows.toLong * DType.INT32.getSizeInBytes
-    offsetsBuffer.setInt(offsetPosition, dataLocation.toInt)
-
-    // Write only the payload (skip the 4-byte length prefix)
-    if (actualPayloadLen > 0) {
-      dataBuffer.setBytes(dataLocation, rawBytes, 4, actualPayloadLen)
-      dataLocation = newEnd
-    }
-    numRows += 1
-  }
-
-  /**
    * Builds a cuDF LIST<UINT8> device column (Spark BinaryType equivalent) and releases host
    * buffers.
    * The returned ColumnVector owns its device memory and must be closed by the caller.

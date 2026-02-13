@@ -27,7 +27,7 @@ package com.nvidia.spark.rapids.shims
 import com.nvidia.spark.rapids._
 
 import org.apache.spark.rapids.hybrid.HybridExecutionUtils
-import org.apache.spark.sql.execution.{FileSourceScanExec, SparkPlan}
+import org.apache.spark.sql.execution.{FileSourceScanExec, RDDScanExec, SparkPlan}
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.rapids.GpuFileSourceScanExec
 
@@ -36,6 +36,10 @@ object ScanExecShims {
     GpuFileSourceScanExec.tagSupport(meta)
 
   def execs: Map[Class[_ <: SparkPlan], ExecRule[_ <: SparkPlan]] = Seq(
+    GpuOverrides.exec[RDDScanExec](
+      "RDD scan physical replacement for SequenceFile binary rows",
+      ExecChecks(TypeSig.BINARY, TypeSig.BINARY),
+      (scan, conf, p, r) => new SequenceFileRDDScanExecMeta(scan, conf, p, r)),
     GpuOverrides.exec[FileSourceScanExec](
       "Reading data from files, often from Hive tables",
       ExecChecks(

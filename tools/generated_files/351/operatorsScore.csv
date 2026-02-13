@@ -8,7 +8,6 @@ GenerateExec,3.0
 GlobalLimitExec,3.0
 LocalLimitExec,3.0
 ProjectExec,3.0
-RDDScanExec,3.0
 RangeExec,3.0
 SampleExec,3.0
 SerializeFromObjectExec,3.0

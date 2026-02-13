@@ -88,8 +88,7 @@ class SequenceFileBinaryFileFormatSuite extends AnyFunSuite {
 
   private def hasGpuSequenceFileRDDScan(df: DataFrame): Boolean = {
     df.queryExecution.executedPlan.collect {
-      case p if p.getClass.getSimpleName == "GpuSequenceFileRDDScanExec" ||
-        p.getClass.getSimpleName == "GpuSequenceFileSerializeFromObjectExec" => 1
+      case p if p.getClass.getSimpleName == "GpuSequenceFileSerializeFromObjectExec" => 1
     }.nonEmpty
   }
 

@@ -26,10 +26,8 @@ import scala.collection.mutable.ArrayBuffer
 import ai.rapids.cudf._
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
-import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.io.async.{AsyncRunner, UnboundedAsyncRunner}
 import com.nvidia.spark.rapids.jni.RmmSpark
-import com.nvidia.spark.rapids.shims.ShimFilePartitionReaderFactory
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.io.{DataOutputBuffer, SequenceFile}
 
@@ -50,6 +48,11 @@ private[sequencefile] final case class PendingRecord(
     key: Option[Array[Byte]],
     value: Option[Array[Byte]],
     bytes: Long)
+
+private[sequencefile] object GpuSequenceFileReaders {
+  final val KEY_FIELD: String = "key"
+  final val VALUE_FIELD: String = "value"
+}
 
 /**
  * Buffers binary values into one contiguous bytes buffer with an INT32 offsets buffer, and then
@@ -307,237 +310,6 @@ private[sequencefile] final class HostBinaryListBufferer(
 }
 
 /**
- * Reads a single SequenceFile split (PartitionedFile) and outputs ColumnarBatch on the GPU.
- *
- * Parsing is CPU-side using Hadoop SequenceFile.Reader, then bytes are copied to GPU and
- * represented as Spark BinaryType columns (cuDF LIST<UINT8>).
- */
-class SequenceFilePartitionReader(
-    conf: Configuration,
-    partFile: PartitionedFile,
-    requiredSchema: StructType,
-    maxRowsPerBatch: Int,
-    maxBytesPerBatch: Long,
-    execMetrics: Map[String, GpuMetric]) extends PartitionReader[ColumnarBatch] with Logging {
-
-  private[this] val path = new org.apache.hadoop.fs.Path(new URI(partFile.filePath.toString))
-  private[this] val reader = {
-    val r = new SequenceFile.Reader(conf, SequenceFile.Reader.file(path))
-    closeOnExcept(r) { _ =>
-      val start = partFile.start
-      if (start > 0) {
-        r.sync(start)
-      }
-      // For the initial version, we explicitly fail fast on compressed SequenceFiles.
-      // (Record- and block-compressed files can be added later.)
-      if (r.isCompressed || r.isBlockCompressed) {
-        val compressionType = r.getCompressionType
-        val msg = s"SequenceFileBinaryFileFormat does not support " +
-          s"compressed SequenceFiles (compressionType=$compressionType), " +
-          s"file=$path, keyClass=${r.getKeyClassName}, " +
-          s"valueClass=${r.getValueClassName}"
-        logError(msg)
-        throw new UnsupportedOperationException(msg)
-      }
-      r
-    }
-  }
-  private[this] val start = partFile.start
-  private[this] val end = start + partFile.length
-
-  private[this] val wantsKey = requiredSchema.fieldNames.exists(
-    _.equalsIgnoreCase(SequenceFileBinaryFileFormat.KEY_FIELD))
-  private[this] val wantsValue = requiredSchema.fieldNames.exists(
-    _.equalsIgnoreCase(SequenceFileBinaryFileFormat.VALUE_FIELD))
-
-  private[this] val keyBuf = new DataOutputBuffer()
-  private[this] val valueBytes = reader.createValueBytes()
-
-  // Reusable buffer for value byte extraction. DataOutputBuffer extends DataOutputStream,
-  // and getData() returns the internal array without copying (unlike ByteArrayOutputStream).
-  private[this] val pendingValueOut = new DataOutputBuffer()
-
-  private[this] var pending: Option[PendingRecord] = None
-  private[this] var exhausted = false
-  private[this] var batch: Option[ColumnarBatch] = None
-
-  private def bufferMetric: GpuMetric = execMetrics.getOrElse(BUFFER_TIME, NoopMetric)
-  private def decodeMetric: GpuMetric = execMetrics.getOrElse(GPU_DECODE_TIME, NoopMetric)
-
-  override def next(): Boolean = {
-    // Close any batch that was prepared but never consumed via get()
-    val previousBatch = batch
-    batch = None
-    previousBatch.foreach(_.close())
-
-    if (exhausted) {
-      false
-    } else {
-      batch = readBatch()
-      batch.isDefined
-    }
-  }
-
-  override def get(): ColumnarBatch = {
-    val ret = batch.getOrElse(throw new NoSuchElementException("No batch available"))
-    batch = None
-    ret
-  }
-
-  private def recordBytes(keyLen: Int, valueLen: Int): Long = {
-    (if (wantsKey) keyLen.toLong else 0L) + (if (wantsValue) valueLen.toLong else 0L)
-  }
-
-  private def makePending(keyLen: Int, valueLen: Int): PendingRecord = {
-    val keyArr =
-      if (wantsKey) Some(util.Arrays.copyOf(keyBuf.getData, keyLen)) else None
-    val valueArr =
-      if (wantsValue) {
-        pendingValueOut.reset()
-        valueBytes.writeUncompressedBytes(pendingValueOut)
-        Some(util.Arrays.copyOf(pendingValueOut.getData, pendingValueOut.getLength))
-      } else None
-    PendingRecord(keyArr, valueArr, recordBytes(keyLen, valueLen))
-  }
-
-  private def readBatch(): Option[ColumnarBatch] = {
-    val initialSize = math.min(maxBytesPerBatch, 1024L * 1024L) // 1MiB
-    val initialRows = math.min(maxRowsPerBatch, 1024)
-
-    val keyBufferer = if (wantsKey) {
-      Some(new HostBinaryListBufferer(initialSize, initialRows))
-    } else None
-
-    val valueBufferer = closeOnExcept(keyBufferer) { _ =>
-      if (wantsValue) {
-        Some(new HostBinaryListBufferer(initialSize, initialRows))
-      } else None
-    }
-
-    // Both bufferers need to be open throughout the read loop, so nesting is necessary.
-    withResource(keyBufferer) { keyBuf =>
-      withResource(valueBufferer) { valBuf =>
-        var rows = 0
-        var bytes = 0L
-
-        bufferMetric.ns {
-          // Handle a pending record (spill-over from previous batch).
-          // Note: If rows == 0, we always add the pending record even if it exceeds
-          // maxBytesPerBatch. This is intentional to ensure forward progress and avoid
-          // infinite loops when a single record is larger than the batch size limit.
-          pending.foreach { p =>
-            if (rows == 0 || bytes + p.bytes <= maxBytesPerBatch) {
-              p.key.foreach { k => keyBuf.foreach(_.addBytesWritablePayload(k, 0, k.length)) }
-              p.value.foreach { v => valBuf.foreach(_.addBytesWritablePayload(v, 0, v.length)) }
-              rows += 1
-              bytes += p.bytes
-              pending = None
-            }
-          }
-
-          // Read new records.
-          // Hadoop SequenceFile split boundary logic (matches SequenceFileRecordReader):
-          // 1. Get position BEFORE reading
-          // 2. Read the record
-          // 3. If posBeforeRead >= end AND syncSeen (from this read), DISCARD the record
-          // This ensures each record is processed by exactly one split.
-          var keepReading = true
-          while (keepReading && rows < maxRowsPerBatch) {
-            val posBeforeRead = reader.getPosition
-            this.keyBuf.reset()
-            val recLen = reader.nextRaw(this.keyBuf, valueBytes)
-            if (recLen < 0) {
-              exhausted = true
-              keepReading = false
-            } else if (posBeforeRead >= end && reader.syncSeen()) {
-              // We were already past the split end, and this read crossed a sync marker.
-              // This record belongs to the next split - discard it.
-              exhausted = true
-              keepReading = false
-            } else {
-              val keyLen = this.keyBuf.getLength
-              val valueLen = valueBytes.getSize
-              val recBytes = recordBytes(keyLen, valueLen)
-
-              // If this record doesn't fit, keep it for next batch (unless it's the first row)
-              if (rows > 0 && bytes + recBytes > maxBytesPerBatch) {
-                pending = Some(makePending(keyLen, valueLen))
-                keepReading = false
-              } else {
-                keyBuf.foreach(_.addBytesWritablePayload(this.keyBuf.getData, 0, keyLen))
-                // Use reusable pendingValueOut instead of per-record ByteArrayOutputStream.
-                // This matches the efficient key path: getData() returns internal array
-                // (zero-copy), then addBytesWritablePayload does a single copy to host buffer.
-                valBuf.foreach { vb =>
-                  pendingValueOut.reset()
-                  valueBytes.writeUncompressedBytes(pendingValueOut)
-                  vb.addBytesWritablePayload(
-                    pendingValueOut.getData, 0, pendingValueOut.getLength)
-                }
-                rows += 1
-                bytes += recBytes
-              }
-            }
-          }
-        }
-
-        if (rows == 0) {
-          None
-        } else {
-          GpuSemaphore.acquireIfNecessary(TaskContext.get())
-
-          val outBatch = if (requiredSchema.isEmpty) {
-            new ColumnarBatch(Array.empty, rows)
-          } else {
-            decodeMetric.ns {
-              buildColumnarBatch(rows, keyBuf, valBuf)
-            }
-          }
-          Some(outBatch)
-        }
-      }
-    }
-  }
-
-  private def buildColumnarBatch(
-      rows: Int,
-      keyBufferer: Option[HostBinaryListBufferer],
-      valueBufferer: Option[HostBinaryListBufferer]): ColumnarBatch = {
-    // Build device columns once, then reference them for each schema field.
-    // Use closeOnExcept to ensure keyCol is cleaned up if valueCol creation fails.
-    val keyCol = keyBufferer.map(_.getDeviceListColumnAndRelease())
-    val valueCol = closeOnExcept(keyCol) { _ =>
-      valueBufferer.map(_.getDeviceListColumnAndRelease())
-    }
-
-    // Both columns need to be open for the mapping, so nesting is necessary here.
-    withResource(keyCol) { kc =>
-      withResource(valueCol) { vc =>
-        val cols: Array[SparkVector] = requiredSchema.fields.map { f =>
-          if (f.name.equalsIgnoreCase(SequenceFileBinaryFileFormat.KEY_FIELD)) {
-            GpuColumnVector.from(kc.get.incRefCount(), BinaryType)
-          } else if (f.name.equalsIgnoreCase(SequenceFileBinaryFileFormat.VALUE_FIELD)) {
-            GpuColumnVector.from(vc.get.incRefCount(), BinaryType)
-          } else {
-            GpuColumnVector.fromNull(rows, f.dataType)
-          }
-        }
-        closeOnExcept(cols) { _ =>
-          new ColumnarBatch(cols, rows)
-        }
-      }
-    }
-  }
-
-  override def close(): Unit = {
-    reader.close()
-    batch.foreach(_.close())
-    batch = None
-    exhausted = true
-  }
-}
-
-/**
  * Represents a single chunk of SequenceFile binary data with its offsets.
  * Used for GPU concat optimization - each file becomes one chunk.
  *
@@ -634,9 +406,9 @@ class MultiFileCloudSequenceFilePartitionReader(
     ignoreCorruptFiles, combineConf = combineConf) with MultiFileReaderFunctions with Logging {
 
   private val wantsKey = requiredSchema.fieldNames.exists(
-    _.equalsIgnoreCase(SequenceFileBinaryFileFormat.KEY_FIELD))
+    _.equalsIgnoreCase(GpuSequenceFileReaders.KEY_FIELD))
   private val wantsValue = requiredSchema.fieldNames.exists(
-    _.equalsIgnoreCase(SequenceFileBinaryFileFormat.VALUE_FIELD))
+    _.equalsIgnoreCase(GpuSequenceFileReaders.VALUE_FIELD))
 
   override def getFileFormatShortName: String = "SequenceFileBinary"
 
@@ -840,9 +612,9 @@ class MultiFileCloudSequenceFilePartitionReader(
     withResource(keyCol) { kc =>
       withResource(valueCol) { vc =>
         val cols: Array[SparkVector] = requiredSchema.fields.map { f =>
-          if (f.name.equalsIgnoreCase(SequenceFileBinaryFileFormat.KEY_FIELD)) {
+          if (f.name.equalsIgnoreCase(GpuSequenceFileReaders.KEY_FIELD)) {
             GpuColumnVector.from(kc.get.incRefCount(), BinaryType)
-          } else if (f.name.equalsIgnoreCase(SequenceFileBinaryFileFormat.VALUE_FIELD)) {
+          } else if (f.name.equalsIgnoreCase(GpuSequenceFileReaders.VALUE_FIELD)) {
             GpuColumnVector.from(vc.get.incRefCount(), BinaryType)
           } else {
             GpuColumnVector.fromNull(numRows, f.dataType)
@@ -958,7 +730,7 @@ class MultiFileCloudSequenceFilePartitionReader(
         closeOnExcept(reader) { _ =>
           if (reader.isCompressed || reader.isBlockCompressed) {
             val compressionType = reader.getCompressionType
-            val msg = s"SequenceFileBinaryFileFormat does not support " +
+            val msg = s"SequenceFile reader does not support " +
               s"compressed SequenceFiles (compressionType=$compressionType), file=$path"
             throw new UnsupportedOperationException(msg)
           }
@@ -1084,39 +856,6 @@ class MultiFileCloudSequenceFilePartitionReader(
   }
 }
 
-case class GpuSequenceFilePartitionReaderFactory(
-    @transient sqlConf: SQLConf,
-    broadcastedConf: Broadcast[SerializableConfiguration],
-    readDataSchema: StructType,
-    partitionSchema: StructType,
-    @transient rapidsConf: RapidsConf,
-    metrics: Map[String, GpuMetric],
-    @transient params: Map[String, String])
-  extends ShimFilePartitionReaderFactory(params) {
-
-  private val maxReadBatchSizeRows = rapidsConf.maxReadBatchSizeRows
-  private val maxReadBatchSizeBytes = rapidsConf.maxReadBatchSizeBytes
-  private val maxGpuColumnSizeBytes = rapidsConf.maxGpuColumnSizeBytes
-
-  override def buildReader(partitionedFile: PartitionedFile): PartitionReader[InternalRow] = {
-    throw new IllegalStateException("ROW BASED PARSING IS NOT SUPPORTED ON THE GPU...")
-  }
-
-  override def buildColumnarReader(partFile: PartitionedFile): PartitionReader[ColumnarBatch] = {
-    val conf = broadcastedConf.value.value
-    val reader = new PartitionReaderWithBytesRead(
-      new SequenceFilePartitionReader(
-        conf,
-        partFile,
-        readDataSchema,
-        maxReadBatchSizeRows,
-        maxReadBatchSizeBytes,
-        metrics))
-    ColumnarPartitionReaderWithPartitionValues.newReader(partFile, reader, partitionSchema,
-      maxGpuColumnSizeBytes)
-  }
-}
-
 case class GpuSequenceFileMultiFilePartitionReaderFactory(
     @transient sqlConf: SQLConf,
     broadcastedConf: Broadcast[SerializableConfiguration],
@@ -1175,6 +914,6 @@ case class GpuSequenceFileMultiFilePartitionReaderFactory(
     // This should never be called since canUseCoalesceFilesReader = false
     throw new IllegalStateException(
       "COALESCING mode is not supported for SequenceFile. " +
-      "Use PERFILE or MULTITHREADED instead.")
+      "Use MULTITHREADED or AUTO instead.")
   }
 }

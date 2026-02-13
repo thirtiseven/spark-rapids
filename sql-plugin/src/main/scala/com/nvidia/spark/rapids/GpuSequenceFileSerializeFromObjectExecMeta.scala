@@ -81,10 +81,13 @@ class GpuSequenceFileSerializeFromObjectExecMeta(
   }
 
   override def convertToGpu(): GpuExec = {
+    val paths = GpuSequenceFileSerializeFromObjectExecMeta
+      .collectInputPaths(sourceScan.rdd)
     GpuSequenceFileSerializeFromObjectExec(
       wrapped.output,
       wrapped.child,
-      TargetSize(conf.gpuTargetBatchSizeBytes))
+      TargetSize(conf.gpuTargetBatchSizeBytes),
+      paths)(conf)
   }
 
   override def convertToCpu(): SparkPlan = wrapped
@@ -141,7 +144,7 @@ object GpuSequenceFileSerializeFromObjectExecMeta extends Logging {
     }
   }
 
-  private def collectInputPaths(rdd: RDD[_]): Seq[String] = {
+  private[rapids] def collectInputPaths(rdd: RDD[_]): Seq[String] = {
     rdd match {
       case n: NewHadoopRDD[_, _] =>
         try {

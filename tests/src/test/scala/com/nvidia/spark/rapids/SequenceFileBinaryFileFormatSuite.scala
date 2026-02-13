@@ -362,29 +362,8 @@ class SequenceFileBinaryFileFormatSuite extends AnyFunSuite {
 
       withPhysicalReplaceEnabledSession { spark =>
         val df = readSequenceFileValueOnly(spark, file.getAbsolutePath)
-        // Debug: print class hierarchy of every node in the executed plan
-        val plan = df.queryExecution.executedPlan
-        def dumpPlan(p: org.apache.spark.sql.execution.SparkPlan, indent: Int): String = {
-          val prefix = "  " * indent
-          val line = s"$prefix${p.getClass.getName} (${p.getClass.getSimpleName})"
-          (line +: p.children.map(c => dumpPlan(c, indent + 1))).mkString("\n")
-        }
-        // Diagnostic: check registration and wrap/tag manually
-        val execs = com.nvidia.spark.rapids.GpuOverrides.execs
-        val sfoClass = classOf[org.apache.spark.sql.execution.SerializeFromObjectExec]
-        val sfoRegistered = execs.contains(sfoClass)
-        val physEnabled = spark.conf.get(
-          "spark.rapids.sql.format.sequencefile.rddScan.physicalReplace.enabled", "false")
-        val rapidsConf = new com.nvidia.spark.rapids.RapidsConf(spark.sessionState.conf)
-        val wrap = com.nvidia.spark.rapids.GpuOverrides.wrapAndTagPlan(plan, rapidsConf)
-        wrap.tagForExplain()
-        val explainOutput = wrap.explain(true)
         assert(hasGpuSequenceFileRDDScan(df),
-          s"Expected GPU SequenceFile exec in plan.\n" +
-            s"SFO registered in execs: $sfoRegistered\n" +
-            s"physicalReplace.enabled: $physEnabled\n" +
-            s"Plan classes:\n${dumpPlan(plan, 0)}\n" +
-            s"RAPIDS explain:\n$explainOutput")
+          s"Expected GPU SequenceFile exec in plan:\n${df.queryExecution.executedPlan}")
         val got = df.collect().map(_.getAs[Array[Byte]](0)).sortBy(_.length)
         val expected = payloads.sortBy(_.length)
         assert(got.length == expected.length)

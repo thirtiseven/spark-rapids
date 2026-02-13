@@ -1681,10 +1681,9 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
   val SEQUENCEFILE_READER_TYPE = conf("spark.rapids.sql.format.sequencefile.reader.type")
     .doc("Sets the SequenceFile reader type. Since SequenceFile decoding happens on the CPU " +
       "(using Hadoop's SequenceFile.Reader), COALESCING mode is not supported and will throw " +
-      "an exception. Use PERFILE which individually reads files, or MULTITHREADED which uses " +
-      "multiple threads to read files in parallel, utilizing multiple CPU cores for I/O and " +
-      "decoding. MULTITHREADED is recommended when reading many files as it allows the CPU to " +
-      "keep reading while GPU is also doing work. " +
+      "an exception. MULTITHREADED uses multiple threads to read files in parallel, utilizing " +
+      "multiple CPU cores for I/O and decoding. MULTITHREADED is recommended when reading " +
+      "many files as it allows the CPU to keep reading while GPU is also doing work. " +
       s"See $MULTITHREAD_READ_NUM_THREADS and " +
       "spark.rapids.sql.format.sequencefile.multiThreadedRead.maxNumFilesParallel to control " +
       "the number of threads and amount of memory used. " +
@@ -1710,7 +1709,7 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
         "the lineage can be safely identified as a simple SequenceFile scan with BinaryType " +
         "key/value output. Unsupported or risky cases automatically remain on CPU.")
       .booleanConf
-      .createWithDefault(false)
+      .createWithDefault(true)
 
   val ENABLE_DELTA_WRITE = conf("spark.rapids.sql.format.delta.write.enabled")
       .doc("When set to false disables Delta Lake output acceleration.")
@@ -3582,26 +3581,19 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val maxNumAvroFilesParallel: Int = get(AVRO_MULTITHREAD_READ_MAX_NUM_FILES_PARALLEL)
 
-  lazy val isSequenceFilePerFileReadEnabled: Boolean = {
+  lazy val isSequenceFileMultiThreadReadEnabled: Boolean = {
     val readerType = RapidsReaderType.withName(get(SEQUENCEFILE_READER_TYPE))
     if (readerType == RapidsReaderType.COALESCING) {
       throw new IllegalArgumentException(
         s"COALESCING reader type is not supported for SequenceFile. " +
         s"SequenceFile decoding happens on CPU, so coalescing provides no benefit. " +
-        s"Use PERFILE, MULTITHREADED, or AUTO instead.")
+        s"Use MULTITHREADED or AUTO instead.")
     }
     if (readerType == RapidsReaderType.PERFILE) {
-      logWarning("SequenceFile PERFILE reader is deprecated and may be removed in a future " +
-        "release. Prefer MULTITHREADED reader for better CPU/GPU overlap.")
+      logWarning("SequenceFile PERFILE reader has been removed; using MULTITHREADED instead.")
     }
-    readerType == RapidsReaderType.PERFILE
+    true
   }
-
-  lazy val isSequenceFileAutoReaderEnabled: Boolean =
-    RapidsReaderType.withName(get(SEQUENCEFILE_READER_TYPE)) == RapidsReaderType.AUTO
-
-  lazy val isSequenceFileMultiThreadReadEnabled: Boolean = isSequenceFileAutoReaderEnabled ||
-    RapidsReaderType.withName(get(SEQUENCEFILE_READER_TYPE)) == RapidsReaderType.MULTITHREADED
 
   lazy val maxNumSequenceFilesParallel: Int = get(
     SEQUENCEFILE_MULTITHREAD_READ_MAX_NUM_FILES_PARALLEL)

@@ -26,7 +26,8 @@ from pyspark.sql.types import *
 from spark_session import with_cpu_session, with_gpu_session
 
 # Reader types supported by SequenceFile (COALESCING is not supported)
-sequencefile_reader_types = ['PERFILE', 'MULTITHREADED']
+# AUTO is accepted for compatibility and resolves to MULTITHREADED.
+sequencefile_reader_types = ['AUTO', 'MULTITHREADED']
 
 
 def write_sequencefile_with_rdd(spark, data_path, payloads):

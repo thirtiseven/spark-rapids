@@ -32,7 +32,10 @@ import org.apache.spark.sql.rapids.shims.RapidsErrorUtils
 import org.apache.spark.sql.types.{AbstractDataType, AnyDataType, ArrayType, BooleanType, DataType, IntegralType, LongType, MapType, StructField, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
-case class GpuGetStructField(child: Expression, ordinal: Int, name: Option[String] = None)
+case class GpuGetStructField(
+    child: Expression,
+    ordinal: Int,
+    name: Option[String] = None)
     extends ShimUnaryExpression
     with GpuExpression
     with ShimGetStructField
@@ -41,15 +44,23 @@ case class GpuGetStructField(child: Expression, ordinal: Int, name: Option[Strin
   lazy val childSchema: StructType = child.dataType.asInstanceOf[StructType]
 
   override def dataType: DataType = childSchema(ordinal).dataType
-  override def nullable: Boolean = child.nullable || childSchema(ordinal).nullable
+
+  override def nullable: Boolean =
+    child.nullable || childSchema(ordinal).nullable
 
   override def toString: String = {
-    val fieldName = if (resolved) childSchema(ordinal).name else s"_$ordinal"
+    val fieldName = if (resolved) {
+      childSchema(ordinal).name
+    } else {
+      s"_$ordinal"
+    }
     s"$child.${name.getOrElse(fieldName)}"
   }
 
-  override def sql: String =
-    child.sql + s".${quoteIdentifier(name.getOrElse(childSchema(ordinal).name))}"
+  override def sql: String = {
+    val fieldName = childSchema(ordinal).name
+    child.sql + s".${quoteIdentifier(name.getOrElse(fieldName))}"
+  }
 
   override def columnarEvalAny(batch: ColumnarBatch): Any = {
     val dt = dataType
@@ -59,7 +70,6 @@ case class GpuGetStructField(child: Expression, ordinal: Int, name: Option[Strin
           GpuColumnVector.from(view.copyToColumnVector(), dt)
         }
       case s: GpuScalar =>
-        // For a scalar in we want a scalar out.
         if (!s.isValid) {
           GpuScalar(null, dt)
         } else {
@@ -402,6 +412,22 @@ case class GpuArrayPosition(left: Expression, right: Expression)
   }
 }
 
+class GpuGetStructFieldMeta(
+    expr: GetStructField,
+    conf: RapidsConf,
+    parent: Option[RapidsMeta[_, _, _]],
+    rule: DataFromReplacementRule)
+  extends UnaryExprMeta[GetStructField](expr, conf, parent, rule) {
+
+  def convertToGpu(child: Expression): GpuExpression = {
+    val runtimeOrd = expr.getTagValue(
+      ProtobufExprShims.PRUNED_ORDINAL_TAG).getOrElse(-1)
+    val effectiveOrd =
+      if (runtimeOrd >= 0) runtimeOrd else expr.ordinal
+    GpuGetStructField(child, effectiveOrd, expr.name)
+  }
+}
+
 class GpuGetArrayStructFieldsMeta(
      expr: GetArrayStructFields,
      conf: RapidsConf,
@@ -410,10 +436,12 @@ class GpuGetArrayStructFieldsMeta(
   extends UnaryExprMeta[GetArrayStructFields](expr, conf, parent, rule) {
 
   def convertToGpu(child: Expression): GpuExpression = {
-    // Check the global protobuf pruned field registry to remap ordinal
-    val runtimeOrd = GpuFromProtobuf.getPrunedOrdinal(expr.field.name)
-    GpuGetArrayStructFields(child, expr.field, expr.ordinal, expr.numFields,
-      expr.containsNull, runtimeOrd)
+    val runtimeOrd = expr.getTagValue(
+      ProtobufExprShims.PRUNED_ORDINAL_TAG).getOrElse(-1)
+    val effectiveOrd =
+      if (runtimeOrd >= 0) runtimeOrd else expr.ordinal
+    GpuGetArrayStructFields(child, expr.field,
+      effectiveOrd, expr.numFields, expr.containsNull)
   }
 }
 
@@ -428,8 +456,7 @@ case class GpuGetArrayStructFields(
     field: StructField,
     ordinal: Int,
     numFields: Int,
-    containsNull: Boolean,
-    runtimeOrdinal: Int = -1) extends GpuUnaryExpression
+    containsNull: Boolean) extends GpuUnaryExpression
     with ShimGetArrayStructFields
     with NullIntolerantShim {
 
@@ -440,16 +467,7 @@ case class GpuGetArrayStructFields(
   override protected def doColumnar(input: GpuColumnVector): ColumnVector = {
     val base = input.getBase
     val fieldView = withResource(base.getChildColumnView(0)) { structView =>
-      val actualChildren = structView.getNumChildren
-      // Handle nested schema projection (Option A): the actual struct may have
-      // fewer children than numFields if GpuFromProtobuf pruned the schema.
-      // Use runtimeOrdinal (if set) when the struct was pruned.
-      val effectiveOrdinal = if (runtimeOrdinal >= 0 && actualChildren < numFields) {
-        runtimeOrdinal
-      } else {
-        ordinal
-      }
-      structView.getChildColumnView(effectiveOrdinal)
+      structView.getChildColumnView(ordinal)
     }
     val listView = withResource(fieldView) { _ =>
       GpuListUtils.replaceListDataColumnAsView(base, fieldView)

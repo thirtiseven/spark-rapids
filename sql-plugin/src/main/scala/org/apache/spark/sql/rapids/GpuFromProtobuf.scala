@@ -20,7 +20,7 @@ import ai.rapids.cudf
 import ai.rapids.cudf.{BinaryOp, CudfException, DType}
 import com.nvidia.spark.rapids.{GpuColumnVector, GpuUnaryExpression}
 import com.nvidia.spark.rapids.Arm.withResource
-import com.nvidia.spark.rapids.jni.Protobuf
+import com.nvidia.spark.rapids.jni.{Protobuf, ProtobufSchemaDescriptor}
 import com.nvidia.spark.rapids.shims.NullIntolerantShim
 
 import org.apache.spark.sql.catalyst.expressions.{ExpectsInputTypes, Expression}
@@ -65,7 +65,7 @@ import org.apache.spark.sql.types._
  */
 case class GpuFromProtobuf(
     fullSchema: StructType,
-    decodedTopLevelIndices: Array[Int],
+    decodedSchema: StructType,
     fieldNumbers: Array[Int],
     parentIndices: Array[Int],
     depthLevels: Array[Int],
@@ -81,211 +81,45 @@ case class GpuFromProtobuf(
     defaultStrings: Array[Array[Byte]],
     enumValidValues: Array[Array[Int]],
     enumNames: Array[Array[Array[Byte]]],
-    nestedPrunedFields: Map[String, Seq[String]],
     failOnErrors: Boolean,
     child: Expression)
   extends GpuUnaryExpression with ExpectsInputTypes with NullIntolerantShim {
 
   override def inputTypes: Seq[AbstractDataType] = Seq(BinaryType)
 
-  /**
-   * Build a partially pruned schema for the output:
-   * - Top-level: matches fullSchema (so GetStructField ordinals stay valid)
-   * - Nested ArrayType(StructType) fields: pruned to only contain decoded children
-   *   (GetArrayStructFields ordinals are remapped in GpuGetArrayStructFieldsMeta)
-   * - Nested StructType (non-repeated) fields: kept at full schema
-   *   (expansion inserts null columns cheaply; GetStructField ordinals stay valid)
-   */
-  private val outputSchema: StructType = {
-    val fields = fullSchema.fields.map { field =>
-      nestedPrunedFields.get(field.name) match {
-        case Some(childNames) =>
-          field.dataType match {
-            case ArrayType(st: StructType, containsNull) =>
-              // Pruned repeated message: only keep decoded children (Option A)
-              val prunedSt = StructType(
-                st.fields.filter(f => childNames.contains(f.name)))
-              field.copy(dataType = ArrayType(prunedSt, containsNull))
-            case _ =>
-              // Non-repeated struct or other: keep full type (expand with null cols)
-              field
-          }
-        case None => field
-      }
-    }
-    StructType(fields).asNullable
-  }
-
-  override def dataType: DataType = outputSchema
+  override def dataType: DataType = decodedSchema
 
   override def nullable: Boolean = true
 
-  // Identify which pruned fields are non-repeated structs (need expansion)
-  // vs repeated messages (pruned in outputSchema, no expansion needed)
-  private val nonRepeatedPrunedFields: Map[String, Seq[String]] =
-    nestedPrunedFields.filter { case (fieldName, _) =>
-      val idx = fullSchema.fieldIndex(fieldName)
-      fullSchema.fields(idx).dataType.isInstanceOf[StructType]
-    }
-
-  // Expansion is needed when not all top-level fields are decoded,
-  // or when non-repeated structs have pruned children
-  private val needsExpansion: Boolean =
-    decodedTopLevelIndices.length != fullSchema.fields.length ||
-    nonRepeatedPrunedFields.nonEmpty
+  @transient private lazy val schema = new ProtobufSchemaDescriptor(
+    fieldNumbers, parentIndices, depthLevels, wireTypes, outputTypeIds, encodings,
+    isRepeated, isRequired, hasDefaultValue, defaultInts, defaultFloats, defaultBools,
+    defaultStrings, enumValidValues, enumNames)
 
   override protected def doColumnar(input: GpuColumnVector): cudf.ColumnVector = {
-    val numRows = input.getRowCount.toInt
     val jniResult = try {
-      Protobuf.decodeToStruct(
-        input.getBase,
-        fieldNumbers,
-        parentIndices,
-        depthLevels,
-        wireTypes,
-        outputTypeIds,
-        encodings,
-        isRepeated,
-        isRequired,
-        hasDefaultValue,
-        defaultInts,
-        defaultFloats,
-        defaultBools,
-        defaultStrings,
-        enumValidValues,
-        enumNames,
-        failOnErrors)
+      Protobuf.decodeToStruct(input.getBase, schema, failOnErrors)
     } catch {
       case e: CudfException if failOnErrors =>
         throw new org.apache.spark.SparkException("Malformed protobuf message", e)
     }
 
-    // Expand if needed:
-    // - Top-level: insert null columns for non-decoded top-level fields
-    // - Non-repeated structs: expand pruned children with null columns
-    // - Repeated messages (ArrayType(StructType)): already pruned in outputSchema,
-    //   handled by GetArrayStructFields ordinal remapping (no expansion needed)
-    val expanded = if (needsExpansion) {
-      withResource(jniResult) { decoded =>
-        expandSchema(decoded, numRows)
+    // Apply input nulls to output
+    if (input.getBase.hasNulls) {
+      withResource(jniResult) { _ =>
+        jniResult.mergeAndSetValidity(BinaryOp.BITWISE_AND, input.getBase)
       }
     } else {
       jniResult
-    }
-
-    // Apply input nulls to output
-    if (input.getBase.hasNulls) {
-      withResource(expanded) { _ =>
-        expanded.mergeAndSetValidity(BinaryOp.BITWISE_AND, input.getBase)
-      }
-    } else {
-      expanded
-    }
-  }
-
-  /**
-   * Expand decoded struct to match outputSchema:
-   * - Top-level: insert null columns for non-decoded fields
-   * - Non-repeated structs with pruned children: expand by inserting null child columns
-   * - Repeated messages (ArrayType): no expansion (already pruned in outputSchema)
-   */
-  private def expandSchema(decoded: cudf.ColumnVector, numRows: Int): cudf.ColumnVector = {
-    val children = new Array[cudf.ColumnVector](fullSchema.fields.length)
-    var decodedIdx = 0
-
-    try {
-      for (i <- fullSchema.fields.indices) {
-        if (decodedIdx < decodedTopLevelIndices.length &&
-            decodedTopLevelIndices(decodedIdx) == i) {
-          val fieldName = fullSchema.fields(i).name
-
-          // Check if this is a non-repeated struct with pruned children
-          nonRepeatedPrunedFields.get(fieldName) match {
-            case Some(decodedNames) =>
-              // Expand non-repeated struct: insert null columns for pruned children
-              val targetSt = fullSchema.fields(i).dataType.asInstanceOf[StructType]
-              withResource(decoded.getChildColumnView(decodedIdx)) { childView =>
-                children(i) = expandStructChildren(childView, targetSt, decodedNames, numRows)
-              }
-            case None =>
-              // No expansion needed (either full schema or ArrayType pruned via Option A)
-              withResource(decoded.getChildColumnView(decodedIdx)) { childView =>
-                children(i) = childView.copyToColumnVector()
-              }
-          }
-          decodedIdx += 1
-        } else {
-          // This field was not decoded — create null column
-          children(i) = GpuColumnVector.columnVectorFromNull(
-            numRows, outputSchema.fields(i).dataType)
-        }
-      }
-
-      cudf.ColumnVector.makeStruct(numRows, children: _*)
-    } finally {
-      children.foreach(col => if (col != null) col.close())
-    }
-  }
-
-  /**
-   * Expand a non-repeated STRUCT column by inserting null columns for pruned children.
-   * This is cheap because non-repeated structs have only num_rows elements.
-   */
-  private def expandStructChildren(
-      decoded: cudf.ColumnView,
-      targetSchema: StructType,
-      decodedChildNames: Seq[String],
-      numRows: Int): cudf.ColumnVector = {
-    val children = new Array[cudf.ColumnVector](targetSchema.fields.length)
-    var decodedChildIdx = 0
-
-    try {
-      for (i <- targetSchema.fields.indices) {
-        if (decodedChildIdx < decodedChildNames.length &&
-            decodedChildNames(decodedChildIdx) == targetSchema.fields(i).name) {
-          withResource(decoded.getChildColumnView(decodedChildIdx)) { childView =>
-            children(i) = childView.copyToColumnVector()
-          }
-          decodedChildIdx += 1
-        } else {
-          children(i) = GpuColumnVector.columnVectorFromNull(
-            numRows, targetSchema.fields(i).dataType)
-        }
-      }
-
-      cudf.ColumnVector.makeStruct(numRows, children: _*)
-    } finally {
-      children.foreach(col => if (col != null) col.close())
     }
   }
 }
 
 object GpuFromProtobuf {
-  // Encodings from com.nvidia.spark.rapids.jni.Protobuf
   val ENC_DEFAULT = 0
   val ENC_FIXED   = 1
   val ENC_ZIGZAG  = 2
   val ENC_ENUM_STRING = 3
-
-  // Thread-local registry for pruned field ordinal mappings.
-  // When GpuFromProtobuf is created with nested pruning, it registers
-  // the field name -> pruned ordinal mapping. GpuGetArrayStructFieldsMeta
-  // reads this during convertToGpu to remap ordinals.
-  private val prunedFieldOrdinals = new ThreadLocal[Map[String, Int]]() {
-    override def initialValue(): Map[String, Int] = Map.empty
-  }
-
-  def registerPrunedFields(mappings: Map[String, Int]): Unit = {
-    prunedFieldOrdinals.set(prunedFieldOrdinals.get() ++ mappings)
-  }
-
-  def getPrunedOrdinal(fieldName: String): Int = {
-    prunedFieldOrdinals.get().getOrElse(fieldName, -1)
-  }
-
-  def clearPrunedFields(): Unit = {
-    prunedFieldOrdinals.set(Map.empty)
-  }
 
   /**
    * Maps a Spark DataType to the corresponding cuDF native type ID.
@@ -309,76 +143,4 @@ object GpuFromProtobuf {
    * Check if a Spark DataType is supported by the GPU protobuf decoder.
    */
   def isTypeSupported(dt: DataType): Boolean = sparkTypeToCudfIdOpt(dt).isDefined
-
-  /**
-   * Create an all-null column of the specified Spark DataType.
-   * This is used for fields with unsupported types (nested structs, arrays, etc.)
-   * that are not decoded but need to be present in the output struct.
-   */
-  def createNullColumn(dt: DataType, numRows: Int): cudf.ColumnVector = {
-    // Helper to create null arrays for boxed types
-    def nullBools = Array.fill[java.lang.Boolean](numRows)(null)
-    def nullInts = Array.fill[java.lang.Integer](numRows)(null)
-    def nullLongs = Array.fill[java.lang.Long](numRows)(null)
-    def nullFloats = Array.fill[java.lang.Float](numRows)(null)
-    def nullDoubles = Array.fill[java.lang.Double](numRows)(null)
-
-    dt match {
-      case BooleanType => cudf.ColumnVector.fromBoxedBooleans(nullBools: _*)
-      case IntegerType => cudf.ColumnVector.fromBoxedInts(nullInts: _*)
-      case LongType => cudf.ColumnVector.fromBoxedLongs(nullLongs: _*)
-      case FloatType => cudf.ColumnVector.fromBoxedFloats(nullFloats: _*)
-      case DoubleType => cudf.ColumnVector.fromBoxedDoubles(nullDoubles: _*)
-      case StringType => cudf.ColumnVector.fromStrings(Array.fill[String](numRows)(null): _*)
-      case BinaryType =>
-        // Binary is LIST<INT8> - create all-null list column using Scalar API
-        val elementType = new cudf.HostColumnVector.BasicType(true, DType.INT8)
-        withResource(cudf.Scalar.listFromNull(elementType)) { nullScalar =>
-          cudf.ColumnVector.fromScalar(nullScalar, numRows)
-        }
-      case st: StructType =>
-        // Recursively create null columns for struct fields
-        val children = st.fields.map(f => createNullColumn(f.dataType, numRows))
-        try {
-          withResource(cudf.ColumnVector.makeStruct(numRows, children: _*)) { structCol =>
-            // Set all rows to null - mergeAndSetValidity returns a NEW column
-            withResource(cudf.ColumnVector.fromBoxedBooleans(nullBools: _*)) { nullMask =>
-              structCol.mergeAndSetValidity(BinaryOp.BITWISE_AND, nullMask)
-            }
-          }
-        } finally {
-          children.foreach(_.close())
-        }
-      case ArrayType(elementType, _) =>
-        // Create empty arrays with all nulls using Scalar API
-        val cudfElementDType = sparkTypeToCudfIdOpt(elementType)
-          .map(id => DType.fromNative(id, 0))
-          .getOrElse(DType.INT8)  // fallback for nested complex types
-        val elemType = new cudf.HostColumnVector.BasicType(true, cudfElementDType)
-        withResource(cudf.Scalar.listFromNull(elemType)) { nullScalar =>
-          cudf.ColumnVector.fromScalar(nullScalar, numRows)
-        }
-      case MapType(keyType, valueType, _) =>
-        // Maps are represented as LIST<STRUCT<key, value>> in cuDF
-        // For all-null maps, we create a list column with STRUCT<key, value> element type
-        val cudfKeyDType = sparkTypeToCudfIdOpt(keyType)
-          .map(id => DType.fromNative(id, 0))
-          .getOrElse(DType.INT8)
-        val cudfValueDType = sparkTypeToCudfIdOpt(valueType)
-          .map(id => DType.fromNative(id, 0))
-          .getOrElse(DType.INT8)
-        // Create the struct type for map entries (key, value)
-        val keyFieldType = new cudf.HostColumnVector.BasicType(true, cudfKeyDType)
-        val valueFieldType = new cudf.HostColumnVector.BasicType(true, cudfValueDType)
-        val structType = new cudf.HostColumnVector.StructType(true, keyFieldType, valueFieldType)
-        // Create an all-null map column (list of structs)
-        withResource(cudf.Scalar.listFromNull(structType)) { nullScalar =>
-          cudf.ColumnVector.fromScalar(nullScalar, numRows)
-        }
-      case _ =>
-        // Fallback for any other types - create INT8 nulls as placeholder
-        // This should not happen in practice since unsupported types should be caught earlier
-        cudf.ColumnVector.fromBoxedBytes(Array.fill[java.lang.Byte](numRows)(null): _*)
-    }
-  }
 }

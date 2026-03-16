@@ -10,6 +10,7 @@ LocalLimitExec,3.0
 ProjectExec,3.0
 RangeExec,3.0
 SampleExec,3.0
+SerializeFromObjectExec,3.0
 SortExec,8.0
 SubqueryBroadcastExec,3.0
 TakeOrderedAndProjectExec,3.0
@@ -244,6 +245,7 @@ Second,4
 SecondsToTimestamp,4
 Sequence,4
 Sha1,4
+Sha2,4
 ShiftLeft,4
 ShiftRight,4
 ShiftRightUnsigned,4

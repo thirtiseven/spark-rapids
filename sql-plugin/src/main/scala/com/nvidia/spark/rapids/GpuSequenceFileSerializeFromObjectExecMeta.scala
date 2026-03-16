@@ -16,10 +16,12 @@
 
 package com.nvidia.spark.rapids
 
+import scala.annotation.tailrec
 import scala.util.control.NonFatal
 
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.mapred.{FileInputFormat => OldFileInputFormat}
+import org.apache.hadoop.mapreduce.Job
 import org.apache.hadoop.mapreduce.lib.input.{
   FileInputFormat => NewFileInputFormat}
 
@@ -36,6 +38,8 @@ class GpuSequenceFileSerializeFromObjectExecMeta(
     rule: DataFromReplacementRule)
   extends SparkPlanMeta[SerializeFromObjectExec](plan, conf, parent, rule) with Logging {
 
+  import GpuSequenceFileSerializeFromObjectExecMeta._
+
   // Override childExprs to empty: we replace the entire SerializeFromObjectExec including its
   // serializer expressions, so we don't need them to be individually GPU-compatible.
   // Without this, the framework's canExprTreeBeReplaced check rejects us because the
@@ -47,7 +51,8 @@ class GpuSequenceFileSerializeFromObjectExecMeta(
   // wrapping child plans to avoid "not all children can be replaced" cascading failures.
   override val childPlans: Seq[SparkPlanMeta[SparkPlan]] = Seq.empty
 
-  private var sourceScan: ExternalRDDScanExec[_] = null
+  private var scanAnalysis: Option[SequenceFileScanAnalysis] =
+    None
 
   override def tagPlanForGpu(): Unit = {
     if (!conf.isSequenceFileRDDPhysicalReplaceEnabled) {
@@ -65,29 +70,39 @@ class GpuSequenceFileSerializeFromObjectExecMeta(
     }
     wrapped.child match {
       case e: ExternalRDDScanExec[_] =>
-        sourceScan = e
+        if (!isSimpleSequenceFileRDD(e.rdd)) {
+          willNotWorkOnGpu("RDD lineage is not a simple SequenceFile scan")
+          return
+        }
+        val analysis = analyzeSequenceFileScan(
+          e, e.rdd.context.hadoopConfiguration)
+        if (analysis.inputPaths.isEmpty) {
+          willNotWorkOnGpu("Failed to collect SequenceFile input paths via reflection")
+          return
+        }
+        scanAnalysis = Some(analysis)
+        if (analysis.hasCompressedInput) {
+          willNotWorkOnGpu("Compressed SequenceFile input falls back to CPU")
+        }
       case _ =>
         willNotWorkOnGpu("SerializeFromObject child is not ExternalRDDScanExec")
         return
     }
-    if (!GpuSequenceFileSerializeFromObjectExecMeta.isSimpleSequenceFileRDD(sourceScan.rdd)) {
-      willNotWorkOnGpu("RDD lineage is not a simple SequenceFile scan")
-      return
-    }
-    if (GpuSequenceFileSerializeFromObjectExecMeta.hasCompressedInput(
-        sourceScan.rdd, sourceScan.rdd.context.hadoopConfiguration)) {
-      willNotWorkOnGpu("Compressed SequenceFile input falls back to CPU")
-    }
   }
 
   override def convertToGpu(): GpuExec = {
-    val paths = GpuSequenceFileSerializeFromObjectExecMeta
-      .collectInputPaths(sourceScan.rdd)
+    val analysis = scanAnalysis.getOrElse {
+      val sourceScan = wrapped.child.asInstanceOf[ExternalRDDScanExec[_]]
+      analyzeSequenceFileScan(
+        sourceScan, sourceScan.rdd.context.hadoopConfiguration)
+    }
+    require(analysis.inputPaths.nonEmpty,
+      "SequenceFile input paths should be collected before GPU physical replacement")
     GpuSequenceFileSerializeFromObjectExec(
       wrapped.output,
       wrapped.child,
       TargetSize(conf.gpuTargetBatchSizeBytes),
-      paths)(conf)
+      analysis.inputPaths)(conf)
   }
 
   override def convertToCpu(): SparkPlan = wrapped
@@ -103,25 +118,33 @@ class GpuSequenceFileSerializeFromObjectExecMeta(
  * to the CPU path by returning conservative defaults.
  */
 object GpuSequenceFileSerializeFromObjectExecMeta extends Logging {
+  private val SequenceFileBlockCompressionVersion = 5
+
+  private case class SequenceFileScanAnalysis(
+      sourceScan: ExternalRDDScanExec[_],
+      inputPaths: Seq[String],
+      hasCompressedInput: Boolean)
+
+  private def analyzeSequenceFileScan(
+      sourceScan: ExternalRDDScanExec[_],
+      conf: org.apache.hadoop.conf.Configuration): SequenceFileScanAnalysis = {
+    val inputPaths = collectInputPaths(sourceScan.rdd)
+    SequenceFileScanAnalysis(
+      sourceScan = sourceScan,
+      inputPaths = inputPaths,
+      hasCompressedInput = hasCompressedInput(inputPaths, conf))
+  }
+
   private def isNewApiSequenceFileRDD(rdd: NewHadoopRDD[_, _]): Boolean = {
     try {
-      val cls = classOf[NewHadoopRDD[_, _]]
-      cls.getDeclaredFields.filter(_.getName.contains("inputFormatClass")).exists { f =>
-        f.setAccessible(true)
-        val v = f.get(rdd)
-        val c = v match {
-          case c: Class[_] => c
-          case other =>
-            try {
-              val vf = other.getClass.getDeclaredField("value")
-              vf.setAccessible(true)
-              vf.get(other).asInstanceOf[Class[_]]
-            } catch {
-              case NonFatal(_) => null
-            }
-        }
-        c != null && c.getName.contains("SequenceFile")
-      }
+      // Spark's Scala bytecode exposes inputFormatClass as a public field with the mangled
+      // name below (verified with javap on Spark 3.5.1), so getField is intentional here.
+      // This is not a JavaBean-style accessor method; using getMethod would look for a
+      // zero-arg method that does not exist on the compiled class.
+      val f = classOf[NewHadoopRDD[_, _]]
+        .getField("org$apache$spark$rdd$NewHadoopRDD$$inputFormatClass")
+      val ifc = f.get(rdd).asInstanceOf[Class[_]]
+      ifc != null && ifc.getName.contains("SequenceFile")
     } catch {
       case NonFatal(e) =>
         logDebug(s"Failed to inspect NewHadoopRDD input format via reflection: ${e.getMessage}", e)
@@ -143,44 +166,39 @@ object GpuSequenceFileSerializeFromObjectExecMeta extends Logging {
   }
 
   def isSimpleSequenceFileRDD(
-      rdd: RDD[_],
-      seen: Set[Int] = Set.empty): Boolean = {
-    val id = System.identityHashCode(rdd)
-    if (seen.contains(id)) return false
-    rdd match {
-      case n: NewHadoopRDD[_, _] => isNewApiSequenceFileRDD(n)
-      case h: HadoopRDD[_, _] => isOldApiSequenceFileRDD(h)
-      case other =>
-        if (other.dependencies.size != 1) false
-        else isSimpleSequenceFileRDD(
-          other.dependencies.head.rdd, seen + id)
+      rdd: RDD[_]): Boolean = {
+    @tailrec
+    def recurse(current: RDD[_], seen: Set[RDD[_]]): Boolean = {
+      if (seen.contains(current)) {
+        false
+      } else {
+        current match {
+          case n: NewHadoopRDD[_, _] => isNewApiSequenceFileRDD(n)
+          case h: HadoopRDD[_, _] => isOldApiSequenceFileRDD(h)
+          case other =>
+            if (other.dependencies.size != 1) false
+            else recurse(other.dependencies.head.rdd, seen + current)
+        }
+      }
     }
+
+    recurse(rdd, Set.empty)
   }
 
   private[rapids] def collectInputPaths(rdd: RDD[_]): Seq[String] = {
     rdd match {
       case n: NewHadoopRDD[_, _] =>
         try {
-          val cls = classOf[NewHadoopRDD[_, _]]
-          cls.getDeclaredFields
-            .filter(f => f.getName == "_conf" || f.getName.contains("_conf"))
-            .flatMap { f =>
-              f.setAccessible(true)
-              val cv = f.get(n)
-              val conf = cv match {
-                case c: org.apache.hadoop.conf.Configuration => c
-                case other =>
-                  try {
-                    val vf = other.getClass.getDeclaredField("value")
-                    vf.setAccessible(true)
-                    vf.get(other).asInstanceOf[org.apache.hadoop.conf.Configuration]
-                  } catch {
-                    case NonFatal(_) => null
-                  }
-              }
-              val p = if (conf != null) conf.get(NewFileInputFormat.INPUT_DIR) else null
-              Option(p).toSeq
-            }.flatMap(_.split(",").map(_.trim)).filter(_.nonEmpty)
+          val jobConf = n.getConf
+          if (jobConf == null) {
+            Seq.empty
+          } else {
+            // Reuse Hadoop's own parsing of INPUT_DIR instead of splitting the raw conf string.
+            // This preserves any escaping/normalization semantics that FileInputFormat applies.
+            val job = Job.getInstance(jobConf)
+            val paths = NewFileInputFormat.getInputPaths(job)
+            if (paths == null) Seq.empty else paths.map(_.toString).toSeq
+          }
         } catch {
           case NonFatal(e) =>
             logDebug(s"Failed to collect input paths from NewHadoopRDD: ${e.getMessage}", e)
@@ -229,10 +247,15 @@ object GpuSequenceFileSerializeFromObjectExecMeta extends Logging {
       if (!(magic(0) == 'S' && magic(1) == 'E' && magic(2) == 'Q')) {
         false
       } else {
+        val version = magic(3) & 0xFF
         org.apache.hadoop.io.Text.readString(in)
         org.apache.hadoop.io.Text.readString(in)
         val isCompressed = in.readBoolean()
-        val isBlockCompressed = in.readBoolean()
+        val isBlockCompressed = if (version >= SequenceFileBlockCompressionVersion) {
+          in.readBoolean()
+        } else {
+          false
+        }
         isCompressed || isBlockCompressed
       }
     } catch {
@@ -242,8 +265,10 @@ object GpuSequenceFileSerializeFromObjectExecMeta extends Logging {
     }
   }
 
-  def hasCompressedInput(rdd: RDD[_], conf: org.apache.hadoop.conf.Configuration): Boolean = {
-    collectInputPaths(rdd).exists { p =>
+  private def hasCompressedInput(
+      inputPaths: Seq[String],
+      conf: org.apache.hadoop.conf.Configuration): Boolean = {
+    inputPaths.exists { p =>
       try {
         findAnyFile(new Path(p), conf).exists(f => isCompressedSequenceFile(f, conf))
       } catch {

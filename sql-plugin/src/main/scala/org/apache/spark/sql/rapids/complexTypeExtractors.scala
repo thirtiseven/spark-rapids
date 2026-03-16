@@ -412,6 +412,11 @@ case class GpuArrayPosition(left: Expression, right: Expression)
   }
 }
 
+object GpuStructFieldOrdinalTag {
+  val PRUNED_ORDINAL_TAG =
+    new org.apache.spark.sql.catalyst.trees.TreeNodeTag[Int]("GPU_PRUNED_ORDINAL")
+}
+
 class GpuGetStructFieldMeta(
     expr: GetStructField,
     conf: RapidsConf,
@@ -420,11 +425,20 @@ class GpuGetStructFieldMeta(
   extends UnaryExprMeta[GetStructField](expr, conf, parent, rule) {
 
   def convertToGpu(child: Expression): GpuExpression = {
-    val runtimeOrd = expr.getTagValue(
-      ProtobufExprShims.PRUNED_ORDINAL_TAG).getOrElse(-1)
-    val effectiveOrd =
-      if (runtimeOrd >= 0) runtimeOrd else expr.ordinal
+    val effectiveOrd = GpuGetStructFieldMeta.effectiveOrdinal(expr)
     GpuGetStructField(child, effectiveOrd, expr.name)
+  }
+}
+
+object GpuGetStructFieldMeta {
+  def effectiveOrdinal(expr: GetStructField): Int = {
+    val runtimeOrd = expr.getTagValue(
+      GpuStructFieldOrdinalTag.PRUNED_ORDINAL_TAG).getOrElse(-1)
+    if (runtimeOrd >= 0) {
+      runtimeOrd
+    } else {
+      expr.ordinal
+    }
   }
 }
 
@@ -436,12 +450,39 @@ class GpuGetArrayStructFieldsMeta(
   extends UnaryExprMeta[GetArrayStructFields](expr, conf, parent, rule) {
 
   def convertToGpu(child: Expression): GpuExpression = {
+    val effectiveOrd = GpuGetArrayStructFieldsMeta.effectiveOrdinal(expr)
     val runtimeOrd = expr.getTagValue(
-      ProtobufExprShims.PRUNED_ORDINAL_TAG).getOrElse(-1)
-    val effectiveOrd =
-      if (runtimeOrd >= 0) runtimeOrd else expr.ordinal
+      GpuStructFieldOrdinalTag.PRUNED_ORDINAL_TAG).getOrElse(-1)
+    val effectiveNumFields =
+      GpuGetArrayStructFieldsMeta.effectiveNumFields(child, expr, runtimeOrd)
     GpuGetArrayStructFields(child, expr.field,
-      effectiveOrd, expr.numFields, expr.containsNull)
+      effectiveOrd, effectiveNumFields, expr.containsNull)
+  }
+}
+
+object GpuGetArrayStructFieldsMeta {
+  def effectiveOrdinal(expr: GetArrayStructFields): Int = {
+    val runtimeOrd = expr.getTagValue(
+      GpuStructFieldOrdinalTag.PRUNED_ORDINAL_TAG).getOrElse(-1)
+    if (runtimeOrd >= 0) {
+      runtimeOrd
+    } else {
+      expr.ordinal
+    }
+  }
+
+  def effectiveNumFields(
+      child: Expression,
+      expr: GetArrayStructFields,
+      runtimeOrd: Int): Int = {
+    if (runtimeOrd >= 0) {
+      child.dataType match {
+        case ArrayType(st: StructType, _) => st.fields.length
+        case _ => expr.numFields
+      }
+    } else {
+      expr.numFields
+    }
   }
 }
 

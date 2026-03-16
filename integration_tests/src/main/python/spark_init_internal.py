@@ -45,6 +45,7 @@ def conf_for_env(env_name):
     return res
 
 _DRIVER_ENV = env_for_conf('spark.driver.extraJavaOptions')
+_DRIVER_CLASSPATH = env_for_conf('spark.driver.extraClassPath')
 _SPARK_JARS = env_for_conf("spark.jars")
 _SPARK_JARS_PACKAGES = env_for_conf("spark.jars.packages")
 spark_jars_env = {
@@ -82,14 +83,30 @@ def _add_driver_classpath(jars):
     # Remove trailing 'pyspark-shell' if present
     if current_args.endswith('pyspark-shell'):
         current_args = current_args[:-len('pyspark-shell')].strip()
-    # Skip if driver-class-path is already present
-    if '--driver-class-path' in current_args:
-        logging.info("driver-class-path already in PYSPARK_SUBMIT_ARGS, skipping")
+    jar_list = [j.strip() for j in jars.split(',') if j.strip()]
+    existing_driver_cp = {
+        p for p in os.environ.get(_DRIVER_CLASSPATH, '').split(os.pathsep) if p
+    }
+    jar_list = [j for j in jar_list if j not in existing_driver_cp]
+    if not jar_list:
+        logging.info("Skipping PYSPARK_SUBMIT_ARGS driver-class-path update; jars already present")
         return
-    # Add driver-class-path for each jar (use os.pathsep for platform independence)
-    jar_list = jars.replace(',', ' ').split()
-    driver_cp = os.pathsep.join(jar_list)
-    new_args = f"{current_args} --driver-class-path {driver_cp} pyspark-shell".strip()
+    new_cp = os.pathsep.join(jar_list)
+    if '--driver-class-path' in current_args:
+        match = re.search(r'--driver-class-path\s+(\S+)', current_args)
+        if match:
+            existing_cp = match.group(1)
+            merged_cp = existing_cp + os.pathsep + new_cp
+            current_args = re.sub(
+                r'--driver-class-path\s+\S+',
+                lambda m: f'--driver-class-path {merged_cp}',
+                current_args,
+                count=1)
+        else:
+            current_args += f' --driver-class-path {new_cp}'
+    else:
+        current_args += f' --driver-class-path {new_cp}'
+    new_args = f"{current_args} pyspark-shell".strip()
     os.environ['PYSPARK_SUBMIT_ARGS'] = new_args
     logging.info(f"Updated PYSPARK_SUBMIT_ARGS with driver-class-path")
 

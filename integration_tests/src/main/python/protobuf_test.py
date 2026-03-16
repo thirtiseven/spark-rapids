@@ -18,17 +18,23 @@ import struct
 
 import pytest
 
-from asserts import assert_gpu_and_cpu_are_equal_collect
+from asserts import assert_gpu_and_cpu_are_equal_collect, assert_gpu_and_cpu_error
 from data_gen import (
     BooleanGen, IntegerGen, LongGen, FloatGen, DoubleGen, StringGen, BinaryGen,
     ProtobufMessageGen, PbScalar, PbNested, PbRepeated, PbRepeatedMessage,
-    encode_pb_message, gen_df, idfn
+    encode_pb_message, gen_df, idfn, _encode_protobuf_packed_repeated
 )
 from marks import ignore_order
 from spark_session import with_cpu_session, is_before_spark_340
 import pyspark.sql.functions as f
+from pyspark.sql.types import IntegerType, LongType
 
-pytestmark = [pytest.mark.premerge_ci_1]
+_protobuf_jars_available = os.environ.get('PROTOBUF_JARS_AVAILABLE', 'true').lower() != 'false'
+
+pytestmark = [
+    pytest.mark.premerge_ci_1,
+    pytest.mark.skipif(not _protobuf_jars_available, reason="Protobuf JARs not available"),
+]
 
 
 # Random data generation configurations for simple scalars
@@ -87,8 +93,16 @@ def _spark_protobuf_jvm_available(spark) -> bool:
     even when the JVM side isn't present on the classpath, which manifests as:
       TypeError: 'JavaPackage' object is not callable
     when calling into `sc._jvm.org.apache.spark.sql.protobuf.functions.from_protobuf`.
+
+    In the integration harness, Spark jars are often attached dynamically. Using the current
+    thread's context classloader is more reliable than the default `Class.forName()` lookup.
     """
     jvm = spark.sparkContext._jvm
+    loader = None
+    try:
+        loader = jvm.Thread.currentThread().getContextClassLoader()
+    except Exception:
+        pass
     candidates = [
         # Scala object `functions` compiles to `functions$`
         "org.apache.spark.sql.protobuf.functions$",
@@ -97,11 +111,21 @@ def _spark_protobuf_jvm_available(spark) -> bool:
     ]
     for cls in candidates:
         try:
-            jvm.java.lang.Class.forName(cls)
+            if loader is not None:
+                jvm.java.lang.Class.forName(cls, True, loader)
+            else:
+                jvm.java.lang.Class.forName(cls)
             return True
         except Exception:
             continue
-    return False
+
+    # Fallback: try to resolve the JVM member through Py4J. A missing optional module typically
+    # stays as a JavaPackage placeholder instead of a callable JavaMember/JavaClass.
+    try:
+        member = jvm.org.apache.spark.sql.protobuf.functions.from_protobuf
+        return type(member).__name__ != "JavaPackage"
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -137,9 +161,34 @@ def _call_from_protobuf(from_protobuf_fn, col, message_name,
         if options is not None:
             kw["options"] = options
         return from_protobuf_fn(col, message_name, **kw)
-    if options is not None and "options" in sig.parameters:
+    if options is not None:
         return from_protobuf_fn(col, message_name, desc_path, options)
     return from_protobuf_fn(col, message_name, desc_path)
+
+
+def test_call_from_protobuf_preserves_options_for_legacy_signature():
+    calls = []
+
+    def fake_from_protobuf(col, message_name, desc_path, *args):
+        calls.append((col, message_name, desc_path, args))
+        return "ok"
+
+    options = {"enums.as.ints": "true"}
+    result = _call_from_protobuf(
+        fake_from_protobuf, "col", "msg", "/tmp/test.desc", b"desc", options=options)
+
+    assert result == "ok"
+    assert calls == [("col", "msg", "/tmp/test.desc", (options,))]
+
+
+def test_encode_protobuf_packed_repeated_fixed_uses_unsigned_twos_complement():
+    i32_encoded = _encode_protobuf_packed_repeated(
+        1, IntegerType(), [0xFFFFFFFF], encoding='fixed')
+    i64_encoded = _encode_protobuf_packed_repeated(
+        1, LongType(), [0xFFFFFFFFFFFFFFFF], encoding='fixed')
+
+    assert i32_encoded == b"\x0a\x04" + struct.pack("<I", 0xFFFFFFFF)
+    assert i64_encoded == b"\x0a\x08" + struct.pack("<Q", 0xFFFFFFFFFFFFFFFF)
 
 
 def _build_simple_descriptor_set_bytes(spark):
@@ -870,6 +919,515 @@ def test_from_protobuf_nested_enum_permissive_invalid_row_null(spark_tmp_path, f
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
 
 
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_nested_enum_invalid_permissive_nulls_sibling_fields(
+        spark_tmp_path, from_protobuf_fn):
+    """Invalid nested enums must null the full row, including sibling fields."""
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "nested_enum.desc", _build_nested_enum_descriptor_set_bytes)
+    message_name = "test.WithNestedEnum"
+
+    row_valid = (_encode_tag(1, 0) + _encode_varint(1) +
+                 _encode_tag(2, 2) + _encode_varint(4) +
+                 _encode_tag(1, 0) + _encode_varint(1) +
+                 _encode_tag(2, 0) + _encode_varint(10) +
+                 _encode_tag(3, 2) + _encode_varint(2) + b"ok")
+    row_invalid = (_encode_tag(1, 0) + _encode_varint(2) +
+                   _encode_tag(2, 2) + _encode_varint(4) +
+                   _encode_tag(1, 0) + _encode_varint(999) +
+                   _encode_tag(2, 0) + _encode_varint(20) +
+                   _encode_tag(3, 2) + _encode_varint(3) + b"bad")
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame([(0, row_valid), (1, row_invalid)], schema="idx int, bin binary")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes,
+            options={"mode": "PERMISSIVE"})
+        return df.select(
+            f.col("idx"),
+            decoded.isNull().alias("decoded_is_null"),
+            decoded.getField("id").alias("id"),
+            decoded.getField("detail").getField("status").alias("status"),
+            decoded.getField("name").alias("name")).orderBy("idx")
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+def _build_nested_enum_default_struct_descriptor_set_bytes(spark):
+    """
+    Build a FileDescriptorSet for:
+      package test;
+      syntax = "proto2";
+      enum Language {
+        UNKNOWN_LANGUAGE = 0;
+        EN = 1;
+        ZH = 2;
+      }
+      enum CodeType {
+        UNKNOWN_CODE = 0;
+        UTF8 = 1;
+        GBK = 2;
+      }
+      message CommonWithEnumDefaults {
+        optional string logid = 1;
+        optional Language language = 2 [default = EN];
+        optional CodeType code_type = 3 [default = UTF8];
+      }
+      message OuterWithCommonEnumDefaults {
+        optional int32 id = 1;
+        optional CommonWithEnumDefaults common = 2;
+      }
+
+    Regression target:
+      In string mode, spark-protobuf surfaces enum defaults as EnumValueDescriptor.
+      GPU planning must not cast those defaults to Python/Scala String blindly.
+    """
+    D, fd = _new_proto2_file(spark, "nested_enum_defaults.proto")
+    label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
+
+    language_enum = D.EnumDescriptorProto.newBuilder().setName("Language")
+    language_enum.addValue(
+        D.EnumValueDescriptorProto.newBuilder()
+            .setName("UNKNOWN_LANGUAGE").setNumber(0).build())
+    language_enum.addValue(
+        D.EnumValueDescriptorProto.newBuilder()
+            .setName("EN").setNumber(1).build())
+    language_enum.addValue(
+        D.EnumValueDescriptorProto.newBuilder()
+            .setName("ZH").setNumber(2).build())
+    fd.addEnumType(language_enum.build())
+
+    code_enum = D.EnumDescriptorProto.newBuilder().setName("CodeType")
+    code_enum.addValue(
+        D.EnumValueDescriptorProto.newBuilder()
+            .setName("UNKNOWN_CODE").setNumber(0).build())
+    code_enum.addValue(
+        D.EnumValueDescriptorProto.newBuilder()
+            .setName("UTF8").setNumber(1).build())
+    code_enum.addValue(
+        D.EnumValueDescriptorProto.newBuilder()
+            .setName("GBK").setNumber(2).build())
+    fd.addEnumType(code_enum.build())
+
+    common_msg = D.DescriptorProto.newBuilder().setName("CommonWithEnumDefaults")
+    common_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("logid").setNumber(1).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_STRING).build())
+    common_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("language").setNumber(2).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_ENUM)
+            .setTypeName(".test.Language")
+            .setDefaultValue("EN").build())
+    common_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("code_type").setNumber(3).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_ENUM)
+            .setTypeName(".test.CodeType")
+            .setDefaultValue("UTF8").build())
+    fd.addMessageType(common_msg.build())
+
+    outer_msg = D.DescriptorProto.newBuilder().setName("OuterWithCommonEnumDefaults")
+    outer_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("id").setNumber(1).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_INT32).build())
+    outer_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("common").setNumber(2).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_MESSAGE)
+            .setTypeName(".test.CommonWithEnumDefaults").build())
+    fd.addMessageType(outer_msg.build())
+
+    fds = D.FileDescriptorSet.newBuilder().addFile(fd.build()).build()
+    return bytes(fds.toByteArray())
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_nested_enum_defaults_string_mode(spark_tmp_path, from_protobuf_fn):
+    """Regression test: nested enum defaults in string mode must not crash GPU planning.
+
+    Selecting the whole nested struct forces GPU planning to visit all of its children,
+    including enum fields whose proto2 defaults are represented as EnumValueDescriptor
+    objects by spark-protobuf.
+    """
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "nested_enum_defaults.desc",
+        _build_nested_enum_default_struct_descriptor_set_bytes)
+    message_name = "test.OuterWithCommonEnumDefaults"
+
+    common_with_logid = (_encode_tag(1, 2) + _encode_varint(5) + b"log-1")
+    row_logid_only = (_encode_tag(1, 0) + _encode_varint(1) +
+                      _encode_tag(2, 2) + _encode_varint(len(common_with_logid)) +
+                      common_with_logid)
+    row_empty_common = (_encode_tag(1, 0) + _encode_varint(2) +
+                        _encode_tag(2, 2) + _encode_varint(0))
+    row_no_common = _encode_tag(1, 0) + _encode_varint(3)
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(row_logid_only,), (row_empty_common,), (row_no_common,)],
+            schema="bin binary")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
+        return df.select(
+            decoded.getField("id").alias("id"),
+            decoded.getField("common").alias("common"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+def _build_repeated_enum_descriptor_set_bytes(spark):
+    """
+    message WithRepeatedEnum {
+        optional int32 id = 1;
+        repeated Priority priority = 2;
+        enum Priority { UNKNOWN = 0; FOO = 1; BAR = 2; }
+    }
+    """
+    D, fd = _new_proto2_file(spark, "repeated_enum.proto")
+    label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
+    label_rep = D.FieldDescriptorProto.Label.LABEL_REPEATED
+
+    msg = D.DescriptorProto.newBuilder().setName("WithRepeatedEnum")
+
+    enum_type = D.EnumDescriptorProto.newBuilder().setName("Priority")
+    enum_type.addValue(D.EnumValueDescriptorProto.newBuilder().setName("UNKNOWN").setNumber(0).build())
+    enum_type.addValue(D.EnumValueDescriptorProto.newBuilder().setName("FOO").setNumber(1).build())
+    enum_type.addValue(D.EnumValueDescriptorProto.newBuilder().setName("BAR").setNumber(2).build())
+    msg.addEnumType(enum_type.build())
+
+    msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("id").setNumber(1).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_INT32).build())
+    msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("priority").setNumber(2).setLabel(label_rep)
+            .setType(D.FieldDescriptorProto.Type.TYPE_ENUM)
+            .setTypeName(".test.WithRepeatedEnum.Priority").build())
+
+    fd.addMessageType(msg.build())
+    fds = D.FileDescriptorSet.newBuilder().addFile(fd.build()).build()
+    return bytes(fds.toByteArray())
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_repeated_enum_invalid_permissive(spark_tmp_path, from_protobuf_fn):
+    """Repeated enum with invalid values in PERMISSIVE mode.
+
+    Row with any invalid enum value should become null (entire struct row),
+    while rows with all-valid enum values decode normally.
+    """
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "repeated_enum.desc", _build_repeated_enum_descriptor_set_bytes)
+    message_name = "test.WithRepeatedEnum"
+
+    row1 = (_encode_tag(1, 0) + _encode_varint(1) +
+            _encode_tag(2, 0) + _encode_varint(0) +
+            _encode_tag(2, 0) + _encode_varint(1) +
+            _encode_tag(2, 0) + _encode_varint(2))
+    row2 = (_encode_tag(1, 0) + _encode_varint(2) +
+            _encode_tag(2, 0) + _encode_varint(1) +
+            _encode_tag(2, 0) + _encode_varint(99))
+    row3 = (_encode_tag(1, 0) + _encode_varint(3) +
+            _encode_tag(2, 0) + _encode_varint(0))
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(row1,), (row2,), (row3,)], schema="bin binary")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes,
+            options={"mode": "PERMISSIVE"})
+        return df.select(decoded.alias("decoded"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_repeated_enum_string_invalid_permissive_nulls_sibling_fields(
+        spark_tmp_path, from_protobuf_fn):
+    """Repeated enum string mode must null sibling fields when any enum value is invalid."""
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "repeated_enum.desc", _build_repeated_enum_descriptor_set_bytes)
+    message_name = "test.WithRepeatedEnum"
+
+    row_valid = (_encode_tag(1, 0) + _encode_varint(1) +
+                 _encode_tag(2, 0) + _encode_varint(0) +
+                 _encode_tag(2, 0) + _encode_varint(2))
+    row_invalid = (_encode_tag(1, 0) + _encode_varint(2) +
+                   _encode_tag(2, 0) + _encode_varint(1) +
+                   _encode_tag(2, 0) + _encode_varint(99))
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame([(0, row_valid), (1, row_invalid)], schema="idx int, bin binary")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes,
+            options={"mode": "PERMISSIVE"})
+        return df.select(
+            f.col("idx"),
+            decoded.isNull().alias("decoded_is_null"),
+            decoded.getField("id").alias("id"),
+            decoded.getField("priority").alias("priority")).orderBy("idx")
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+def _build_repeated_message_enum_descriptor_set_bytes(spark):
+    """
+    message ContainerWithPriorityItems {
+        optional int32 id = 1;
+        repeated ItemWithPriority items = 2;
+        optional string title = 3;
+    }
+    message ItemWithPriority {
+        optional Priority priority = 1;
+        optional int32 count = 2;
+    }
+    enum Priority { UNKNOWN = 0; FOO = 1; BAR = 2; }
+    """
+    D, fd = _new_proto2_file(spark, "repeated_message_enum.proto")
+    label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
+    label_rep = D.FieldDescriptorProto.Label.LABEL_REPEATED
+
+    item_msg = D.DescriptorProto.newBuilder().setName("ItemWithPriority")
+    enum_type = D.EnumDescriptorProto.newBuilder().setName("Priority")
+    enum_type.addValue(D.EnumValueDescriptorProto.newBuilder().setName("UNKNOWN").setNumber(0).build())
+    enum_type.addValue(D.EnumValueDescriptorProto.newBuilder().setName("FOO").setNumber(1).build())
+    enum_type.addValue(D.EnumValueDescriptorProto.newBuilder().setName("BAR").setNumber(2).build())
+    item_msg.addEnumType(enum_type.build())
+    item_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("priority").setNumber(1).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_ENUM)
+            .setTypeName(".test.ItemWithPriority.Priority").build())
+    item_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("count").setNumber(2).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_INT32).build())
+    fd.addMessageType(item_msg.build())
+
+    container_msg = D.DescriptorProto.newBuilder().setName("ContainerWithPriorityItems")
+    container_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("id").setNumber(1).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_INT32).build())
+    container_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("items").setNumber(2).setLabel(label_rep)
+            .setType(D.FieldDescriptorProto.Type.TYPE_MESSAGE)
+            .setTypeName(".test.ItemWithPriority").build())
+    container_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("title").setNumber(3).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_STRING).build())
+    fd.addMessageType(container_msg.build())
+
+    fds = D.FileDescriptorSet.newBuilder().addFile(fd.build()).build()
+    return bytes(fds.toByteArray())
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_repeated_message_child_enum_string(
+        spark_tmp_path, from_protobuf_fn):
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "repeated_message_enum.desc",
+        _build_repeated_message_enum_descriptor_set_bytes)
+    message_name = "test.ContainerWithPriorityItems"
+
+    item_foo = (_encode_tag(1, 0) + _encode_varint(1) +
+                _encode_tag(2, 0) + _encode_varint(10))
+    item_bar = (_encode_tag(1, 0) + _encode_varint(2) +
+                _encode_tag(2, 0) + _encode_varint(20))
+    row_with_items = (_encode_tag(1, 0) + _encode_varint(1) +
+                      _encode_tag(2, 2) + _encode_varint(len(item_foo)) + item_foo +
+                      _encode_tag(2, 2) + _encode_varint(len(item_bar)) + item_bar +
+                      _encode_tag(3, 2) + _encode_varint(5) + b"hello")
+    row_no_items = (_encode_tag(1, 0) + _encode_varint(2) +
+                    _encode_tag(3, 2) + _encode_varint(5) + b"empty")
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(row_with_items,), (row_no_items,), (None,)], schema="bin binary")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
+        return df.select(
+            decoded.getField("id").alias("id"),
+            decoded.getField("title").alias("title"),
+            decoded.getField("items").getField("priority").alias("priorities"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_repeated_message_child_enum_string_invalid_permissive(
+        spark_tmp_path, from_protobuf_fn):
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "repeated_message_enum.desc",
+        _build_repeated_message_enum_descriptor_set_bytes)
+    message_name = "test.ContainerWithPriorityItems"
+
+    item_valid = (_encode_tag(1, 0) + _encode_varint(1) +
+                  _encode_tag(2, 0) + _encode_varint(10))
+    item_invalid = (_encode_tag(1, 0) + _encode_varint(99) +
+                    _encode_tag(2, 0) + _encode_varint(20))
+    row_valid = (_encode_tag(1, 0) + _encode_varint(1) +
+                 _encode_tag(2, 2) + _encode_varint(len(item_valid)) + item_valid +
+                 _encode_tag(3, 2) + _encode_varint(2) + b"ok")
+    row_invalid = (_encode_tag(1, 0) + _encode_varint(2) +
+                   _encode_tag(2, 2) + _encode_varint(len(item_invalid)) + item_invalid +
+                   _encode_tag(3, 2) + _encode_varint(3) + b"bad")
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(0, row_valid), (1, row_invalid)], schema="idx int, bin binary")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes,
+            options={"mode": "PERMISSIVE"})
+        return df.select(
+            f.col("idx"),
+            decoded.isNull().alias("decoded_is_null"),
+            decoded.getField("id").alias("id"),
+            decoded.getField("title").alias("title"),
+            decoded.getField("items").getField("priority").getItem(0).alias("priority0")
+        )
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+def _build_nested_repeated_enum_descriptor_set_bytes(spark):
+    """
+    message OuterWithNestedRepeatedEnum {
+        optional int32 id = 1;
+        optional InnerWithRepeatedPriority inner = 2;
+        optional string name = 3;
+    }
+    message InnerWithRepeatedPriority {
+        repeated Priority priority = 1;
+        optional int32 count = 2;
+    }
+    enum Priority { UNKNOWN = 0; FOO = 1; BAR = 2; }
+    """
+    D, fd = _new_proto2_file(spark, "nested_repeated_enum.proto")
+    label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
+    label_rep = D.FieldDescriptorProto.Label.LABEL_REPEATED
+
+    inner_msg = D.DescriptorProto.newBuilder().setName("InnerWithRepeatedPriority")
+    enum_type = D.EnumDescriptorProto.newBuilder().setName("Priority")
+    enum_type.addValue(D.EnumValueDescriptorProto.newBuilder().setName("UNKNOWN").setNumber(0).build())
+    enum_type.addValue(D.EnumValueDescriptorProto.newBuilder().setName("FOO").setNumber(1).build())
+    enum_type.addValue(D.EnumValueDescriptorProto.newBuilder().setName("BAR").setNumber(2).build())
+    inner_msg.addEnumType(enum_type.build())
+    inner_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("priority").setNumber(1).setLabel(label_rep)
+            .setType(D.FieldDescriptorProto.Type.TYPE_ENUM)
+            .setTypeName(".test.InnerWithRepeatedPriority.Priority").build())
+    inner_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("count").setNumber(2).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_INT32).build())
+    fd.addMessageType(inner_msg.build())
+
+    outer_msg = D.DescriptorProto.newBuilder().setName("OuterWithNestedRepeatedEnum")
+    outer_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("id").setNumber(1).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_INT32).build())
+    outer_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("inner").setNumber(2).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_MESSAGE)
+            .setTypeName(".test.InnerWithRepeatedPriority").build())
+    outer_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("name").setNumber(3).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_STRING).build())
+    fd.addMessageType(outer_msg.build())
+
+    fds = D.FileDescriptorSet.newBuilder().addFile(fd.build()).build()
+    return bytes(fds.toByteArray())
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_nested_repeated_enum_string(
+        spark_tmp_path, from_protobuf_fn):
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "nested_repeated_enum.desc",
+        _build_nested_repeated_enum_descriptor_set_bytes)
+    message_name = "test.OuterWithNestedRepeatedEnum"
+
+    inner = (_encode_tag(1, 0) + _encode_varint(0) +
+             _encode_tag(1, 0) + _encode_varint(2) +
+             _encode_tag(1, 0) + _encode_varint(1) +
+             _encode_tag(2, 0) + _encode_varint(7))
+    row_with_inner = (_encode_tag(1, 0) + _encode_varint(1) +
+                      _encode_tag(2, 2) + _encode_varint(len(inner)) + inner +
+                      _encode_tag(3, 2) + _encode_varint(5) + b"hello")
+    row_no_inner = (_encode_tag(1, 0) + _encode_varint(2) +
+                    _encode_tag(3, 2) + _encode_varint(4) + b"none")
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(row_with_inner,), (row_no_inner,), (None,)], schema="bin binary")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
+        return df.select(
+            decoded.getField("id").alias("id"),
+            decoded.getField("name").alias("name"),
+            decoded.getField("inner").getField("priority").alias("priorities"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_nested_repeated_enum_string_invalid_permissive(
+        spark_tmp_path, from_protobuf_fn):
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "nested_repeated_enum.desc",
+        _build_nested_repeated_enum_descriptor_set_bytes)
+    message_name = "test.OuterWithNestedRepeatedEnum"
+
+    inner_valid = (_encode_tag(1, 0) + _encode_varint(1) +
+                   _encode_tag(1, 0) + _encode_varint(2) +
+                   _encode_tag(2, 0) + _encode_varint(7))
+    inner_invalid = (_encode_tag(1, 0) + _encode_varint(1) +
+                     _encode_tag(1, 0) + _encode_varint(99) +
+                     _encode_tag(2, 0) + _encode_varint(9))
+    row_valid = (_encode_tag(1, 0) + _encode_varint(1) +
+                 _encode_tag(2, 2) + _encode_varint(len(inner_valid)) + inner_valid +
+                 _encode_tag(3, 2) + _encode_varint(2) + b"ok")
+    row_invalid = (_encode_tag(1, 0) + _encode_varint(2) +
+                   _encode_tag(2, 2) + _encode_varint(len(inner_invalid)) + inner_invalid +
+                   _encode_tag(3, 2) + _encode_varint(3) + b"bad")
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(0, row_valid), (1, row_invalid)], schema="idx int, bin binary")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes,
+            options={"mode": "PERMISSIVE"})
+        return df.select(
+            f.col("idx"),
+            decoded.isNull().alias("decoded_is_null"),
+            decoded.getField("id").alias("id"),
+            decoded.getField("name").alias("name"),
+            decoded.getField("inner").getField("priority").getItem(0).alias("priority0"),
+            decoded.getField("inner").getField("priority").getItem(1).alias("priority1")
+        )
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
 def _build_required_field_descriptor_set_bytes(spark):
     """
     Build a FileDescriptorSet for a message with required fields (proto2):
@@ -957,6 +1515,25 @@ def test_from_protobuf_required_field_present(spark_tmp_path, from_protobuf_fn):
         )
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_required_field_missing_failfast(spark_tmp_path, from_protobuf_fn):
+    """Required-field violations should fail consistently on CPU and GPU in FAILFAST mode."""
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "required.desc", _build_required_field_descriptor_set_bytes)
+    message_name = "test.WithRequired"
+
+    missing_required_row = _encode_tag(2, 2) + _encode_varint(4) + b"oops"
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame([(missing_required_row,)], schema="bin binary")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
+        return df.select(decoded.alias("decoded")).collect()
+
+    assert_gpu_and_cpu_error(run_on_spark, conf={}, error_message="Malformed")
 
 
 def _build_default_value_descriptor_set_bytes(spark):
@@ -1446,6 +2023,39 @@ def test_from_protobuf_nested_message_field_access(spark_tmp_path, from_protobuf
         )
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_nested_message_field_access_with_batch_merge(
+        spark_tmp_path, from_protobuf_fn):
+    """
+    Same as nested field access, but with protobuf post-project batch merge enabled.
+    This protects correctness when schema-projected protobuf output is coalesced.
+    """
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "nested.desc", _build_nested_descriptor_set_bytes)
+    message_name = "test.WithNested"
+
+    data_gen = ProtobufMessageGen([
+        PbScalar("simple_int", 1, IntegerGen()),
+        PbScalar("simple_str", 2, StringGen(nullable=True)),
+        PbNested("nested_msg", 3, [PbScalar("x", 1, IntegerGen())]),
+        PbScalar("simple_long", 4, LongGen()),
+    ])
+
+    def run_on_spark(spark):
+        df = gen_df(spark, data_gen)
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
+        return df.select(
+            decoded.getField("simple_int").alias("simple_int"),
+            decoded.getField("nested_msg").getField("x").alias("nested_x"),
+        )
+
+    assert_gpu_and_cpu_are_equal_collect(
+        run_on_spark,
+        conf={"spark.rapids.sql.protobuf.batchMergeAfterProject.enabled": "true"})
 
 
 def _build_deep_nested_descriptor_set_bytes(spark):
@@ -2304,6 +2914,126 @@ def _get_field_by_path(expr, path):
     return current
 
 
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_projection_across_alias_project_boundary(
+        spark_tmp_path, from_protobuf_fn):
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "schema_proj_alias.desc",
+        _build_schema_projection_descriptor_set_bytes)
+    message_name = "test.SchemaProj"
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame([(row,) for row in _schema_proj_test_data], schema="bin binary")
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
+        aliased = df.select(decoded.alias("decoded"))
+        return aliased.select(
+            f.col("decoded").getField("detail").getField("a").alias("detail_a"),
+            f.col("decoded").getField("id").alias("id"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_projection_across_withcolumn_boundary(
+        spark_tmp_path, from_protobuf_fn):
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "schema_proj_withcolumn.desc",
+        _build_schema_projection_descriptor_set_bytes)
+    message_name = "test.SchemaProj"
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame([(row,) for row in _schema_proj_test_data], schema="bin binary")
+        with_decoded = df.withColumn(
+            "decoded",
+            _call_from_protobuf(from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes))
+        return with_decoded.select(
+            f.col("decoded").getField("items").getField("a").alias("items_a"),
+            f.col("decoded").getField("id").alias("id"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+def _build_dual_message_projection_descriptor_set_bytes(spark):
+    """
+    message BytesView {
+        optional int32 status = 1;
+        optional bytes payload = 2;
+    }
+    message NestedPayload {
+        optional int32 count = 1;
+    }
+    message NestedView {
+        optional int32 status = 1;
+        optional NestedPayload payload = 2;
+    }
+    """
+    D, fd = _new_proto2_file(spark, "dual_projection.proto")
+    label_opt = D.FieldDescriptorProto.Label.LABEL_OPTIONAL
+
+    nested_msg = D.DescriptorProto.newBuilder().setName("NestedPayload")
+    nested_msg.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("count").setNumber(1).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_INT32).build())
+    fd.addMessageType(nested_msg.build())
+
+    bytes_view = D.DescriptorProto.newBuilder().setName("BytesView")
+    bytes_view.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("status").setNumber(1).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_INT32).build())
+    bytes_view.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("payload").setNumber(2).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_BYTES).build())
+    fd.addMessageType(bytes_view.build())
+
+    nested_view = D.DescriptorProto.newBuilder().setName("NestedView")
+    nested_view.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("status").setNumber(1).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_INT32).build())
+    nested_view.addField(
+        D.FieldDescriptorProto.newBuilder()
+            .setName("payload").setNumber(2).setLabel(label_opt)
+            .setType(D.FieldDescriptorProto.Type.TYPE_MESSAGE)
+            .setTypeName(".test.NestedPayload").build())
+    fd.addMessageType(nested_view.build())
+
+    fds = D.FileDescriptorSet.newBuilder().addFile(fd.build()).build()
+    return bytes(fds.toByteArray())
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_different_messages_same_binary_column_do_not_interfere(
+        spark_tmp_path, from_protobuf_fn):
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "dual_projection.desc",
+        _build_dual_message_projection_descriptor_set_bytes)
+
+    payload_keep = _encode_tag(1, 0) + _encode_varint(7)
+    payload_drop = _encode_tag(1, 0) + _encode_varint(9)
+    row_keep = (_encode_tag(1, 0) + _encode_varint(1) +
+                _encode_tag(2, 2) + _encode_varint(len(payload_keep)) + payload_keep)
+    row_drop = (_encode_tag(1, 0) + _encode_varint(0) +
+                _encode_tag(2, 2) + _encode_varint(len(payload_drop)) + payload_drop)
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame([(row_keep,), (row_drop,)], schema="bin binary")
+        bytes_view = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), "test.BytesView", desc_path, desc_bytes)
+        nested_view = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), "test.NestedView", desc_path, desc_bytes)
+        return df.filter(bytes_view.getField("status") == 1).select(
+            nested_view.getField("payload").getField("count").alias("payload_count"))
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
 def _build_deep_nested_5_level_descriptor_set_bytes(spark):
     """
     Build a FileDescriptorSet for 5-level deep nesting:
@@ -2710,16 +3440,16 @@ def _encode_tag(field_number, wire_type):
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
 def test_from_protobuf_bool_noncanonical_varint_scalar(spark_tmp_path, from_protobuf_fn):
-    """Scalar bool field encoded as varint 256 should decode as true, not false."""
+    """Regression test: scalar bool encoded as non-canonical varint (e.g. 256) must decode as true.
+
+    Protobuf allows any non-zero varint for bool true. The GPU decoder previously
+    truncated to uint8_t, causing values >= 256 to wrap to 0 (false).
+    """
     desc_path, desc_bytes = _setup_protobuf_desc(
         spark_tmp_path, "simple_bool_bug.desc", _build_simple_descriptor_set_bytes)
     message_name = "test.Simple"
 
-    # Hand-craft protobuf wire bytes:
-    #   field 1 (bool b): tag = (1<<3)|0 = 0x08, value = varint(256) = 0x80 0x02
-    #   field 2 (int32 i32): tag = (2<<3)|0 = 0x10, value = varint(99) = 0x63
-    # Varint 256 is a perfectly valid encoding; CPU reads it as true.
-    # GPU truncates uint8_t(256) = 0 → false.
+    # varint(256) = 0x80 0x02, varint(512) = 0x80 0x04 — valid non-canonical bool true
     row_bool_256 = _encode_tag(1, 0) + _encode_varint(256) + \
                    _encode_tag(2, 0) + _encode_varint(99)
 
@@ -2727,7 +3457,7 @@ def test_from_protobuf_bool_noncanonical_varint_scalar(spark_tmp_path, from_prot
     row_bool_1 = _encode_tag(1, 0) + _encode_varint(1) + \
                  _encode_tag(2, 0) + _encode_varint(100)
 
-    # Another problematic value: 512 → uint8_t(0) → false
+    # Another non-canonical value: varint(512)
     row_bool_512 = _encode_tag(1, 0) + _encode_varint(512) + \
                    _encode_tag(2, 0) + _encode_varint(101)
 
@@ -2773,15 +3503,16 @@ def _build_repeated_bool_descriptor_set_bytes(spark):
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
 def test_from_protobuf_bool_noncanonical_varint_repeated(spark_tmp_path, from_protobuf_fn):
-    """Repeated bool with non-canonical varint values (256, 512) should all decode as true."""
+    """Regression test: repeated bool with non-canonical varint values must all decode as true.
+
+    Same uint8_t truncation issue as the scalar case, exercised with repeated fields.
+    """
     desc_path, desc_bytes = _setup_protobuf_desc(
         spark_tmp_path, "repeated_bool_bug.desc", _build_repeated_bool_descriptor_set_bytes)
     message_name = "test.WithRepeatedBool"
 
     # Repeated bool field 2 (wire type 0 = varint), unpacked.
-    # Three elements: varint(256), varint(1), varint(512)
-    # CPU: [true, true, true]
-    # GPU (buggy): [false, true, false]  — because uint8(256)=0, uint8(512)=0
+    # Three elements: varint(256), varint(1), varint(512) — all should decode as true.
     row = (_encode_tag(1, 0) + _encode_varint(42) +
            _encode_tag(2, 0) + _encode_varint(256) +
            _encode_tag(2, 0) + _encode_varint(1) +
@@ -2800,15 +3531,7 @@ def test_from_protobuf_bool_noncanonical_varint_repeated(spark_tmp_path, from_pr
 
 
 # ---------------------------------------------------------------------------
-# Bug 2: Nested message child field default values are lost
-#
-# In ProtobufExprShims.scala, addChildFieldsFromStruct always sets
-# defaultValue = None for nested children, even when hasDefaultValue = true.
-# This means proto2 defaults for fields inside nested messages are never
-# passed to the GPU decoder.
-#
-# CPU: missing child field → proto2 default value
-# GPU: missing child field → null
+# Regression guard: nested message child field default values
 # ---------------------------------------------------------------------------
 
 def _build_nested_with_defaults_descriptor_set_bytes(spark):
@@ -2863,12 +3586,10 @@ def _build_nested_with_defaults_descriptor_set_bytes(spark):
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
 def test_from_protobuf_nested_child_default_values(spark_tmp_path, from_protobuf_fn):
-    """Proto2 default values for fields inside nested messages must be honored.
+    """Regression test: proto2 default values for fields inside nested messages must be honored.
 
-    When `inner` is present but its child fields are absent, the CPU decoder
-    returns the proto2 defaults (count=42, label="hello", flag=true).
-    The GPU decoder currently returns null for all three because
-    defaultValue is never populated for nested children.
+    When `inner` is present but its child fields are absent, the decoder must
+    return the proto2 defaults (count=42, label="hello", flag=true), not null.
     """
     desc_path, desc_bytes = _setup_protobuf_desc(
         spark_tmp_path, "nested_defaults.desc",
@@ -3039,6 +3760,90 @@ def test_deep_pruning_whole_struct_at_depth_3(spark_tmp_path, from_protobuf_fn):
             from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
         return df.select(
             decoded.getField("level2").getField("level3").alias("level3"),
+        )
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+# ===========================================================================
+# FAILFAST mode tests
+# ===========================================================================
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+def test_from_protobuf_failfast_malformed_data(spark_tmp_path, from_protobuf_fn):
+    """FAILFAST mode should throw on malformed protobuf data (both CPU and GPU)."""
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "failfast.desc", _build_simple_descriptor_set_bytes)
+    message_name = "test.Simple"
+
+    # Craft a valid row and a malformed row (truncated varint with continuation bit)
+    valid_row = _encode_tag(1, 0) + _encode_varint(1) + \
+                _encode_tag(2, 0) + _encode_varint(42)
+    malformed_row = bytes([0x08, 0x80])  # field 1, varint, but only continuation byte -- no end
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(valid_row,), (malformed_row,)],
+            schema="bin binary",
+        )
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes,
+            options={"mode": "FAILFAST"})
+        # Must call .collect() so the exception surfaces inside with_*_session
+        return df.select(decoded.getField("b").alias("b")).collect()
+
+    assert_gpu_and_cpu_error(run_on_spark, {}, "Malformed")
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_permissive_malformed_returns_null(spark_tmp_path, from_protobuf_fn):
+    """PERMISSIVE mode should return null for malformed rows, not throw.
+
+    Note: Spark's from_protobuf defaults to FAILFAST (unlike JSON/CSV which
+    default to PERMISSIVE), so mode must be set explicitly.
+    """
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "permissive.desc", _build_simple_descriptor_set_bytes)
+    message_name = "test.Simple"
+
+    valid_row = _encode_tag(2, 0) + _encode_varint(99)
+    malformed_row = bytes([0x08, 0x80])  # truncated varint
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(valid_row,), (malformed_row,)],
+            schema="bin binary",
+        )
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes,
+            options={"mode": "PERMISSIVE"})
+        return df.select(
+            decoded.getField("i32").alias("i32"),
+        )
+
+    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
+@ignore_order(local=True)
+def test_from_protobuf_all_null_input(spark_tmp_path, from_protobuf_fn):
+    """All rows in the input binary column are null (not empty bytes, actual nulls).
+    GPU should produce all-null struct rows matching CPU behavior."""
+    desc_path, desc_bytes = _setup_protobuf_desc(
+        spark_tmp_path, "allnull.desc", _build_simple_descriptor_set_bytes)
+    message_name = "test.Simple"
+
+    def run_on_spark(spark):
+        df = spark.createDataFrame(
+            [(None,), (None,), (None,)],
+            schema="bin binary",
+        )
+        decoded = _call_from_protobuf(
+            from_protobuf_fn, f.col("bin"), message_name, desc_path, desc_bytes)
+        return df.select(
+            decoded.getField("i32").alias("i32"),
+            decoded.getField("s").alias("s"),
         )
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)

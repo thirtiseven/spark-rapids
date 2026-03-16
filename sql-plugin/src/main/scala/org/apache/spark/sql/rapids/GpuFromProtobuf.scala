@@ -16,6 +16,8 @@
 
 package org.apache.spark.sql.rapids
 
+import java.util.Arrays
+
 import ai.rapids.cudf
 import ai.rapids.cudf.{BinaryOp, CudfException, DType}
 import com.nvidia.spark.rapids.{GpuColumnVector, GpuUnaryExpression}
@@ -23,6 +25,7 @@ import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.jni.{Protobuf, ProtobufSchemaDescriptor}
 import com.nvidia.spark.rapids.shims.NullIntolerantShim
 
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{ExpectsInputTypes, Expression}
 import org.apache.spark.sql.types._
 
@@ -36,13 +39,15 @@ import org.apache.spark.sql.types._
  * indices pointing to their containing message field. For pure scalar schemas, all fields
  * are top-level (parentIndices == -1, depthLevels == 0, isRepeated == false).
  *
- * Schema projection is supported: only fields in `decodedTopLevelIndices` are decoded by
- * the GPU. Fields not in this array will be filled with null columns in post-processing
- * to ensure the output matches `fullSchema`.
+ * Schema projection is supported: `decodedSchema` contains only the top-level fields and
+ * nested children that are actually referenced by downstream operators. Downstream
+ * `GetStructField` and `GetArrayStructFields` nodes have their ordinals rewritten via
+ * `PRUNED_ORDINAL_TAG` to index into the pruned schema. Unreferenced fields are never
+ * accessed, so no null-column filling is needed.
  *
- * @param fullSchema The complete output schema (must match the original expression's dataType)
- * @param decodedTopLevelIndices Indices in fullSchema for top-level fields decoded by GPU.
- *                               Must be sorted in ascending order.
+ * @param decodedSchema The pruned schema containing only the fields decoded by the GPU.
+ *                      Only fields referenced by downstream operators are included;
+ *                      ordinal remapping ensures correct field access into the pruned output.
  * @param fieldNumbers Protobuf field numbers for all fields in flattened schema
  * @param parentIndices Parent indices for all fields (-1 for top-level)
  * @param depthLevels Nesting depth for all fields (0 for top-level)
@@ -58,13 +63,9 @@ import org.apache.spark.sql.types._
  * @param defaultStrings Default string/bytes values
  * @param enumValidValues Valid enum values for each field
  * @param enumNames Enum value names for enum-as-string fields. Parallel to enumValidValues.
- * @param nestedPrunedFields For nested schema projection: maps top-level field name to the
- *                           ordered list of decoded child field names. Only present for fields
- *                           where children were pruned. If empty map, no nested pruning.
  * @param failOnErrors If true, throw exception on malformed data
  */
 case class GpuFromProtobuf(
-    fullSchema: StructType,
     decodedSchema: StructType,
     fieldNumbers: Array[Int],
     parentIndices: Array[Int],
@@ -83,7 +84,7 @@ case class GpuFromProtobuf(
     enumNames: Array[Array[Array[Byte]]],
     failOnErrors: Boolean,
     child: Expression)
-  extends GpuUnaryExpression with ExpectsInputTypes with NullIntolerantShim {
+  extends GpuUnaryExpression with ExpectsInputTypes with NullIntolerantShim with Logging {
 
   override def inputTypes: Seq[AbstractDataType] = Seq(BinaryType)
 
@@ -91,17 +92,67 @@ case class GpuFromProtobuf(
 
   override def nullable: Boolean = true
 
-  @transient private lazy val schema = new ProtobufSchemaDescriptor(
+  override def equals(other: Any): Boolean = other match {
+    case that: GpuFromProtobuf =>
+      decodedSchema == that.decodedSchema &&
+        Arrays.equals(fieldNumbers, that.fieldNumbers) &&
+        Arrays.equals(parentIndices, that.parentIndices) &&
+        Arrays.equals(depthLevels, that.depthLevels) &&
+        Arrays.equals(wireTypes, that.wireTypes) &&
+        Arrays.equals(outputTypeIds, that.outputTypeIds) &&
+        Arrays.equals(encodings, that.encodings) &&
+        Arrays.equals(isRepeated, that.isRepeated) &&
+        Arrays.equals(isRequired, that.isRequired) &&
+        Arrays.equals(hasDefaultValue, that.hasDefaultValue) &&
+        Arrays.equals(defaultInts, that.defaultInts) &&
+        Arrays.equals(defaultFloats, that.defaultFloats) &&
+        Arrays.equals(defaultBools, that.defaultBools) &&
+        GpuFromProtobuf.deepEquals(defaultStrings, that.defaultStrings) &&
+        GpuFromProtobuf.deepEquals(enumValidValues, that.enumValidValues) &&
+        GpuFromProtobuf.deepEquals(enumNames, that.enumNames) &&
+        failOnErrors == that.failOnErrors &&
+        child == that.child
+    case _ => false
+  }
+
+  override def hashCode(): Int = {
+    var result = decodedSchema.hashCode()
+    result = 31 * result + Arrays.hashCode(fieldNumbers)
+    result = 31 * result + Arrays.hashCode(parentIndices)
+    result = 31 * result + Arrays.hashCode(depthLevels)
+    result = 31 * result + Arrays.hashCode(wireTypes)
+    result = 31 * result + Arrays.hashCode(outputTypeIds)
+    result = 31 * result + Arrays.hashCode(encodings)
+    result = 31 * result + Arrays.hashCode(isRepeated)
+    result = 31 * result + Arrays.hashCode(isRequired)
+    result = 31 * result + Arrays.hashCode(hasDefaultValue)
+    result = 31 * result + Arrays.hashCode(defaultInts)
+    result = 31 * result + Arrays.hashCode(defaultFloats)
+    result = 31 * result + Arrays.hashCode(defaultBools)
+    result = 31 * result + GpuFromProtobuf.deepHashCode(defaultStrings)
+    result = 31 * result + GpuFromProtobuf.deepHashCode(enumValidValues)
+    result = 31 * result + GpuFromProtobuf.deepHashCode(enumNames)
+    result = 31 * result + failOnErrors.hashCode()
+    result = 31 * result + child.hashCode()
+    result
+  }
+
+  // ProtobufSchemaDescriptor is a pure-Java immutable holder for validated schema arrays.
+  // It does not own native resources, so task-scoped close hooks are not required here.
+  @transient private lazy val protobufSchema = new ProtobufSchemaDescriptor(
     fieldNumbers, parentIndices, depthLevels, wireTypes, outputTypeIds, encodings,
     isRepeated, isRequired, hasDefaultValue, defaultInts, defaultFloats, defaultBools,
     defaultStrings, enumValidValues, enumNames)
 
   override protected def doColumnar(input: GpuColumnVector): cudf.ColumnVector = {
     val jniResult = try {
-      Protobuf.decodeToStruct(input.getBase, schema, failOnErrors)
+      Protobuf.decodeToStruct(input.getBase, protobufSchema, failOnErrors)
     } catch {
       case e: CudfException if failOnErrors =>
         throw new org.apache.spark.SparkException("Malformed protobuf message", e)
+      case e: CudfException =>
+        logWarning(s"Unexpected CudfException in PERMISSIVE mode: ${e.getMessage}", e)
+        throw e
     }
 
     // Apply input nulls to output
@@ -143,4 +194,10 @@ object GpuFromProtobuf {
    * Check if a Spark DataType is supported by the GPU protobuf decoder.
    */
   def isTypeSupported(dt: DataType): Boolean = sparkTypeToCudfIdOpt(dt).isDefined
+
+  private def deepEquals[T](left: Array[T], right: Array[T]): Boolean =
+    Arrays.deepEquals(left.asInstanceOf[Array[Object]], right.asInstanceOf[Array[Object]])
+
+  private def deepHashCode[T](arr: Array[T]): Int =
+    Arrays.deepHashCode(arr.asInstanceOf[Array[Object]])
 }

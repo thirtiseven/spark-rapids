@@ -159,7 +159,7 @@ else
         if [[ ! -f "$PROTOBUF_JAR_PATH" ]]; then
             echo "Downloading spark-protobuf jar..."
             PROTOBUF_MAVEN_URL="https://repo1.maven.org/maven2/org/apache/spark/spark-protobuf_${SCALA_VERSION}/${VERSION_STRING}/${PROTOBUF_JAR_NAME}"
-            if curl -sL -o "$PROTOBUF_JAR_PATH" "$PROTOBUF_MAVEN_URL"; then
+            if curl -fsL -o "$PROTOBUF_JAR_PATH" "$PROTOBUF_MAVEN_URL"; then
                 echo "Downloaded spark-protobuf jar to $PROTOBUF_JAR_PATH"
             else
                 echo "WARNING: Failed to download spark-protobuf jar from $PROTOBUF_MAVEN_URL"
@@ -167,16 +167,30 @@ else
             fi
         fi
         
-        # Also download protobuf-java jar (required dependency)
-        # Spark 3.5.x uses protobuf-java 3.25.1
-        PROTOBUF_JAVA_VERSION="3.25.1"
+        # Also download protobuf-java jar (required dependency).
+        # Detect version from the jar bundled with Spark, fall back to version mapping.
+        PROTOBUF_JAVA_VERSION=""
+        BUNDLED_PB_JAR=$(ls "$SPARK_HOME"/jars/protobuf-java-[0-9]*.jar 2>/dev/null | sort -V | tail -1)
+        if [[ -n "$BUNDLED_PB_JAR" ]]; then
+            PROTOBUF_JAVA_VERSION=$(basename "$BUNDLED_PB_JAR" | sed 's/protobuf-java-\(.*\)\.jar/\1/')
+            echo "Detected protobuf-java version $PROTOBUF_JAVA_VERSION from SPARK_HOME"
+        fi
+        if [[ -z "$PROTOBUF_JAVA_VERSION" ]]; then
+            case "$VERSION_STRING" in
+                3.4.*) PROTOBUF_JAVA_VERSION="3.25.1" ;;
+                3.5.*) PROTOBUF_JAVA_VERSION="3.25.1" ;;
+                4.0.*|4.1.*) PROTOBUF_JAVA_VERSION="4.29.3" ;;
+                *)     PROTOBUF_JAVA_VERSION="3.25.1" ;;
+            esac
+            echo "Using protobuf-java version $PROTOBUF_JAVA_VERSION based on Spark $VERSION_STRING"
+        fi
         PROTOBUF_JAVA_JAR_NAME="protobuf-java-${PROTOBUF_JAVA_VERSION}.jar"
         PROTOBUF_JAVA_JAR_PATH="${TARGET_DIR}/dependency/${PROTOBUF_JAVA_JAR_NAME}"
         
         if [[ ! -f "$PROTOBUF_JAVA_JAR_PATH" ]]; then
             echo "Downloading protobuf-java jar..."
             PROTOBUF_JAVA_MAVEN_URL="https://repo1.maven.org/maven2/com/google/protobuf/protobuf-java/${PROTOBUF_JAVA_VERSION}/${PROTOBUF_JAVA_JAR_NAME}"
-            if curl -sL -o "$PROTOBUF_JAVA_JAR_PATH" "$PROTOBUF_JAVA_MAVEN_URL"; then
+            if curl -fsL -o "$PROTOBUF_JAVA_JAR_PATH" "$PROTOBUF_JAVA_MAVEN_URL"; then
                 echo "Downloaded protobuf-java jar to $PROTOBUF_JAVA_JAR_PATH"
             else
                 echo "WARNING: Failed to download protobuf-java jar from $PROTOBUF_JAVA_MAVEN_URL"
@@ -184,23 +198,42 @@ else
             fi
         fi
         
+        SPARK_PROTOBUF_JAR_AVAILABLE=false
+        PROTOBUF_JAVA_AVAILABLE=false
+
         if [[ -f "$PROTOBUF_JAR_PATH" ]]; then
             PROTOBUF_JARS="$PROTOBUF_JAR_PATH"
             echo "Including spark-protobuf jar: $PROTOBUF_JAR_PATH"
+            SPARK_PROTOBUF_JAR_AVAILABLE=true
         fi
         if [[ -f "$PROTOBUF_JAVA_JAR_PATH" ]]; then
-            PROTOBUF_JARS="$PROTOBUF_JARS $PROTOBUF_JAVA_JAR_PATH"
+            PROTOBUF_JARS="${PROTOBUF_JARS:+$PROTOBUF_JARS }$PROTOBUF_JAVA_JAR_PATH"
             echo "Including protobuf-java jar: $PROTOBUF_JAVA_JAR_PATH"
+            PROTOBUF_JAVA_AVAILABLE=true
+        elif [[ -n "$BUNDLED_PB_JAR" ]]; then
+            echo "Using bundled protobuf-java jar from SPARK_HOME: $BUNDLED_PB_JAR"
+            PROTOBUF_JAVA_AVAILABLE=true
+        fi
+
+        if [[ "$SPARK_PROTOBUF_JAR_AVAILABLE" == "true" && \
+              "$PROTOBUF_JAVA_AVAILABLE" == "true" ]]; then
+            export PROTOBUF_JARS_AVAILABLE=true
+        else
+            echo "WARNING: Protobuf JAR dependencies incomplete; protobuf tests will be skipped"
+            echo "  spark-protobuf available: $SPARK_PROTOBUF_JAR_AVAILABLE"
+            echo "  protobuf-java available: $PROTOBUF_JAVA_AVAILABLE"
+            export PROTOBUF_JARS_AVAILABLE=false
         fi
         # Also add protobuf jars to driver classpath for Class.forName() to work
         # This is needed because --jars only adds to executor classpath
         if [[ -n "$PROTOBUF_JARS" ]]; then
-            PROTOBUF_DRIVER_CP=$(echo $PROTOBUF_JARS | tr ' ' ':')
+            PROTOBUF_DRIVER_CP=$(echo "$PROTOBUF_JARS" | tr ' ' ':')
             export PYSP_TEST_spark_driver_extraClassPath="${PYSP_TEST_spark_driver_extraClassPath:+${PYSP_TEST_spark_driver_extraClassPath}:}${PROTOBUF_DRIVER_CP}"
             echo "Added protobuf jars to driver classpath"
         fi
     else
         export INCLUDE_SPARK_PROTOBUF_JAR=false
+        export PROTOBUF_JARS_AVAILABLE=false
     fi
 
     # ALL_JARS includes dist.jar integration-test.jar avro.jar parquet.jar protobuf.jar if they exist

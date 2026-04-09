@@ -19,9 +19,8 @@ package org.apache.spark.sql.rapids
 import java.util.Arrays
 
 import ai.rapids.cudf
-import ai.rapids.cudf.{CudfException, DType}
+import ai.rapids.cudf.{CudfException, DType, ProtobufSchemaDescriptor}
 import com.nvidia.spark.rapids.{GpuColumnVector, GpuUnaryExpression}
-import com.nvidia.spark.rapids.jni.{Protobuf, ProtobufSchemaDescriptor}
 import com.nvidia.spark.rapids.shims.NullIntolerantShim
 
 import org.apache.spark.internal.Logging
@@ -147,7 +146,7 @@ case class GpuFromProtobuf(
     // Input null mask is propagated to the output struct by the C++ decoder,
     // so no mergeAndSetValidity call is needed here.
     try {
-      Protobuf.decodeToStruct(input.getBase, protobufSchema, failOnErrors)
+      input.getBase.decodeProtobuf(protobufSchema, failOnErrors)
     } catch {
       case e: CudfException if failOnErrors =>
         throw new org.apache.spark.SparkException("Malformed protobuf message", e)

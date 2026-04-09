@@ -18,7 +18,7 @@ package org.apache.spark.sql.rapids.protobuf
 
 import scala.collection.mutable
 
-import com.nvidia.spark.rapids.jni.Protobuf.{WT_32BIT, WT_64BIT, WT_LEN, WT_VARINT}
+import ai.rapids.cudf.ProtobufSchemaDescriptor.{WT_32BIT, WT_64BIT, WT_LEN, WT_VARINT}
 
 import org.apache.spark.sql.rapids.GpuFromProtobuf
 import org.apache.spark.sql.types._

@@ -39,6 +39,7 @@
 {"spark": "357"}
 {"spark": "358"}
 {"spark": "400"}
+{"spark": "400db173"}
 {"spark": "401"}
 {"spark": "402"}
 {"spark": "411"}
@@ -46,6 +47,7 @@ spark-rapids-shim-json-lines ***/
 package com.nvidia.spark.rapids.shims
 
 import com.nvidia.spark.rapids._
+import com.nvidia.spark.rapids.jni.BloomFilter
 
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
@@ -80,7 +82,9 @@ object BloomFilterShims {
             GpuBloomFilterAggregate(
               childExprs.head.convertToGpu(),
               a.estimatedNumItemsExpression.eval().asInstanceOf[Number].longValue,
-              a.numBitsExpression.eval().asInstanceOf[Number].longValue)
+              a.numBitsExpression.eval().asInstanceOf[Number].longValue,
+              BloomFilterConstantsShims.BLOOM_FILTER_FORMAT_VERSION,
+              BloomFilter.DEFAULT_SEED)
           }
         })
     ).map(r => (r.getClassFor.asSubclass(classOf[Expression]), r)).toMap

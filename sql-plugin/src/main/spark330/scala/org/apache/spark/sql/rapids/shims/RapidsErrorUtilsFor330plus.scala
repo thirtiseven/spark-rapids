@@ -39,6 +39,7 @@
 {"spark": "357"}
 {"spark": "358"}
 {"spark": "400"}
+{"spark": "400db173"}
 {"spark": "401"}
 {"spark": "402"}
 {"spark": "411"}
@@ -61,6 +62,12 @@ trait RapidsErrorUtilsFor330plus {
 
   def divOverflowError(origin: Origin): ArithmeticException = {
     QueryExecutionErrors.overflowInIntegralDivideError(origin.context)
+  }
+
+  def arithmeticOverflowError(
+      message: String,
+      origin: Origin): ArithmeticException = {
+    QueryExecutionErrors.arithmeticOverflowError(message, "", origin.context)
   }
 
   def foundDuplicateFieldInCaseInsensitiveModeError(

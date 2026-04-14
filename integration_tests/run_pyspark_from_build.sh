@@ -323,9 +323,9 @@ else
         # 0 is more efficient
         TEST_PARALLEL_OPTS=()
     elif [[ ${TEST_PARALLEL} -gt ${MAX_PARALLEL} ]]; then
-        TEST_PARALLEL_OPTS=("-n" "$MAX_PARALLEL")
+        TEST_PARALLEL_OPTS=("-n" "$MAX_PARALLEL" "--dist" "worksteal")
     else
-        TEST_PARALLEL_OPTS=("-n" "$TEST_PARALLEL")
+        TEST_PARALLEL_OPTS=("-n" "$TEST_PARALLEL" "--dist" "worksteal")
     fi
 
     mkdir -p "$TARGET_DIR"
@@ -532,6 +532,11 @@ else
         if [[ -n "$PYSP_TEST_spark_jars_repositories" ]]; then
             SPARK_SHELL_ARGS_ARR+=(--repositories "${PYSP_TEST_spark_jars_repositories}")
         fi
+
+        if [[ -n "$PYSP_TEST_spark_jars_ivySettings" ]]; then
+            SPARK_SHELL_ARGS_ARR+=(--conf "spark.jars.ivySettings=${PYSP_TEST_spark_jars_ivySettings}")
+        fi
+
         # NOTE grep is used not only for checking the output but also
         # to workaround the fact that spark-shell catches all failures.
         # In this test it exits not because of the failure but because it encounters

@@ -249,6 +249,12 @@ def is_spark_356_or_later():
 def is_spark_35x():
     return "3.5.0" <= spark_version() < "3.6.0"
 
+def is_spark_40x():
+    return "4.0.0" <= spark_version() < "4.1.0"
+
+def is_iceberg_supported_spark():
+    return is_spark_35x() or is_spark_40x()
+
 def is_spark_400_or_later():
     return spark_version() >= "4.0.0"
 
@@ -312,6 +318,9 @@ def is_databricks133():
 
 def is_databricks143_or_later():
     return is_databricks_version_or_later(14, 3)
+
+def is_databricks173_or_later():
+    return is_databricks_version_or_later(17, 3)
 
 def supports_delta_lake_deletion_vectors():
     if is_databricks_runtime():

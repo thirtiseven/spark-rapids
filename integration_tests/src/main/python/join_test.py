@@ -204,6 +204,8 @@ def test_empty_broadcast_hash_join(join_type, kudo_enabled):
 
 @pytest.mark.parametrize('join_type', ['Left', 'Inner', 'LeftSemi', 'LeftAnti'], ids=idfn)
 @pytest.mark.parametrize("kudo_enabled", ["true", "false"], ids=idfn)
+# https://github.com/NVIDIA/spark-rapids/issues/11100
+@allow_non_gpu('EmptyRelationExec')
 def test_broadcast_hash_join_constant_keys(join_type, kudo_enabled):
     def do_join(spark):
         left = spark.range(10).withColumn("s", lit(1))
@@ -803,7 +805,10 @@ def test_right_broadcast_nested_loop_join_condition_missing_count(data_gen, join
     def do_join(spark):
         left, right = create_df(spark, data_gen, 50, 25)
         return left.join(broadcast(right), how=join_type).selectExpr('COUNT(*)')
-    assert_gpu_and_cpu_are_equal_collect(do_join, conf = {kudo_enabled_conf_key: kudo_enabled})
+    # Disable AQE temporarily until https://github.com/NVIDIA/spark-rapids/issues/14319 is resolved.
+    assert_gpu_and_cpu_are_equal_collect(do_join, conf = {kudo_enabled_conf_key: kudo_enabled,
+                                                          'spark.sql.adaptive.enabled': 'false'
+                                                          })
 
 @pytest.mark.parametrize('data_gen', all_gen + single_level_array_gens + [binary_gen], ids=idfn)
 @pytest.mark.parametrize('join_type', ['Right'], ids=idfn)
@@ -1502,7 +1507,6 @@ def test_bloom_filter_join_cpu_probe(is_multi_column, kudo_enabled):
 @pytest.mark.parametrize("is_multi_column", [False, True], ids=idfn)
 @pytest.mark.skipif(is_databricks_runtime(), reason="https://github.com/NVIDIA/spark-rapids/issues/8921")
 @pytest.mark.skipif(is_before_spark_330(), reason="Bloom filter joins added in Spark 3.3.0")
-@pytest.mark.xfail(condition=is_spark_411_or_later(), reason="https://github.com/NVIDIA/spark-rapids/issues/14148")
 @pytest.mark.parametrize("kudo_enabled", ["true", "false"], ids=idfn)
 def test_bloom_filter_join_cpu_build(is_multi_column, kudo_enabled):
     conf = {"spark.rapids.sql.expression.BloomFilterAggregate": "false",
@@ -1517,7 +1521,6 @@ def test_bloom_filter_join_cpu_build(is_multi_column, kudo_enabled):
 @pytest.mark.parametrize("is_multi_column", [False, True], ids=idfn)
 @pytest.mark.skipif(is_databricks_runtime(), reason="https://github.com/NVIDIA/spark-rapids/issues/8921")
 @pytest.mark.skipif(is_before_spark_330(), reason="Bloom filter joins added in Spark 3.3.0")
-@pytest.mark.xfail(condition=is_spark_411_or_later(), reason="https://github.com/NVIDIA/spark-rapids/issues/14148")
 @pytest.mark.parametrize("kudo_enabled", ["true", "false"], ids=idfn)
 def test_bloom_filter_join_split_cpu_build(agg_replace_mode, is_multi_column, kudo_enabled):
     conf = {"spark.rapids.sql.hashAgg.replaceMode": agg_replace_mode,

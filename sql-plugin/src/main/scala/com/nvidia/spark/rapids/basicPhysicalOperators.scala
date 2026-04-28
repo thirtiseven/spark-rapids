@@ -40,6 +40,7 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, PartitioningCollection, RangePartitioning, SinglePartition, UnknownPartitioning}
 import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
 import org.apache.spark.sql.execution.{FilterExec, ProjectExec, SampleExec, SparkPlan}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.{GpuCreateArray, GpuCreateMap, GpuCreateNamedStruct, GpuPartitionwiseSampledRDD, GpuPoissonSampler}
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
 import org.apache.spark.sql.types._
@@ -375,7 +376,14 @@ object PreProjectSplitIterator {
 
   val KEY_NUM_PRE_SPLIT = "NUM_PRE_SPLITS"
 
-  def getSplitUntilSize: Long = GpuDeviceManager.getSplitUntilSize
+  // The user-facing `spark.rapids.sql.preProject.splitUntilSize` overrides the default
+  // (computed by `GpuDeviceManager.getSplitUntilSize` from the pool size). This is the
+  // hotfix knob for cuDF-heavy expressions whose internal scratch the estimator cannot
+  // see — see RapidsConf.PRE_PROJECT_SPLIT_UNTIL_SIZE for guidance.
+  def getSplitUntilSize: Long = {
+    new RapidsConf(SQLConf.get).preProjectSplitUntilSize
+        .getOrElse(GpuDeviceManager.getSplitUntilSize)
+  }
 
   def calcMinOutputSize(cb: ColumnarBatch, boundExprs: GpuTieredProject): Long = {
     new PreSplitOutSizeEstimator(cb, boundExprs).calcMinOutputSize()
@@ -467,10 +475,25 @@ object PreProjectSplitIterator {
             getColumnSize(cb.column(colId).asInstanceOf[GpuColumnVector].getBase,
               exprType, nullable, exprAmount)
           }.getOrElse {
-            // minGpuMemory is not suitable for the meta size calculation here, so do it
-            // separately.
-            computeMetaSize(nullable, hasOffset(exprType), rowsNum, exprAmount) +
-              GpuBatchUtils.minGpuMemory(exprType, false, rowsNum, false)
+            // minGpuMemory assumes empty strings/binaries (zero chars); that starves
+            // pre-split whenever a projection produces a string-heavy output whose
+            // per-row length cannot be inferred statically (e.g. from_unixtime,
+            // stringReplaceWithBackrefs, regex_replace). Fall back to Spark's
+            // default string size so the split iterator does not let a multi-GB
+            // output slip through as a single batch. Pass-through strings already
+            // get their real size above.
+            val metaSize =
+              computeMetaSize(nullable, hasOffset(exprType), rowsNum, exprAmount)
+            exprType match {
+              case StringType | BinaryType =>
+                val amount = exprAmount.getOrElse(1)
+                val ret = metaSize +
+                  StringType.defaultSize.toLong * rowsNum * amount
+                updateOffsetColumnSize(ret)
+                ret
+              case _ =>
+                metaSize + GpuBatchUtils.minGpuMemory(exprType, false, rowsNum, false)
+            }
           }
       }
     }

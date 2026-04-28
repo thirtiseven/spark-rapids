@@ -2737,6 +2737,26 @@ val SHUFFLE_COMPRESSION_LZ4_CHUNK_SIZE = conf("spark.rapids.shuffle.compression.
       .longConf
       .createOptional
 
+  val PRE_PROJECT_SPLIT_UNTIL_SIZE = conf("spark.rapids.sql.preProject.splitUntilSize")
+      .doc("Threshold (in bytes) above which GpuProjectExec will pre-split its input " +
+          "batch row-wise before evaluation. " +
+          "The default is max(GPU pool size / 8, 100 MB) (see " +
+          "GpuDeviceManager.getSplitUntilSize). " +
+          "Lower values reduce GPU memory pressure for cuDF-heavy expressions whose " +
+          "internal scratch the estimator cannot see (e.g. LEGACY timestamp parser, " +
+          "complex regex / string operations) at the cost of additional kernel launch " +
+          "overhead and possible coalesce-after-split work for downstream operators. " +
+          "Use this as a workaround when GPU OOMs originate inside GpuProjectExec; " +
+          "do not lower it preventively. " +
+          "Recommended starting point if needed: 256 MB; do not go below 64 MB. " +
+          "Long-term fix tracked at https://github.com/NVIDIA/spark-rapids/issues/14191 " +
+          "will make this conf unnecessary.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(v => v >= 64L * 1024 * 1024,
+        "Setting preProject.splitUntilSize below 64 MB causes kernel-launch overhead " +
+            "to dominate and the post-split coalesce peak may exceed the unsplit peak.")
+      .createOptional
+
   val TEST_IO_ENCRYPTION = conf("spark.rapids.test.io.encryption")
     .doc("Only for tests: verify for IO encryption")
     .internal()
@@ -3941,6 +3961,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val spillToDiskBounceBufferCount: Int = get(SPILL_TO_DISK_BOUNCE_BUFFER_COUNT)
 
   lazy val splitUntilSizeOverride: Option[Long] = get(SPLIT_UNTIL_SIZE_OVERRIDE)
+
+  lazy val preProjectSplitUntilSize: Option[Long] = get(PRE_PROJECT_SPLIT_UNTIL_SIZE)
 
   lazy val skipGpuArchCheck: Boolean = get(SKIP_GPU_ARCH_CHECK)
 

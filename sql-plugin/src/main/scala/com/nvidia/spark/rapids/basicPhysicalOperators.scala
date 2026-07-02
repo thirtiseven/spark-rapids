@@ -65,7 +65,7 @@ class GpuProjectExecMeta(
       // cuDF requires return column is fixed width
       val allReturnTypesFixedWidth = gpuExprs.forall(e => GpuBatchUtils.isFixedWidth(e.dataType))
       if (canUseAnsiJitAst && allReturnTypesFixedWidth && childExprs.forall(_.canThisBeAst)) {
-        return GpuProjectAstExec(gpuExprs, gpuChild)
+        return GpuProjectAstExec(gpuExprs, gpuChild, conf.isLibcudfJitEnabled)
       }
       // explain AST because this is optional and it is sometimes hard to debug
       if (conf.shouldExplain) {
@@ -909,15 +909,72 @@ object GpuProjectAstExec {
   val COMPILE_ASTS_TIME = "compileAstsTime"
   val COMPUTE_ASTS_TIME = "computeAstsTime"
 
-  private def translateAstJitError(error: CudfException): Throwable = {
-    val message = Option(error.getMessage).getOrElse("")
-    if (message.contains("DIVISION_BY_ZERO")) {
-      RapidsErrorUtils.divByZeroError(CurrentOrigin.get)
-    } else if (message.contains("OVERFLOW")) {
-      RapidsErrorUtils.divOverflowError(CurrentOrigin.get)
-    } else {
-      error
+  private[rapids] case class AstFusionLimits(
+      maxOutputs: Int,
+      maxAstNodes: Int,
+      maxEstimatedLiveValues: Int)
+
+  private val defaultFusionLimits = AstFusionLimits(
+    maxOutputs = 32,
+    maxAstNodes = 512,
+    // Keep expression values well below CUDA's 255-register per-thread architectural limit.
+    maxEstimatedLiveValues = 128)
+
+  private def astNodeCount(expression: Expression): Int =
+    1 + expression.children.map(astNodeCount).sum
+
+  private def estimatedLiveValues(expression: Expression): Int = {
+    var liveChildren = 0
+    expression.children.foldLeft(1) { (maxLive, child) =>
+      val childMaxLive = liveChildren + estimatedLiveValues(child)
+      liveChildren += 1
+      math.max(maxLive, childMaxLive)
     }
+  }
+
+  private[rapids] def planFusionGroups(
+      expressions: Seq[GpuExpression],
+      limits: AstFusionLimits = defaultFusionLimits): Seq[Seq[GpuExpression]] = {
+    require(limits.maxOutputs > 0 && limits.maxAstNodes > 0 &&
+      limits.maxEstimatedLiveValues > 0, "AST fusion limits must be positive")
+
+    val groups = ArrayBuffer[ArrayBuffer[GpuExpression]]()
+    var currentNodeCount = 0
+    var currentLiveValues = 0
+
+    expressions.foreach { expression =>
+      val nodeCount = astNodeCount(expression)
+      val liveValues = estimatedLiveValues(expression)
+      val current = groups.lastOption
+      val exceedsLimit = current.exists { group =>
+        group.size >= limits.maxOutputs ||
+          currentNodeCount + nodeCount > limits.maxAstNodes ||
+          currentLiveValues + liveValues > limits.maxEstimatedLiveValues
+      }
+
+      if (current.isEmpty || exceedsLimit) {
+        groups += ArrayBuffer(expression)
+        currentNodeCount = nodeCount
+        currentLiveValues = liveValues
+      } else {
+        current.get += expression
+        currentNodeCount += nodeCount
+        currentLiveValues += liveValues
+      }
+    }
+
+    groups.map(_.toSeq).toSeq
+  }
+
+  private def translateAstJitError(error: CudfException): Throwable = error match {
+    case evaluationError: CudfEvaluationException => evaluationError.getErrorCode match {
+      case CudfEvaluationException.ErrorCode.DIVISION_BY_ZERO =>
+        RapidsErrorUtils.divByZeroError(CurrentOrigin.get)
+      case CudfEvaluationException.ErrorCode.OVERFLOW =>
+        RapidsErrorUtils.arithmeticOverflowError("Overflow occurs", CurrentOrigin.get)
+      case _ => error
+    }
+    case _ => error
   }
 }
 
@@ -931,7 +988,8 @@ case class GpuProjectAstExec(
     // serde: https://github.com/scala/scala/blob/2.12.x/src/library/scala/collection/
     //   immutable/List.scala#L516
     projectList: List[Expression],
-    child: SparkPlan
+    child: SparkPlan,
+    enableJitFusion: Boolean = false
 ) extends GpuProjectExecLike {
 
   override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
@@ -984,9 +1042,7 @@ case class GpuProjectAstExec(
             spillable, Seq(compiledAstExprs), { cb =>
               NvtxIdWithMetrics(NvtxRegistry.PROJECT_AST, opTime) {
                 val projectedTable = withResource(tableFromBatch(cb)) { table =>
-                  withResource(compiledAstExprs.computeColumns(table)) { projectedColumns =>
-                    new Table(projectedColumns: _*)
-                  }
+                  compiledAstExprs.computeTable(table)
                 }
                 withResource(projectedTable) { _ =>
                   GpuColumnVector.from(projectedTable, outputTypes)
@@ -1026,6 +1082,11 @@ case class GpuProjectAstExec(
       opTime: GpuMetric,
       compileAstsTime: GpuMetric,
       computeAstsTime: GpuMetric) extends Retryable with AutoCloseable {
+    private[this] val fusionGroupSizes = if (enableJitFusion) {
+      GpuProjectAstExec.planFusionGroups(boundProjectList).map(_.size)
+    } else {
+      Seq(boundProjectList.size)
+    }
     private[this] var compiledAstExprs: Seq[cudf.ast.CompiledExpression] = compile()
 
     override def checkpoint(): Unit = {}
@@ -1037,14 +1098,33 @@ case class GpuProjectAstExec(
       compiledAstExprs = compile()
     }
 
-    def computeColumns(table: Table): Seq[cudf.ColumnVector] =
+    def computeTable(table: Table): Table =
       NvtxIdWithMetrics(NvtxRegistry.COMPUTE_ASTS, computeAstsTime) {
-        compiledAstExprs.safeMap { expr =>
-          try {
-            expr.computeColumn(table)
-          } catch {
-            case e: CudfException => throw GpuProjectAstExec.translateAstJitError(e)
+        try {
+          if (fusionGroupSizes.size == 1) {
+            cudf.ast.CompiledExpression.computeColumns(table, compiledAstExprs.toArray)
+          } else {
+            var offset = 0
+            withResource(fusionGroupSizes.safeMap { groupSize =>
+              val end = offset + groupSize
+              val group = compiledAstExprs.slice(offset, end).toArray
+              offset = end
+              cudf.ast.CompiledExpression.computeColumns(table, group)
+            }) { tables =>
+              withResource(new Array[cudf.ColumnVector](compiledAstExprs.size)) { columns =>
+                var outputIndex = 0
+                tables.foreach { result =>
+                  (0 until result.getNumberOfColumns).foreach { columnIndex =>
+                    columns(outputIndex) = result.getColumn(columnIndex).incRefCount()
+                    outputIndex += 1
+                  }
+                }
+                new Table(columns: _*)
+              }
+            }
           }
+        } catch {
+          case e: CudfException => throw GpuProjectAstExec.translateAstJitError(e)
         }
       }
 

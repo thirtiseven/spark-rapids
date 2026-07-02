@@ -586,6 +586,30 @@ def test_ansi_jit_arithmetic_for_integer_ansi_on(data_desc):
                           f.col('a') * f.col('b')),
                       conf=_ansi_jit_ast_enabled_conf)
 
+def test_multiple_outputs_without_jit():
+    assert_gpu_ast(
+        True,
+        lambda spark: spark.createDataFrame(
+            spark.sparkContext.parallelize(
+                [(1, 10), (None, 20), (3, None), (4, 40)] * 8, 1),
+            'a INT, b INT').select(
+                f.col('a'),
+                f.col('b') > f.lit(25),
+                f.col('a') + f.lit(1)))
+
+@_requires_libcudf_jit
+def test_ansi_jit_multiple_outputs_with_independent_nulls():
+    assert_gpu_ast(
+        True,
+        lambda spark: spark.createDataFrame(
+            spark.sparkContext.parallelize(
+                [(1, 10), (None, 20), (3, None), (4, 40)] * 8, 1),
+            'a INT, b INT').select(
+                f.col('a'),
+                f.col('b') > f.lit(25),
+                f.col('a') + f.lit(1)),
+        conf=_ansi_jit_ast_enabled_conf)
+
 @_requires_libcudf_jit
 @pytest.mark.parametrize('data_desc', _ast_integral_desc_list_for_ansi_jit_on, ids=idfn)
 def test_ansi_jit_unary_arithmetic_for_integer_ansi_on(data_desc):
@@ -630,40 +654,26 @@ def test_ansi_jit_integral_mod_sign_for_integer_ansi_on():
                        'a INT, b INT').selectExpr('a % b'),
                    conf=_ansi_jit_ast_enabled_conf)
 
-def _collect_with_retry_oom_disabled(spark, df_fun):
-    spark.conf.set("spark.rapids.sql.test.injectRetryOOM", "false")
-    return df_fun(spark).collect()
-
 @_requires_libcudf_jit
 def test_ansi_jit_integral_div_by_zero_errors():
-    ast_conf = copy_and_update(
-        _ansi_jit_ast_enabled_conf,
-        _project_ast_enabled_conf,
-        {"spark.rapids.sql.test.injectRetryOOM": "false"})
+    ast_conf = copy_and_update(_ansi_jit_ast_enabled_conf, _project_ast_enabled_conf)
     assert_gpu_and_cpu_error(
-        lambda spark: _collect_with_retry_oom_disabled(
+        lambda spark: two_col_df(
             spark,
-            lambda spark: two_col_df(
-                spark,
-                LongGen(nullable=False, min_val=-100, max_val=100, special_cases=[]),
-                SetValuesGen(LongType(), [0]),
-                length=8,
-                num_slices=1).selectExpr('a DIV b')),
+            LongGen(nullable=False, min_val=-100, max_val=100, special_cases=[]),
+            SetValuesGen(LongType(), [0]),
+            length=8,
+            num_slices=1).selectExpr('a DIV b').collect(),
         ast_conf,
         'Division by zero')
 
 @_requires_libcudf_jit
 def test_ansi_jit_integral_div_overflow_errors():
-    ast_conf = copy_and_update(
-        _ansi_jit_ast_enabled_conf,
-        _project_ast_enabled_conf,
-        {"spark.rapids.sql.test.injectRetryOOM": "false"})
+    ast_conf = copy_and_update(_ansi_jit_ast_enabled_conf, _project_ast_enabled_conf)
     assert_gpu_and_cpu_error(
-        lambda spark: _collect_with_retry_oom_disabled(
-            spark,
-            lambda spark: spark.createDataFrame(
-                spark.sparkContext.parallelize([(LONG_MIN, -1)] * 8, 1),
-                'a LONG, b LONG').selectExpr('a DIV b')),
+        lambda spark: spark.createDataFrame(
+            spark.sparkContext.parallelize([(LONG_MIN, -1)] * 8, 1),
+            'a LONG, b LONG').selectExpr('a DIV b').collect(),
         ast_conf,
         'Overflow')
 

@@ -138,7 +138,10 @@ object GpuProjectExec {
         // different vector length, thus not able to reuse cached vectors.
         GpuExpressionsUtils.cachedNullVectors.get.clear()
 
-        GpuArrayHofFusion.project(cb, boundExprs).getOrElse {
+        // Each fusion path owns the whole projection, so keep HOF precedence until they compose.
+        GpuArrayHofFusion.project(cb, boundExprs).orElse {
+          GpuAstJitFusion.project(cb, boundExprs)
+        }.getOrElse {
           val newColumns = boundExprs.safeMap(_.columnarEval(cb)).toArray[ColumnVector]
           new ColumnarBatch(newColumns, cb.numRows())
         }

@@ -16,8 +16,6 @@
 
 package com.nvidia.spark.rapids
 
-import scala.collection.mutable.ArrayBuffer
-
 import ai.rapids.cudf.{Scalar, Table}
 import ai.rapids.cudf.ast.CompiledExpression
 import com.nvidia.spark.Retryable
@@ -29,7 +27,7 @@ import com.nvidia.spark.rapids.shims.ShimUnaryExpression
 import org.apache.spark.TaskContext
 import org.apache.spark.sql.catalyst.expressions.{Expression, NamedExpression}
 import org.apache.spark.sql.types.DataType
-import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
+import org.apache.spark.sql.vectorized.ColumnarBatch
 
 object GpuAstJitExpression {
   private def wrapMaximalSubtrees(expression: Expression): Expression = expression match {
@@ -47,122 +45,6 @@ object GpuAstJitExpression {
   private[rapids] def wrapProjectExpressions(
       expressions: List[NamedExpression]): List[NamedExpression] = {
     expressions.map(wrapMaximalSubtrees(_).asInstanceOf[NamedExpression])
-  }
-
-  private[rapids] def tableFromBatch(batch: ColumnarBatch): Table = {
-    if (batch.numCols() != 0) {
-      GpuColumnVector.from(batch)
-    } else {
-      withResource(Scalar.fromBool(false)) { falseScalar =>
-        withResource(ai.rapids.cudf.ColumnVector.fromScalar(falseScalar, batch.numRows())) {
-          falseColumn => new Table(falseColumn)
-        }
-      }
-    }
-  }
-}
-
-private[rapids] object GpuAstJitFusion {
-  private case class JitInProject(outputIndex: Int, expression: GpuAstJitExpression)
-
-  private case class JitGroup(members: Seq[JitInProject]) {
-    val startIndex: Int = members.head.outputIndex
-    val outputIndexes: Seq[Int] = members.map(_.outputIndex)
-  }
-
-  private[rapids] def project(
-      batch: ColumnarBatch,
-      boundExprs: Seq[Expression]): Option[ColumnarBatch] = {
-    val fusedGroups = findFusedGroups(boundExprs)
-    if (fusedGroups.isEmpty) {
-      None
-    } else {
-      val groupsByStartIndex = fusedGroups.map(group => group.startIndex -> group).toMap
-      Some(projectWithFusedGroups(batch, boundExprs, groupsByStartIndex))
-    }
-  }
-
-  private[rapids] def findFusedGroupIndexes(
-      boundExprs: Seq[Expression]): Seq[Seq[Int]] =
-    findFusedGroups(boundExprs).map(_.outputIndexes)
-
-  private def findFusedGroups(boundExprs: Seq[Expression]): Seq[JitGroup] = {
-    val fusedGroups = ArrayBuffer[JitGroup]()
-    val candidates = ArrayBuffer[JitInProject]()
-
-    def flushCandidates(): Unit = {
-      if (candidates.length > 1) {
-        fusedGroups += JitGroup(candidates.toList)
-      }
-      candidates.clear()
-    }
-
-    boundExprs.zipWithIndex.foreach { case (expr, index) =>
-      extractJitExpression(expr).filter(canFuse) match {
-        case Some(jit) => candidates += JitInProject(index, jit)
-        case None if !canReorderExpression(expr) => flushCandidates()
-        case None =>
-      }
-    }
-    flushCandidates()
-    fusedGroups.toSeq
-  }
-
-  private def extractJitExpression(expr: Expression): Option[GpuAstJitExpression] = expr match {
-    case GpuAlias(child, _) => extractJitExpression(child)
-    case jit: GpuAstJitExpression => Some(jit)
-    case _ => None
-  }
-
-  private def canFuse(jit: GpuAstJitExpression): Boolean =
-    jit.deterministic && !jit.hasSideEffects
-
-  private def canReorderExpression(expr: Expression): Boolean =
-    expr.deterministic && (expr match {
-      case gpuExpr: GpuExpression => !gpuExpr.hasSideEffects
-      case _ => false
-    })
-
-  private def projectWithFusedGroups(
-      batch: ColumnarBatch,
-      boundExprs: Seq[Expression],
-      groupsByStartIndex: Map[Int, JitGroup]): ColumnarBatch = {
-    val outputColumns = new Array[ColumnVector](boundExprs.length)
-    closeOnExcept(outputColumns) { _ =>
-      boundExprs.indices.foreach { index =>
-        if (outputColumns(index) == null) {
-          groupsByStartIndex.get(index) match {
-            case Some(group) => evaluateFusedGroup(batch, group, outputColumns)
-            case None => outputColumns(index) = boundExprs(index).columnarEval(batch)
-          }
-        }
-      }
-      new ColumnarBatch(outputColumns, batch.numRows())
-    }
-  }
-
-  private def evaluateFusedGroup(
-      batch: ColumnarBatch,
-      group: JitGroup,
-      outputColumns: Array[ColumnVector]): Unit = {
-    val compiledExpressions = group.members.map(_.expression.getCompiledExpression).toArray
-    withResource(GpuAstJitExpression.tableFromBatch(batch)) { table =>
-      withResource(CompiledExpression.computeColumnsJit(table, compiledExpressions)) { result =>
-        if (result.getNumberOfColumns != group.members.length) {
-          throw new IllegalStateException(
-            s"AST JIT returned ${result.getNumberOfColumns} columns for " +
-              s"${group.members.length} expressions")
-        }
-        if (result.getRowCount != batch.numRows()) {
-          throw new IllegalStateException(
-            s"AST JIT returned ${result.getRowCount} rows for ${batch.numRows()} input rows")
-        }
-        group.members.zipWithIndex.foreach { case (member, resultIndex) =>
-          outputColumns(member.outputIndex) = GpuColumnVector.from(
-            result.getColumn(resultIndex).incRefCount(), member.expression.dataType)
-        }
-      }
-    }
   }
 }
 
@@ -193,14 +75,14 @@ case class GpuAstJitExpression(child: Expression)
   override def close(): Unit = closeCompiledExpression()
 
   override def columnarEval(batch: ColumnarBatch): GpuColumnVector = {
-    withResource(GpuAstJitExpression.tableFromBatch(batch)) { table =>
+    withResource(tableFromBatch(batch)) { table =>
       closeOnExcept(getCompiledExpression.computeColumnJit(table)) { result =>
         GpuColumnVector.from(result, dataType)
       }
     }
   }
 
-  private[rapids] def getCompiledExpression: CompiledExpression = synchronized {
+  private def getCompiledExpression: CompiledExpression = synchronized {
     if (compiledExpression == null) {
       compiledExpression = child.asInstanceOf[GpuExpression]
         .convertToAst(Int.MaxValue)
@@ -220,5 +102,17 @@ case class GpuAstJitExpression(child: Expression)
   private def closeCompiledExpression(): Unit = synchronized {
     Option(compiledExpression).foreach(_.safeClose())
     compiledExpression = null
+  }
+
+  private def tableFromBatch(batch: ColumnarBatch): Table = {
+    if (batch.numCols() != 0) {
+      GpuColumnVector.from(batch)
+    } else {
+      withResource(Scalar.fromBool(false)) { falseScalar =>
+        withResource(ai.rapids.cudf.ColumnVector.fromScalar(falseScalar, batch.numRows())) {
+          falseColumn => new Table(falseColumn)
+        }
+      }
+    }
   }
 }

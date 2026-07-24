@@ -22,7 +22,7 @@ import scala.collection.mutable.ArrayBuffer
 import org.apache.spark.sql.{Column, DataFrame, SparkSession}
 import org.apache.spark.sql.functions._
 
-object ProjectAstJitUltimateBench {
+object ProjectAstJitLtoBench {
   private val spark = SparkSession.active
 
   private def env(name: String, default: String): String =
@@ -36,22 +36,18 @@ object ProjectAstJitUltimateBench {
 
   private val rows = env("BENCH_ROWS", "100000000").toLong
   private val partitions = env("BENCH_PARTITIONS", "16").toInt
-  private val outputCounts = ints("BENCH_OUTPUT_COUNTS", "2,4,8")
-  private val depths = ints("BENCH_DEPTHS", "8,16")
-  private val workloads = strings("BENCH_WORKLOADS", "independent,shared_prefix")
-  private val modes = strings("BENCH_MODES", "gpu_project,legacy_ast,ast_jit")
-  private val warmups = env("BENCH_WARMUPS", "2").toInt
-  private val iterations = env("BENCH_ITERS", "5").toInt
+  private val outputCounts = ints("BENCH_OUTPUT_COUNTS", "1")
+  private val depths = ints("BENCH_DEPTHS", "4")
+  private val workloads = strings("BENCH_WORKLOADS", "two_input")
+  private val modes = strings("BENCH_MODES", "ast_jit")
+  private val warmups = env("BENCH_WARMUPS", "0").toInt
+  private val iterations = env("BENCH_ITERS", "1").toInt
   private val resultPath = env(
-    "BENCH_RESULT_CSV_PATH", s"/tmp/project_ast_jit_${System.currentTimeMillis()}.csv")
-  private val nativeBackend = env("LIBCUDF_AST_JIT_BACKEND", "source")
-  require(Set("source", "lto", "lto-wrapper-required").contains(nativeBackend),
-    s"Unsupported LIBCUDF_AST_JIT_BACKEND: $nativeBackend")
-  require(nativeBackend != "lto-wrapper-required" || outputCounts.forall(Set(2, 8)),
-    "lto-wrapper-required only has precompiled 3-input wrappers for 2 and 8 outputs")
+    "BENCH_RESULT_CSV_PATH", s"/tmp/project_ast_jit_lto_${System.currentTimeMillis()}.csv")
+  private val variant = env("BENCH_VARIANT", "lto")
 
   private case class Result(
-      backend: String,
+      variant: String,
       mode: String,
       workload: String,
       outputCount: Int,
@@ -102,48 +98,59 @@ object ProjectAstJitUltimateBench {
     input
   }
 
-  private def independentExpression(index: Int, depth: Int): Column = {
-    var state = index.toLong + 1L
-    var expression = index % 3 match {
-      case 0 => col("a") + col("b")
-      case 1 => col("b") * col("c")
-      case _ => col("c") + col("a")
-    }
+  private def oneInputExpression(index: Int, depth: Int): Column = {
+    var expression = col("a") * col("a")
     var level = 1
     while (level < depth) {
-      state = state * 6364136223846793005L + 1442695040888963407L
-      val rhs = ((state >>> 32) % 3).toInt match {
-        case 0 => col("a")
-        case 1 => col("b")
-        case _ => col("c")
-      }
-      expression = if ((state & 1L) == 0L) expression + rhs else expression * rhs
+      expression = if (((index + level) & 1) == 0) expression + col("a")
+      else expression * col("a")
       level += 1
     }
     expression
   }
 
-  private def sharedPrefixExpressions(outputCount: Int, depth: Int): Seq[Column] = {
-    var prefix = col("a") + col("b")
+  private def twoInputExpression(index: Int, depth: Int): Column = {
+    var expression = if ((index & 1) == 0) col("a") + col("b") else col("b") * col("a")
     var level = 1
     while (level < depth) {
-      prefix = if ((level & 1) == 0) prefix + col("a") else prefix * col("c")
+      val rhs = if (((index + level) & 1) == 0) col("a") else col("b")
+      expression = if ((level & 1) == 0) expression + rhs else expression * rhs
       level += 1
     }
-    (0 until outputCount).map { index =>
-      var output = prefix
-      var suffix = 0
-      while (suffix < 3) {
-        val rhs = (index + suffix) % 3 match {
-          case 0 => col("a")
-          case 1 => col("b")
-          case _ => col("c")
-        }
-        output = if (((index >>> suffix) & 1) == 0) output + rhs else output * rhs
-        suffix += 1
-      }
-      output
+    expression
+  }
+
+  private def columnScalarExpression(index: Int, depth: Int): Column = {
+    var expression = col("a") + lit(index.toLong + 1L)
+    var level = 1
+    while (level < depth) {
+      expression = if ((level & 1) == 0) expression + col("a") else expression * col("a")
+      level += 1
     }
+    expression
+  }
+
+  private def threeInputExpression(index: Int, depth: Int): Column = {
+    var expression = (col("a") + col("b")) * col("c")
+    var level = 1
+    while (level < depth) {
+      val rhs = (index + level) % 3 match {
+        case 0 => col("a")
+        case 1 => col("b")
+        case _ => col("c")
+      }
+      expression = if ((level & 1) == 0) expression + rhs else expression * rhs
+      level += 1
+    }
+    expression
+  }
+
+  private def expression(workload: String, index: Int, depth: Int): Column = workload match {
+    case "one_input" => oneInputExpression(index, depth)
+    case "two_input" => twoInputExpression(index, depth)
+    case "column_scalar" => columnScalarExpression(index, depth)
+    case "three_input" => threeInputExpression(index, depth)
+    case other => throw new IllegalArgumentException(s"Unknown BENCH_WORKLOADS entry: $other")
   }
 
   private def query(
@@ -151,11 +158,7 @@ object ProjectAstJitUltimateBench {
       workload: String,
       outputCount: Int,
       depth: Int): DataFrame = {
-    val expressions = workload match {
-      case "independent" => (0 until outputCount).map(independentExpression(_, depth))
-      case "shared_prefix" => sharedPrefixExpressions(outputCount, depth)
-      case other => throw new IllegalArgumentException(s"Unknown BENCH_WORKLOADS entry: $other")
-    }
+    val expressions = (0 until outputCount).map(expression(workload, _, depth))
     input.select(expressions.zipWithIndex.map { case (expr, index) =>
       expr.as(s"out_$index")
     }: _*)
@@ -204,10 +207,10 @@ object ProjectAstJitUltimateBench {
       consume(query(input, workload, outputCount, depth), mode, outputCount)
     val elapsedMs = (System.nanoTime() - start) / 1e6
     val isCold = iteration == 0 && (isWarmup || warmups == 0)
-    val result = Result(nativeBackend, mode, workload, outputCount, depth, iteration,
+    val result = Result(variant, mode, workload, outputCount, depth, iteration,
       isWarmup, isCold, elapsedMs, checksum, astJitExpressions, legacyAstProject, nodes)
     results += result
-    println(f"backend=$nativeBackend mode=$mode workload=$workload outputs=$outputCount " +
+    println(f"variant=$variant mode=$mode workload=$workload outputs=$outputCount " +
       f"depth=$depth iteration=$iteration warmup=$isWarmup cold=$isCold wallMs=$elapsedMs%.3f " +
       s"checksum=$checksum astJitExpressions=$astJitExpressions " +
       s"legacyAstProject=$legacyAstProject projects=$nodes")
@@ -220,10 +223,10 @@ object ProjectAstJitUltimateBench {
     }
     val writer = new PrintWriter(path.toFile)
     try {
-      writer.println("backend,mode,workload,output_count,depth,iteration,warmup,cold,wall_ms," +
+      writer.println("variant,mode,workload,output_count,depth,iteration,warmup,cold,wall_ms," +
         "checksum,ast_jit_expressions,legacy_ast_project,project_nodes")
       results.foreach { result =>
-        writer.println(Seq(result.backend, result.mode, result.workload, result.outputCount,
+        writer.println(Seq(result.variant, result.mode, result.workload, result.outputCount,
           result.depth, result.iteration, result.warmup, result.cold, result.wallMs,
           result.checksum, result.astJitExpressions, result.legacyAstProject,
           result.projectNodes).mkString(","))
@@ -237,8 +240,9 @@ object ProjectAstJitUltimateBench {
   def run(): Unit = {
     spark.conf.set("spark.sql.ansi.enabled", "false")
     spark.conf.set("spark.sql.adaptive.enabled", "false")
-    println(s"backend=$nativeBackend rows=$rows partitions=$partitions")
-    val input = makeInput()
+    println(s"variant=$variant rows=$rows partitions=$partitions " +
+      s"kernelCachePath=${sys.env.getOrElse("LIBCUDF_KERNEL_CACHE_PATH", "<default>")}")
+    val input = withMode("gpu_project") { makeInput() }
     try {
       workloads.foreach { workload =>
         outputCounts.foreach { outputCount =>
@@ -261,4 +265,4 @@ object ProjectAstJitUltimateBench {
   }
 }
 
-ProjectAstJitUltimateBench.run()
+ProjectAstJitLtoBench.run()

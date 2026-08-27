@@ -287,7 +287,8 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
     maxReadBatchSizeRows: Int,
     maxReadBatchSizeBytes: Long,
     maxGpuColumnSizeBytes: Long,
-    keepReadsInOrder: Boolean)
+    keepReadsInOrder: Boolean,
+    combineWaitTime: Int)
   extends MultiFileCloudPartitionReaderBase(
     conf,
     files,
@@ -301,7 +302,8 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
     combineConf = CombineConf(Seq(
       SequenceFileReaderLimits.MAX_BATCH_OUTPUT_BYTES,
       maxReadBatchSizeBytes,
-      maxGpuColumnSizeBytes).min, 0)) with MultiFileReaderFunctions {
+      maxGpuColumnSizeBytes).min,
+      combineWaitTime)) with MultiFileReaderFunctions {
 
   private val projectedColumns = 2
   private val batchCapacity = Seq(
@@ -723,6 +725,7 @@ private[rapids] case class GpuSequenceFilePartitionReaderFactory(
 
   private val maxNumFileProcessed = rapidsConf.multiThreadReadNumThreads
   private val keepReadsInOrder = rapidsConf.getMultithreadedReaderKeepOrder
+  private val combineWaitTime = rapidsConf.getMultithreadedCombineWaitTime
 
   override protected def buildBaseColumnarReaderForCloud(
       files: Array[PartitionedFile],
@@ -737,7 +740,8 @@ private[rapids] case class GpuSequenceFilePartitionReaderFactory(
       maxReadBatchSizeRows,
       maxReadBatchSizeBytes,
       maxGpuColumnSizeBytes,
-      keepReadsInOrder)
+      keepReadsInOrder,
+      combineWaitTime)
   }
 
   override protected def buildBaseColumnarReaderForCoalescing(

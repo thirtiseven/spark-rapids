@@ -767,7 +767,7 @@ abstract class MultiFileCloudPartitionReaderBase(
         fut
       }
       if (hmbFuture == null) {
-        if (combineConf.combineWaitTime > 0) {
+        if (combineConf.combineWaitTime > 0 && !tasks.isEmpty) {
           // no more are ready, wait to see if any finish within wait time
           val taskResult = if (keepReadsInOrder) {
             tasks.poll().get(combineConf.combineWaitTime, TimeUnit.MILLISECONDS)
@@ -787,10 +787,10 @@ abstract class MultiFileCloudPartitionReaderBase(
             val hmbAndMeta = convertAsyncResult(taskResult)
             results.append(hmbAndMeta)
             currSize += hmbAndMeta.memBuffersAndSizes.map(_.bytes).sum
+            currNumRows += hmbAndMeta.memBuffersAndSizes.map(_.numRows).sum
             filesToRead -= 1
           }
         } else {
-          // wait time is <= 0
           takeMore = false
         }
       } else {

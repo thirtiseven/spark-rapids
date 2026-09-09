@@ -22,6 +22,9 @@ import scala.util.control.NonFatal
 import org.apache.spark.rdd.NewHadoopRDD
 import org.apache.spark.sql.catalyst.expressions.Nondeterministic
 import org.apache.spark.sql.execution.{FilterExec, ProjectExec, SerializeFromObjectExec, SparkPlan}
+import org.apache.spark.sql.execution.command.DataWritingCommandExec
+import org.apache.spark.sql.execution.datasources.InsertIntoHadoopFsRelationCommand
+import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.rapids.{GpuSequenceFileRDDScanExec, SequenceFileRddReadProof}
 
 private[rapids] object GpuSequenceFileSerializeFromObjectExecMeta {
@@ -117,11 +120,43 @@ private[rapids] final class GpuSequenceFileSerializeFromObjectExecMeta(
       !meta.hasDirectCpuBridgeExpressions && !hasPartitionSensitiveExpression(ancestor)
   }
 
+  private def isGpuV1ParquetWrite(meta: SparkPlanMeta[_]): Boolean = {
+    meta.wrapped match {
+      case command: DataWritingCommandExec =>
+        command.getClass == classOf[DataWritingCommandExec] &&
+          (command.cmd match {
+            case insert: InsertIntoHadoopFsRelationCommand =>
+              insert.getClass == classOf[InsertIntoHadoopFsRelationCommand] &&
+                insert.fileFormat.getClass == classOf[ParquetFileFormat] &&
+                insert.partitionColumns.isEmpty && insert.bucketSpec.isEmpty &&
+                insert.staticPartitions.isEmpty
+            case _ => false
+          }) && meta.canDataWriteCmdsBeReplaced && meta.parent.isEmpty
+      case _ => false
+    }
+  }
+
+  private def isTerminalWriteBoundary(meta: SparkPlanMeta[_]): Boolean = {
+    // Regrouping preserves the row multiset written by an unpartitioned Parquet sink, although
+    // its physical part-file layout can change.
+    // Keep the boundary exact so every intervening operator still has to pass the proof.
+    if (meta.wrapped.getClass.getName ==
+        "org.apache.spark.sql.execution.datasources.WriteFilesExec") {
+      meta.parent.exists {
+        case parent: SparkPlanMeta[_] => isGpuV1ParquetWrite(parent)
+        case _ => false
+      }
+    } else {
+      isGpuV1ParquetWrite(meta)
+    }
+  }
+
   @tailrec
   private def hasUnprovenPartitionAncestor(
       current: Option[RapidsMeta[_, _, _]]): Boolean = current match {
     case Some(meta: SparkPlanMeta[_]) if isPartitionTransparent(meta) =>
       hasUnprovenPartitionAncestor(meta.parent)
+    case Some(meta: SparkPlanMeta[_]) if isTerminalWriteBoundary(meta) => false
     case Some(_) => true
     case None => false
   }

@@ -23,6 +23,7 @@ import scala.concurrent.duration._
 
 import com.nvidia.spark.rapids.{GpuMetric, GpuRangeExec, RapidsConf, SparkQueryCompareTestSuite,
   TestUtils}
+import com.nvidia.spark.rapids.shims.SparkShimImpl
 import com.nvidia.spark.rapids.spill.SpillFramework
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{ChecksumFileSystem, Path}
@@ -36,8 +37,8 @@ import org.scalatest.concurrent.Eventually
 import org.apache.spark.{SparkConf, TaskContext}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, SparkSession}
-import org.apache.spark.sql.execution.SerializeFromObjectExec
-import org.apache.spark.sql.functions.{col, spark_partition_id}
+import org.apache.spark.sql.execution.{SerializeFromObjectExec, SparkPlan}
+import org.apache.spark.sql.functions.{col, lit, spark_partition_id}
 
 class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventually {
   private val replaceConfKey = RapidsConf.SEQUENCEFILE_RDD_READ_ENABLED.key
@@ -317,6 +318,29 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
   private def bag[T](values: Seq[T]): Map[T, Int] =
     values.groupBy(identity).map { case (value, copies) => value -> copies.size }
 
+  private def captureWrite(write: => Unit): SparkPlan = {
+    ExecutionPlanCaptureCallback.startCapture()
+    write
+    val captured = ExecutionPlanCaptureCallback.getResultsWithTimeout()
+    assert(captured.length == 1,
+      s"Expected one write plan:\n${captured.mkString("\n")}")
+    ExecutionPlanCaptureCallback.extractExecutedPlan(captured.head)
+  }
+
+  private def writeParquetAndCapture(df: DataFrame, output: File): SparkPlan =
+    captureWrite(df.write.mode("overwrite").parquet(output.getAbsolutePath))
+
+  private def assertGpuFileWriter(
+      plan: SparkPlan,
+      expectWriteFiles: Boolean = SparkShimImpl.hasGpuWriteFiles): Unit = {
+    ExecutionPlanCaptureCallback.assertContains(plan, "GpuDataWritingCommandExec")
+    if (expectWriteFiles) {
+      ExecutionPlanCaptureCallback.assertContains(plan, "GpuWriteFilesExec")
+    } else {
+      ExecutionPlanCaptureCallback.assertNotContain(plan, "GpuWriteFilesExec")
+    }
+  }
+
   private def assertGpuRead(
       df: DataFrame,
       expected: Seq[(Seq[Byte], Seq[Byte])]): GpuSequenceFileRDDScanExec = {
@@ -351,6 +375,63 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
         assert(scan.sourceColumns ==
           Seq(SequenceFileRddReadProof.Key, SequenceFileRddReadProof.Value))
       }, replacementConf(keepReadsInOrder = false))
+    }
+  }
+
+  test("replace BLOCK-LZO RDD read when writing Parquet") {
+    withTempPath { input =>
+      assert(input.mkdirs())
+      writeLzoPartFiles(input, fileCount = 3, rowCount = 32, payloadSize = 512)
+      withGpuSparkSession({ spark =>
+        withTempPath { output =>
+          val expected = readWithHadoop(spark, input)
+          val plan = writeParquetAndCapture(copiedDataFrame(spark, input), output)
+          assertGpuFileWriter(plan)
+          val scans = plan.collect { case scan: GpuSequenceFileRDDScanExec => scan }
+          assert(scans.length == 1, s"Expected one GPU SequenceFile scan:\n$plan")
+          assert(scans.head.sourceRdd.getNumPartitions >
+            scans.head.outputPartitioning.numPartitions)
+          ExecutionPlanCaptureCallback.assertNotContain(plan, "GpuRowToColumnarExec")
+          ExecutionPlanCaptureCallback.assertNotContain(plan, "SerializeFromObjectExec")
+          ExecutionPlanCaptureCallback.assertNotContain(plan, "ExternalRDDScanExec")
+
+          val actual = collectPairs(
+            spark.read.parquet(output.getAbsolutePath).select("key", "value"))
+          assert(bag(actual) == bag(expected))
+        }
+      }, replacementConf())
+    }
+  }
+
+  test("partitioned Parquet write keeps the CPU SequenceFile scan") {
+    withSequenceFileSession(replacementConf(allowCpuPlan = true)) { (spark, input) =>
+      withTempPath { output =>
+        val df = copiedDataFrame(spark, input).withColumn("part", lit(1))
+        val plan = captureWrite(df.write.mode("overwrite").partitionBy("part")
+          .parquet(output.getAbsolutePath))
+        assertGpuFileWriter(plan)
+        ExecutionPlanCaptureCallback.assertNotContain(plan, "GpuSequenceFileRDDScanExec")
+        ExecutionPlanCaptureCallback.assertContains(plan, "SerializeFromObjectExec")
+        val actual = collectPairs(spark.read.parquet(output.getAbsolutePath)
+          .select("key", "value"))
+        assert(bag(actual) == bag(recordPairs))
+      }
+    }
+  }
+
+  test("replace RDD read for a Parquet write without planned WriteFiles") {
+    val conf = replacementConf()
+      .set("spark.sql.optimizer.plannedWrite.enabled", "false")
+    withSequenceFileSession(conf) { (spark, input) =>
+      withTempPath { output =>
+        val plan = writeParquetAndCapture(copiedDataFrame(spark, input), output)
+        assertGpuFileWriter(plan, expectWriteFiles = false)
+        ExecutionPlanCaptureCallback.assertContains(plan, "GpuSequenceFileRDDScanExec")
+        ExecutionPlanCaptureCallback.assertNotContain(plan, "SerializeFromObjectExec")
+        val actual = collectPairs(spark.read.parquet(output.getAbsolutePath)
+          .select("key", "value"))
+        assert(bag(actual) == bag(recordPairs))
+      }
     }
   }
 
@@ -527,6 +608,23 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
     }
   }
 
+  test("spark_partition_id keeps the CPU scan when writing Parquet") {
+    withMultiSplitDataFrame(replacementConf(allowCpuPlan = true)) { (spark, input, _) =>
+      withTempPath { output =>
+        val withPartitionId = input
+          .select(col("key"), col("value"), spark_partition_id().as("partition_id"))
+        val plan = writeParquetAndCapture(withPartitionId, output)
+        assertGpuFileWriter(plan)
+        ExecutionPlanCaptureCallback.assertNotContain(plan, "GpuSequenceFileRDDScanExec")
+        ExecutionPlanCaptureCallback.assertContains(plan, "SerializeFromObjectExec")
+
+        val actual = spark.read.parquet(output.getAbsolutePath).collect()
+        assert(actual.length == multiSplitRowCount)
+        assert(actual.map(_.getAs[Int]("partition_id")).toSet.size > 1)
+      }
+    }
+  }
+
   test("seeded sample over multiple source splits keeps the CPU scan") {
     val conf = replacementConf(allowCpuPlan = true)
       .set(RapidsConf.TEST_ALLOWED_NONGPU.key,
@@ -551,6 +649,29 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
       val rows = repartitioned.collect()
       assert(rows.length == multiSplitRowCount)
       assert(rows.map(_.getInt(2)).toSet == (0 until 5).toSet)
+    }
+  }
+
+  test("round-robin repartition keeps the CPU scan when writing Parquet") {
+    val conf = replacementConf(allowCpuPlan = true)
+      .set("spark.sql.adaptive.enabled", "false")
+      .set(RapidsConf.TEST_ALLOWED_NONGPU.key,
+        "SerializeFromObjectExec,ExternalRDDScanExec,ProjectExec," +
+          "ShuffleExchangeExec,RoundRobinPartitioning")
+    withMultiSplitDataFrame(conf) { (spark, input, _) =>
+      withTempPath { output =>
+        val repartitioned = input.repartition(5)
+          .select(col("key"), col("value"), spark_partition_id().as("partition_id"))
+
+        val plan = writeParquetAndCapture(repartitioned, output)
+        assertGpuFileWriter(plan)
+        ExecutionPlanCaptureCallback.assertNotContain(plan, "GpuSequenceFileRDDScanExec")
+        ExecutionPlanCaptureCallback.assertContains(plan, "SerializeFromObjectExec")
+
+        val actual = spark.read.parquet(output.getAbsolutePath).collect()
+        assert(actual.length == multiSplitRowCount)
+        assert(actual.map(_.getAs[Int]("partition_id")).toSet == (0 until 5).toSet)
+      }
     }
   }
 

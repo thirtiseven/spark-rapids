@@ -30,7 +30,6 @@ import com.nvidia.spark.rapids.shims._
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.rapids.hybrid.HybridExecutionUtils
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.rapids.TimeStamp
@@ -181,32 +180,32 @@ abstract class ReplacementRule[INPUT <: BASE, BASE, WRAP_TYPE <: RapidsMeta[INPU
       val notesMsg = notes()
       if (asTable) {
         import ConfHelper.makeConfAnchor
-        print(s"${makeConfAnchor(confKey)}")
+        ConsoleOutput.write(s"${makeConfAnchor(confKey)}")
         if (sparkSQLFunctions.isDefined) {
-          print(s"|${sparkSQLFunctions.get}")
+          ConsoleOutput.write(s"|${sparkSQLFunctions.get}")
         }
         val incompatOps = RapidsConf.INCOMPATIBLE_OPS.asInstanceOf[ConfEntryWithDefault[Boolean]]
         val expressionEnabled = disabledMsg.isEmpty &&
           (incompatDoc.isEmpty || incompatOps.defaultValue)
-        print(s"|$desc|$expressionEnabled|")
+        ConsoleOutput.write(s"|$desc|$expressionEnabled|")
         if (notesMsg.isDefined) {
-          print(s"${notesMsg.get}")
+          ConsoleOutput.write(s"${notesMsg.get}")
         } else {
-          print("None")
+          ConsoleOutput.write("None")
         }
-        println("|")
+        ConsoleOutput.writeLine("|")
       } else {
-        println(s"$confKey:")
-        println(s"\tEnable (true) or disable (false) the $tag $operationName.")
+        ConsoleOutput.writeLine(s"$confKey:")
+        ConsoleOutput.writeLine(s"\tEnable (true) or disable (false) the $tag $operationName.")
         if (sparkSQLFunctions.isDefined) {
-          println(s"\tsql function: ${sparkSQLFunctions.get}")
+          ConsoleOutput.writeLine(s"\tsql function: ${sparkSQLFunctions.get}")
         }
-        println(s"\t$desc")
+        ConsoleOutput.writeLine(s"\t$desc")
         if (notesMsg.isDefined) {
-          println(s"\t${notesMsg.get}")
+          ConsoleOutput.writeLine(s"\t${notesMsg.get}")
         }
-        println(s"\tdefault: ${notesMsg.isEmpty}")
-        println()
+        ConsoleOutput.writeLine(s"\tdefault: ${notesMsg.isEmpty}")
+        ConsoleOutput.writeLine()
       }
     }
   }
@@ -1300,7 +1299,6 @@ case class GpuOverrides(sparkSession: SparkSession = null) extends Rule[SparkPla
       GpuOverrides.logDuration(conf.shouldExplain,
         t => f"Plan conversion to the GPU took $t%.2f ms") {
         var updatedPlan = updateForAdaptivePlan(plan, conf)
-        updatedPlan = HybridExecutionUtils.tryToApplyHybridScanRules(updatedPlan, conf)
         updatedPlan = SparkShimImpl.applyShimPlanRules(updatedPlan, conf)
         updatedPlan = applyOverrides(updatedPlan, conf)
         if (conf.logQueryTransformations) {
@@ -1313,7 +1311,6 @@ case class GpuOverrides(sparkSession: SparkSession = null) extends Rule[SparkPla
     } else if (conf.isSqlEnabled && conf.isSqlExplainOnlyEnabled) {
       // this mode logs the explain output and returns the original CPU plan
       var updatedPlan = updateForAdaptivePlan(plan, conf)
-      updatedPlan = HybridExecutionUtils.tryToApplyHybridScanRules(updatedPlan, conf)
       updatedPlan = SparkShimImpl.applyShimPlanRules(updatedPlan, conf)
       GpuOverrides.explainCatalystSQLPlan(updatedPlan, conf)
       plan

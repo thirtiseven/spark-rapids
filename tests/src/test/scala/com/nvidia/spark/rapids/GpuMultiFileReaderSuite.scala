@@ -114,4 +114,54 @@ class GpuMultiFileReaderSuite extends AnyFunSuite with RmmSparkRetrySuiteBase {
       assert(executor.awaitTermination(10, TimeUnit.SECONDS))
     }
   }
+
+  test("empty buffers do not end the reader while combined leftovers remain") {
+    def buffers(rows: Long): HostMemoryBuffersWithMetaDataBase =
+      new HostMemoryBuffersWithMetaDataBase {
+        override val partitionedFile: PartitionedFile =
+          PartitionedFileUtilsShim.newPartitionedFile(InternalRow.empty, "file:/unused", 0, 0)
+        override val memBuffersAndSizes: Array[SingleHMBAndMeta] =
+          Array(SingleHMBAndMeta.empty(rows))
+        override val bytesRead: Long = 0
+      }
+
+    val reader = new MultiFileCloudPartitionReaderBase(
+      new Configuration(false), Array.empty, DefaultThreadPoolConf(1, false),
+      1, Array.empty, Map.empty, 10, 1024) {
+      // All futures have been consumed, but the last combination left buffered results behind.
+      currentFileHostBuffers = Some(buffers(0))
+      combineLeftOverFiles = Some(Array(buffers(0), buffers(1)))
+
+      override def combineHMBs(
+          results: Array[HostMemoryBuffersWithMetaDataBase]): HostMemoryBuffersWithMetaDataBase = {
+        if (results.length > 1) {
+          combineLeftOverFiles = Some(results.tail)
+        }
+        results.head
+      }
+
+      override def getBatchRunner(
+          tc: TaskContext,
+          file: PartitionedFile,
+          conf: Configuration,
+          filters: Array[Filter]): AsyncRunner[HostMemoryBuffersWithMetaDataBase] =
+        throw new IllegalStateException("No unread files should be scheduled")
+
+      override def readBatches(
+          result: HostMemoryBuffersWithMetaDataBase): Iterator[ColumnarBatch] = {
+        withResource(result) { _ =>
+          new SingleGpuColumnarBatchIterator(
+            new ColumnarBatch(Array.empty, result.memBuffersAndSizes.head.numRows.toInt))
+        }
+      }
+
+      override def getFileFormatShortName: String = "test"
+    }
+
+    withResource(reader) { _ =>
+      assert(reader.next())
+      withResource(reader.get()) { batch => assert(batch.numRows() == 1) }
+      assert(!reader.next())
+    }
+  }
 }

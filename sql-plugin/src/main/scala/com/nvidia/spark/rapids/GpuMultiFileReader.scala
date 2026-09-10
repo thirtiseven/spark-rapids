@@ -958,7 +958,8 @@ abstract class MultiFileCloudPartitionReaderBase(
           }
         }
 
-        if (batchIter.hasNext || filesToRead == 0 || isDone) {
+        if (batchIter.hasNext || isDone || (filesToRead == 0 &&
+            currentFileHostBuffers.isEmpty && combineLeftOverFiles.isEmpty)) {
           continue = false
         }
       }

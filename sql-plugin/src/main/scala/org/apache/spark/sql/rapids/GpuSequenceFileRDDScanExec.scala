@@ -33,7 +33,8 @@ import org.apache.spark.util.SerializableConfiguration
 case class GpuSequenceFileRDDScanExec(
     outputAttrs: Seq[Attribute],
     sourceColumns: Seq[SequenceFileRddReadProof.SourceColumn],
-    @transient sourceRdd: NewHadoopRDD[Any, Any])(
+    @transient sourceRdd: NewHadoopRDD[Any, Any],
+    queryUsesInputFile: Boolean = false)(
     @transient val rapidsConf: RapidsConf)
   extends ShimLeafExecNode with GpuExec {
 
@@ -99,6 +100,7 @@ case class GpuSequenceFileRDDScanExec(
       sparkSession.sessionState.conf,
       broadcastedConf,
       keyFirst,
+      queryUsesInputFile,
       rapidsConf,
       allMetrics)
   }

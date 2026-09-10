@@ -1799,8 +1799,9 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
   val SEQUENCEFILE_RDD_READ_ENABLED =
     conf("spark.rapids.sql.format.sequencefile.rdd.read.enabled")
       .doc("When set to true, replaces exactly proven SequenceFile binary RDD reads with the " +
-        "GPU SequenceFile reader. This optimization may regroup the source RDD's " +
-        "selected input splits and therefore does not preserve its partition identity.")
+        "GPU SequenceFile reader. The reader preserves the binary records and their " +
+        "multiplicity, but may regroup input splits into different scan partitions. " +
+        "Original RDD partition IDs and partition-dependent results are not preserved.")
       .internal()
       .booleanConf
       .createWithDefault(false)

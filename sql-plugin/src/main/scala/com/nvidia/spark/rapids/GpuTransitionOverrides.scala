@@ -39,7 +39,7 @@ import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2ScanExecBase, 
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, ENSURE_REQUIREMENTS,
   Exchange, ReusedExchangeExec, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec}
-import org.apache.spark.sql.rapids.{GpuDataSourceScanExec, GpuFileSourceScanExec, GpuShuffleEnv, GpuTaskMetrics}
+import org.apache.spark.sql.rapids.{GpuDataSourceScanExec, GpuFileSourceScanExec, GpuSequenceFileRDDScanExec, GpuShuffleEnv, GpuTaskMetrics}
 import org.apache.spark.sql.rapids.execution.{ExchangeMappingCache, GpuBroadcastExchangeExec, GpuBroadcastExchangeExecBase, GpuBroadcastToRowExec, GpuCustomShuffleReaderExec, GpuHashJoin, GpuShuffleExchangeExecBase, GpuSubqueryBroadcastExec}
 import org.apache.spark.sql.types.StructType
 
@@ -380,6 +380,7 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
     case _: GpuDataSourceScanExec => true
     case _: DataSourceV2ScanExecBase => true
     case _: RDDScanExec => true // just in case an RDD was reading in data
+    case _: GpuSequenceFileRDDScanExec => true
     case p => p.children.exists(hasDirectLineToInput)
   }
 
@@ -392,6 +393,7 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
     case _: GpuDataSourceScanExec => true
     case _: DataSourceV2ScanExecBase => true
     case _: RDDScanExec => true // just in case an RDD was reading in data
+    case _: GpuSequenceFileRDDScanExec => true
     case _: ExpandExec => true
     case _ => false
   }
@@ -424,6 +426,12 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
           }
         } else {
           batchScan
+        }
+      case sequenceFileScan: GpuSequenceFileRDDScanExec =>
+        if (disableUntilInput) {
+          sequenceFileScan.copy(queryUsesInputFile = true)(sequenceFileScan.rapidsConf)
+        } else {
+          sequenceFileScan
         }
       case fileSourceScan: GpuFileSourceScanExec =>
         if ((disableUntilInput || disableScanUntilInput(fileSourceScan))) {

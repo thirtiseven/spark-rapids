@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.sql.catalyst.expressions.{Expression, InputFileBlockLength, InputFileBlockStart, InputFileName}
-import org.apache.spark.sql.execution.{FileSourceScanExec, LeafExecNode, SparkPlan}
+import org.apache.spark.sql.execution.{FileSourceScanExec, LeafExecNode, SerializeFromObjectExec, SparkPlan}
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, ShuffleExchangeLike}
 import org.apache.spark.sql.rapids.{GpuInputFileBlockLength, GpuInputFileBlockStart, GpuInputFileName}
@@ -61,6 +61,11 @@ object InputFileBlockRule {
         if (plan.canThisBeReplaced) { // FileScan can be replaced
           key.map(p => resultOps.remove(p)) // Remove the chain from Map
         }
+      case _: SerializeFromObjectExec
+          if plan.isInstanceOf[GpuSequenceFileSerializeFromObjectExecMeta] &&
+            plan.canThisBeReplaced =>
+        // The atomic replacement owns the input-file metadata just like a GPU file scan.
+        key.foreach(resultOps.remove)
       case _: BroadcastExchangeLike =>
         // noop: Don't go any further, the file info cannot come from a broadcast.
       case _: LeafExecNode => // We've reached the LeafNode but without any FileScan

@@ -36,9 +36,9 @@ import org.scalatest.concurrent.Eventually
 
 import org.apache.spark.{SparkConf, TaskContext}
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
 import org.apache.spark.sql.execution.{SerializeFromObjectExec, SparkPlan}
-import org.apache.spark.sql.functions.{col, lit, spark_partition_id}
+import org.apache.spark.sql.functions.{col, input_file_name, lit, spark_partition_id}
 
 class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventually {
   private val replaceConfKey = RapidsConf.SEQUENCEFILE_RDD_READ_ENABLED.key
@@ -318,6 +318,13 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
   private def bag[T](values: Seq[T]): Map[T, Int] =
     values.groupBy(identity).map { case (value, copies) => value -> copies.size }
 
+  private def binaryRowBag(rows: Array[Row]): Map[Seq[Any], Int] = {
+    bag(rows.toSeq.map(_.toSeq.map {
+      case bytes: Array[Byte] => bytes.toSeq
+      case value => value
+    }))
+  }
+
   private def captureWrite(write: => Unit): SparkPlan = {
     ExecutionPlanCaptureCallback.startCapture()
     write
@@ -403,15 +410,15 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
     }
   }
 
-  test("partitioned Parquet write keeps the CPU SequenceFile scan") {
+  test("partitioned Parquet write retains the GPU SequenceFile scan") {
     withSequenceFileSession(replacementConf(allowCpuPlan = true)) { (spark, input) =>
       withTempPath { output =>
         val df = copiedDataFrame(spark, input).withColumn("part", lit(1))
         val plan = captureWrite(df.write.mode("overwrite").partitionBy("part")
           .parquet(output.getAbsolutePath))
         assertGpuFileWriter(plan)
-        ExecutionPlanCaptureCallback.assertNotContain(plan, "GpuSequenceFileRDDScanExec")
-        ExecutionPlanCaptureCallback.assertContains(plan, "SerializeFromObjectExec")
+        ExecutionPlanCaptureCallback.assertContains(plan, "GpuSequenceFileRDDScanExec")
+        ExecutionPlanCaptureCallback.assertNotContain(plan, "SerializeFromObjectExec")
         val actual = collectPairs(spark.read.parquet(output.getAbsolutePath)
           .select("key", "value"))
         assert(bag(actual) == bag(recordPairs))
@@ -471,7 +478,7 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
     }
   }
 
-  test("early termination closes the completion-order RDD reader") {
+  test("early termination closes the RDD reader") {
     withTempPath { directory =>
       assert(directory.mkdirs())
       writeLzoPartFiles(directory, fileCount = 4, rowCount = 16, payloadSize = 2048)
@@ -595,11 +602,11 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
     }
   }
 
-  test("spark_partition_id keeps the CPU path and partition semantics") {
+  test("spark_partition_id reports GPU scan partitions with a GPU scan") {
     withSequenceFileSession(replacementConf(allowCpuPlan = true)) { (spark, file) =>
       val df = copiedDataFrame(spark, file)
         .select(col("key"), col("value"), spark_partition_id().as("partition_id"))
-      assertCpuRddScan(df)
+      gpuScan(df)
       val actual = df.collect().map { row =>
         ((row.getAs[Array[Byte]](0).toSeq, row.getAs[Array[Byte]](1).toSeq), row.getInt(2))
       }.toSeq
@@ -608,51 +615,63 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
     }
   }
 
-  test("spark_partition_id keeps the CPU scan when writing Parquet") {
+  test("spark_partition_id reports GPU scan partitions when writing Parquet") {
     withMultiSplitDataFrame(replacementConf(allowCpuPlan = true)) { (spark, input, _) =>
       withTempPath { output =>
         val withPartitionId = input
           .select(col("key"), col("value"), spark_partition_id().as("partition_id"))
         val plan = writeParquetAndCapture(withPartitionId, output)
         assertGpuFileWriter(plan)
-        ExecutionPlanCaptureCallback.assertNotContain(plan, "GpuSequenceFileRDDScanExec")
-        ExecutionPlanCaptureCallback.assertContains(plan, "SerializeFromObjectExec")
+        ExecutionPlanCaptureCallback.assertContains(plan, "GpuSequenceFileRDDScanExec")
+        ExecutionPlanCaptureCallback.assertNotContain(plan, "SerializeFromObjectExec")
 
         val actual = spark.read.parquet(output.getAbsolutePath).collect()
         assert(actual.length == multiSplitRowCount)
-        assert(actual.map(_.getAs[Int]("partition_id")).toSet.size > 1)
+        val scanPartitions = plan.collectFirst {
+          case scan: GpuSequenceFileRDDScanExec => scan.outputPartitioning.numPartitions
+        }.get
+        assert(actual.map(_.getAs[Int]("partition_id")).toSet == (0 until scanPartitions).toSet)
       }
     }
   }
 
-  test("seeded sample over multiple source splits keeps the CPU scan") {
-    val conf = replacementConf(allowCpuPlan = true)
-      .set(RapidsConf.TEST_ALLOWED_NONGPU.key,
-        "SerializeFromObjectExec,ExternalRDDScanExec,ProjectExec,SampleExec")
+  private def assertDownstreamMatchesCpu(
+      input: DataFrame,
+      conf: SparkConf)(transform: DataFrame => DataFrame): Unit = {
+    val (cpu, gpu) = runOnCpuAndGpu(
+      spark => Dataset.ofRows(spark, input.logicalPlan),
+      transform,
+      conf = conf,
+      repart = 0,
+      existClasses = "GpuSequenceFileRDDScanExec",
+      nonExistClasses = "ExternalRDDScanExec")
+    assert(binaryRowBag(cpu) == binaryRowBag(gpu))
+  }
+
+  test("seeded sample accepts a GPU RDD scan") {
+    val conf = replacementConf().set(RapidsConf.TEST_ALLOWED_NONGPU.key, "SampleExec")
     withMultiSplitDataFrame(conf) { (_, input, _) =>
+      val expected = bag(collectPairs(input))
       val sampled = input.sample(withReplacement = false, fraction = 0.5, seed = 37L)
-      assertCpuRddScan(sampled)
-      assert(sampled.collect().nonEmpty)
+      gpuScan(sampled)
+      val actual = bag(collectPairs(sampled))
+      assert(actual.nonEmpty)
+      assert(actual.forall { case (record, copies) => expected.getOrElse(record, 0) >= copies })
     }
   }
 
-  test("round-robin repartition over multiple source splits keeps the CPU scan") {
-    val conf = replacementConf(allowCpuPlan = true)
+  test("round-robin repartition accepts a GPU RDD scan") {
+    val conf = replacementConf()
       .set("spark.sql.adaptive.enabled", "false")
-      .set(RapidsConf.TEST_ALLOWED_NONGPU.key,
-        "SerializeFromObjectExec,ExternalRDDScanExec,ProjectExec," +
-          "ShuffleExchangeExec,RoundRobinPartitioning")
+      .set(RapidsConf.TEST_ALLOWED_NONGPU.key, "ShuffleExchangeExec,RoundRobinPartitioning")
     withMultiSplitDataFrame(conf) { (_, input, _) =>
-      val repartitioned = input.repartition(5)
-        .select(col("key"), col("value"), spark_partition_id().as("partition_id"))
-      assertCpuRddScan(repartitioned)
-      val rows = repartitioned.collect()
-      assert(rows.length == multiSplitRowCount)
-      assert(rows.map(_.getInt(2)).toSet == (0 until 5).toSet)
+      assertDownstreamMatchesCpu(input, conf) {
+        _.repartition(5).select(col("key"), col("value"))
+      }
     }
   }
 
-  test("round-robin repartition keeps the CPU scan when writing Parquet") {
+  test("round-robin repartition retains the GPU scan when writing Parquet") {
     val conf = replacementConf(allowCpuPlan = true)
       .set("spark.sql.adaptive.enabled", "false")
       .set(RapidsConf.TEST_ALLOWED_NONGPU.key,
@@ -665,8 +684,8 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
 
         val plan = writeParquetAndCapture(repartitioned, output)
         assertGpuFileWriter(plan)
-        ExecutionPlanCaptureCallback.assertNotContain(plan, "GpuSequenceFileRDDScanExec")
-        ExecutionPlanCaptureCallback.assertContains(plan, "SerializeFromObjectExec")
+        ExecutionPlanCaptureCallback.assertContains(plan, "GpuSequenceFileRDDScanExec")
+        ExecutionPlanCaptureCallback.assertNotContain(plan, "SerializeFromObjectExec")
 
         val actual = spark.read.parquet(output.getAbsolutePath).collect()
         assert(actual.length == multiSplitRowCount)
@@ -675,37 +694,83 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
     }
   }
 
-  test("Dataset mapPartitions over multiple source splits keeps the CPU scan") {
-    val conf = replacementConf(allowCpuPlan = true)
+  test("Dataset mapPartitions can consume a GPU RDD scan") {
+    val conf = replacementConf()
       .set(RapidsConf.TEST_ALLOWED_NONGPU.key,
-        "SerializeFromObjectExec,ExternalRDDScanExec,ProjectExec," +
-          "MapPartitionsExec,DeserializeToObjectExec")
-    withMultiSplitDataFrame(conf) { (spark, input, sourcePartitions) =>
-      import spark.implicits._
-      val partitionSizes = input.as[(Array[Byte], Array[Byte])]
-        .mapPartitions(records => Iterator.single(records.size))
-        .toDF("rows")
-      assertCpuRddScan(partitionSizes)
-      val sizes = partitionSizes.collect().map(_.getInt(0)).toSeq
-      assert(sizes.length == sourcePartitions)
-      assert(sizes.sum == multiSplitRowCount)
+        "SerializeFromObjectExec,MapPartitionsExec,DeserializeToObjectExec")
+    withMultiSplitDataFrame(conf) { (_, input, _) =>
+      assertDownstreamMatchesCpu(input, conf) { df =>
+        val spark = df.sparkSession
+        import spark.implicits._
+        df.as[(Array[Byte], Array[Byte])].mapPartitions { records =>
+          records.map { case (key, value) => (value, key) }
+        }.toDF("value", "key")
+      }
     }
   }
 
-  test("Dataset map using TaskContext partition ID keeps the CPU scan") {
-    val conf = replacementConf(allowCpuPlan = true)
+  test("Dataset map using TaskContext accepts a GPU scan") {
+    val conf = replacementConf()
       .set(RapidsConf.TEST_ALLOWED_NONGPU.key,
-        "SerializeFromObjectExec,ExternalRDDScanExec,ProjectExec," +
-          "MapElementsExec,DeserializeToObjectExec")
-    withMultiSplitDataFrame(conf) { (spark, input, sourcePartitions) =>
+        "SerializeFromObjectExec,MapElementsExec,DeserializeToObjectExec")
+    withMultiSplitDataFrame(conf) { (spark, input, _) =>
       import spark.implicits._
-      val partitionIds = input.as[(Array[Byte], Array[Byte])].map { pair =>
+      val expected = bag(collectPairs(input))
+      val mapped = input.as[(Array[Byte], Array[Byte])].map { pair =>
         (TaskContext.getPartitionId(), pair._1, pair._2)
       }.toDF("partition_id", "key", "value")
-      assertCpuRddScan(partitionIds)
-      val ids = partitionIds.collect().map(_.getInt(0)).toSet
-      assert(ids.size > 1)
-      assert(ids.forall(id => id >= 0 && id < sourcePartitions))
+      val partitions = gpuScan(mapped).outputPartitioning.numPartitions
+      val rows = mapped.collect()
+      assert(rows.forall(row => row.getInt(0) >= 0 && row.getInt(0) < partitions))
+      assert(bag(rows.map { row =>
+        row.getAs[Array[Byte]](1).toSeq -> row.getAs[Array[Byte]](2).toSeq
+      }.toSeq) == expected)
+    }
+  }
+
+  test("aggregate, join, sort and limit accept a GPU RDD scan") {
+    val conf = replacementConf().set(RapidsConf.TEST_ALLOWED_NONGPU.key,
+      "TakeOrderedAndProjectExec,SortMergeJoinExec,SortExec,ShuffleExchangeExec,HashPartitioning")
+    withMultiSplitDataFrame(conf) { (_, input, _) =>
+      assertDownstreamMatchesCpu(input, conf) { df =>
+        val counts = df.groupBy("key", "value").count()
+        df.join(counts, Seq("key", "value")).orderBy("key").limit(10)
+      }
+    }
+  }
+
+  test("input file name preserves provenance across multiple files with a GPU scan") {
+    withTempPath { directory =>
+      assert(directory.mkdirs())
+      writeLzoPartFiles(directory, fileCount = 3, rowCount = 32, payloadSize = 512)
+      val conf = replacementConf(keepReadsInOrder = false)
+      val (cpu, gpu) = runOnCpuAndGpu(
+        spark => copiedDataFrame(spark, directory),
+        _.select(col("key"), col("value"), input_file_name().as("file")),
+        conf = conf,
+        repart = 0,
+        existClasses = "GpuSequenceFileRDDScanExec",
+        nonExistClasses = "ExternalRDDScanExec")
+      assert(cpu.map(_.getString(2)).toSet.size == 3)
+      assert(binaryRowBag(cpu) == binaryRowBag(gpu))
+    }
+  }
+
+  test("small-file regrouping preserves empty records and duplicate multiplicity") {
+    withTempPath { directory =>
+      assert(directory.mkdirs())
+      val duplicate = Array[Byte](1, 2) -> Array[Byte](3, 4)
+      val fileRecords = Seq(duplicate, duplicate, Array.emptyByteArray -> Array.emptyByteArray)
+      (0 until 4).foreach { index =>
+        writeRawFile(new File(directory, s"part-$index.seq"), fileRecords, CompressionType.BLOCK)
+      }
+      writeRawFile(new File(directory, "empty.seq"), Seq.empty, CompressionType.BLOCK)
+      withGpuSparkSession({ spark =>
+        val df = copiedDataFrame(spark, directory)
+        val scan = assertGpuRead(df, readWithHadoop(spark, directory))
+        assert(scan.outputPartitioning.numPartitions < scan.sourceRdd.getNumPartitions)
+        assert(scan.allMetrics(GpuMetric.NUM_OUTPUT_BATCHES).value < 4)
+      }, replacementConf(keepReadsInOrder = true))
     }
   }
 

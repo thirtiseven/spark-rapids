@@ -41,6 +41,7 @@ import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.sql.connector.read.{PartitionReader, PartitionReaderFactory}
 import org.apache.spark.sql.execution.datasources.PartitionedFile
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.rapids.InputFileUtils
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.BinaryType
@@ -288,7 +289,8 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
     maxReadBatchSizeBytes: Long,
     maxGpuColumnSizeBytes: Long,
     keepReadsInOrder: Boolean,
-    combineWaitTime: Int)
+    combineWaitTime: Int,
+    queryUsesInputFile: Boolean)
   extends MultiFileCloudPartitionReaderBase(
     conf,
     files,
@@ -628,6 +630,12 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
 
   override def readBatches(
       fileBufsAndMeta: HostMemoryBuffersWithMetaDataBase): Iterator[ColumnarBatch] = {
+    if (queryUsesInputFile) {
+      val file = fileBufsAndMeta.partitionedFile
+      // NewHadoopRDD exposes Path.toString, which can differ from SparkPath's URI spelling.
+      InputFileUtils.setInputFileBlock(
+        new Path(new URI(file.filePath.toString)).toString, file.start, file.length)
+    }
     val buffers = fileBufsAndMeta.asInstanceOf[SequenceFileBuffers]
     if (!tracker.claim(buffers.sourceBuffers)) {
       buffers.close()
@@ -657,7 +665,7 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
     new SingleGpuColumnarBatchIterator(batch)
   }
 
-  override def canUseCombine: Boolean = true
+  override def canUseCombine: Boolean = !queryUsesInputFile
 
   override def combineHMBs(
       results: Array[HostMemoryBuffersWithMetaDataBase]): HostMemoryBuffersWithMetaDataBase = {
@@ -714,6 +722,7 @@ private[rapids] case class GpuSequenceFilePartitionReaderFactory(
     @transient sqlConf: SQLConf,
     broadcastedConf: Broadcast[SerializableConfiguration],
     keyFirst: Boolean,
+    queryUsesInputFile: Boolean,
     @transient rapidsConf: RapidsConf,
     poolConfBuilder: ThreadPoolConfBuilder,
     metrics: Map[String, GpuMetric])
@@ -741,7 +750,8 @@ private[rapids] case class GpuSequenceFilePartitionReaderFactory(
       maxReadBatchSizeBytes,
       maxGpuColumnSizeBytes,
       keepReadsInOrder,
-      combineWaitTime)
+      combineWaitTime,
+      queryUsesInputFile)
   }
 
   override protected def buildBaseColumnarReaderForCoalescing(
@@ -758,12 +768,14 @@ object GpuSequenceFileRDDReader {
       sqlConf: SQLConf,
       broadcastedConf: Broadcast[SerializableConfiguration],
       keyFirst: Boolean,
+      queryUsesInputFile: Boolean,
       rapidsConf: RapidsConf,
       metrics: Map[String, GpuMetric]): PartitionReaderFactory = {
     GpuSequenceFilePartitionReaderFactory(
       sqlConf,
       broadcastedConf,
       keyFirst,
+      queryUsesInputFile,
       rapidsConf,
       ThreadPoolConfBuilder(rapidsConf),
       metrics)

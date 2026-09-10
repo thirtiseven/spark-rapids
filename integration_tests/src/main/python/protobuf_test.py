@@ -2437,7 +2437,7 @@ def test_from_protobuf_signed_integers(
         decoded = _call_from_protobuf(
             from_protobuf_fn, f.col("bin"), "test.WithSignedInts",
             desc_path, desc_bytes)
-        
+
         return df.select(
             decoded.getField("si32").alias("si32"),
             decoded.getField("si64").alias("si64"),
@@ -2926,7 +2926,7 @@ def test_from_protobuf_bug1_name_collision(
         df = spark.createDataFrame(fixture_rows, fixture_schema)
         decoded = _call_from_protobuf(
             from_protobuf_fn, f.col("bin"), "test.Event", desc_path, desc_bytes)
-        
+
         return df.select(
             decoded.getField("user_info").getField("age").alias("age"),
             decoded.getField("user_info").getField("id").alias("user_id"),
@@ -2965,7 +2965,7 @@ def test_from_protobuf_bug2_filter_jump(
             from_protobuf_fn, f.col("bin"), "test.Event", desc_path, desc_bytes)
         pb_expr2 = _call_from_protobuf(
             from_protobuf_fn, f.col("bin"), "test.Event", desc_path, desc_bytes)
-        
+
         return df.filter(pb_expr1.getField("status") == 1).select(pb_expr2.getField("ad_info").alias("ad_info"))
 
     assert_gpu_and_cpu_are_equal_collect(run_on_spark)
@@ -3009,10 +3009,10 @@ def test_from_protobuf_bug3_unrelated_struct_name_collision(
         path = spark_tmp_path + "/bug3_data.parquet"
         df_with_other.write.mode("overwrite").parquet(path)
         read_df = spark.read.parquet(path)
-        
+
         decoded = _call_from_protobuf(
             from_protobuf_fn, f.col("bin"), "test.Event", desc_path, desc_bytes)
-        
+
         # We only select decoded.ad_info.winfoid, so dummy is pruned.
         # winfoid gets ordinal 0 in the pruned schema.
         # But for other_struct, winfoid is ordinal 1.

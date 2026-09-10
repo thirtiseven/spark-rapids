@@ -305,7 +305,7 @@ object ProtobufExprShims extends org.apache.spark.internal.Logging {
                 return
               }, flatFields += _)
 
-              // For nested struct types (including repeated message = ArrayType(StructType)), 
+              // For nested struct types (including repeated message = ArrayType(StructType)),
               // add child fields
               sf.dataType match {
                 case st: StructType if containingMsgDesc != null =>
@@ -313,15 +313,15 @@ object ProtobufExprShims extends org.apache.spark.internal.Logging {
                   // expansion path; the flat parent entry's isRepeated flag distinguishes them.
                   addChildFieldsFromStruct(
                     st, containingMsgDesc, sf.name, currentIdx, depth, isOutput, pathPrefix)
-                  
+
                 case ArrayType(st: StructType, _) if containingMsgDesc != null =>
                   addChildFieldsFromStruct(
                     st, containingMsgDesc, sf.name, currentIdx, depth, isOutput, pathPrefix)
-                  
+
                 case _ => // Not a struct, no children to add
               }
             }
-            
+
             // Helper to add child fields from a struct type.
             // Applies nested schema pruning at arbitrary depth using path-based
             // lookup into nestedFieldRequirements.

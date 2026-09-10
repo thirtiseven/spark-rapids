@@ -29,7 +29,8 @@
 #   - SPARK_HOME: Path to your Apache Spark installation.
 #   - SKIP_TESTS: If set to true, skips running the Python integration tests.
 #   - INCLUDE_SPARK_AVRO_JAR: If set to true, includes Avro tests.
-#   - INCLUDE_SPARK_PROTOBUF_JAR: Controls external spark-protobuf jar injection, not test selection.
+#   - INCLUDE_SPARK_PROTOBUF_JAR: Controls external spark-protobuf jar injection; setting it to
+#                                false also disables protobuf tests on Apache Spark.
 #   - TEST: Specifies a specific test to run.
 #   - TEST_TAGS: Allows filtering tests based on tags.
 #   - TEST_TYPE: Specifies the type of tests to run.
@@ -184,8 +185,9 @@ else
         if [[ "$INCLUDE_SPARK_PROTOBUF_JAR_REQUESTED" != "false" \
               && "$PROTOBUF_JAR_COUNT" -gt 1 ]]; then
             >&2 echo "WARNING: Multiple spark-protobuf jars were found (matched: $PROTOBUF_JARS); not injecting spark-protobuf."
-        elif [[ "$INCLUDE_SPARK_PROTOBUF_JAR_REQUESTED" == "true" ]]; then
-            >&2 echo "WARNING: INCLUDE_SPARK_PROTOBUF_JAR=true was requested but a spark-protobuf jar was not found (searched: $PROTOBUF_JARS)."
+        elif [[ "$INCLUDE_SPARK_PROTOBUF_JAR_REQUESTED" != "false" ]] \
+             && printf '%s\n' "3.4.0" "$VERSION_STRING" | sort -V | head -1 | grep -qx "3.4.0"; then
+            >&2 echo "WARNING: a spark-protobuf jar was not found (searched: $PROTOBUF_JARS); protobuf tests will be skipped."
         fi
         export INCLUDE_SPARK_PROTOBUF_JAR=false
         PROTOBUF_JARS=""
@@ -481,20 +483,6 @@ else
     # See AllocationRetryCoverageTracker.scala and https://github.com/NVIDIA/spark-rapids/issues/13672
     if [[ -n "${SPARK_RAPIDS_RETRY_COVERAGE_TRACKING}" ]]; then
         export PYSP_TEST_spark_executorEnv_SPARK_RAPIDS_RETRY_COVERAGE_TRACKING="${SPARK_RAPIDS_RETRY_COVERAGE_TRACKING}"
-    fi
-
-    # Turns on $LOAD_HYBRID_BACKEND and setup the filepath of hybrid backend jars, to activate the
-    # hybrid backend while running subsequent integration tests.
-    if [[ "$LOAD_HYBRID_BACKEND" -eq 1 ]]; then
-      if [ -z "${HYBRID_BACKEND_JARS}" ]; then
-        echo "Error: Environment HYBRID_BACKEND_JARS is not set."
-        exit 1
-      fi
-      export PYSP_TEST_spark_jars="${PYSP_TEST_spark_jars},${HYBRID_BACKEND_JARS//:/,}"
-      export PYSP_TEST_spark_rapids_sql_hybrid_loadBackend=true
-      export PYSP_TEST_spark_memory_offHeap_enabled=true
-      export PYSP_TEST_spark_memory_offHeap_size=512M
-      export PYSP_TEST_spark_gluten_loadLibFromJar=true
     fi
 
     SPARK_SHELL_SMOKE_TEST="${SPARK_SHELL_SMOKE_TEST:-0}"

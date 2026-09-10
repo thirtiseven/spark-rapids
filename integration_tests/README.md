@@ -86,6 +86,8 @@ For manual installation, you need to setup your environment:
 - pytest
   : A framework that makes it easy to write small, readable tests, and can scale to support complex
   functional testing for applications and libraries (requires  Python 3.6+).
+- protobuf
+  : Provides Protocol Buffers APIs for protobuf integration-test fixtures.
 - sre_yield
   : Provides a set of APIs to generate string data from a regular expression.
 - pandas
@@ -301,16 +303,16 @@ when certain environments have different behavior, and the tests don't have a go
 
 #### Protobuf tests on Databricks
 
-`INCLUDE_SPARK_PROTOBUF_JAR` controls external `spark-protobuf` jar injection; it does not control
-protobuf test eligibility. Apache Spark runs inject a matching external jar only when exactly one is
-found and this variable is not set to `false`. Databricks runs use the runtime-bundled protobuf
-implementation instead, so `run_pyspark_from_build.sh --runtime_env=databricks` does not inject a
-matching jar from either the build dependencies or `LOCAL_JAR_PATH`, even if the variable is
-explicitly set to `true`.
+On Databricks, `INCLUDE_SPARK_PROTOBUF_JAR` controls only external `spark-protobuf` jar injection; it
+does not control protobuf test eligibility. Apache Spark runs require a matching external jar and
+skip the protobuf tests when this variable is set to `false`. Databricks runs use the runtime-bundled
+protobuf implementation instead, so `run_pyspark_from_build.sh --runtime_env=databricks` does not
+inject a matching jar from either the build dependencies or `LOCAL_JAR_PATH`, even if the variable
+is explicitly set to `true`.
 
 The protobuf tests detect the bundled runtime independently. Descriptor sets are generated with the
-Python protobuf library, so the full test module remains enabled without relying on Spark's private,
-runtime-specific shaded protobuf classes.
+Python protobuf library or provided as static fixtures, so the tests do not depend on Spark's
+private, runtime-specific shaded protobuf classes.
 
 ### timezone
 
@@ -460,19 +462,6 @@ non_utc_allow_for_sequence = ['ProjectExec'] # Update after non-utc time zone is
 @allow_non_gpu(*non_utc_allow_for_sequence)
 test_my_new_added_case_for_sequence_operator()
 ```
-
-### Running with Hybrid execution
-The hybrid tests require extra jars. To enable hybrid tests, the following prerequisites are required::
-- Build Gluten bundle jar, Gluten thirdparty jar, refer to [link](../docs/dev/hybrid-execution.md#build)
-- Download Hybrid jar, refer to [link](../docs/dev/hybrid-execution.md#download-rapids-hybrid-jar-from-maven-repo)
-
-Execute the following command to run Hybrid tests:
-```shell
-$ LOAD_HYBRID_BACKEND=1 \
-  HYBRID_BACKEND_JARS=/path/to/${GLUTEN_BUNDLE_JAR},/path/to/${GLUTEN_THIRD_PARTY_JAR},/path/to/HYBRID_JAR \
-  ./integration_tests/run_pyspark_from_build.sh -m hybrid_test
-```
-For more information about Hybrid feature, refer to [link](../docs/dev/hybrid-execution.md)
 
 ### Reviewing integration tests in Spark History Server
 

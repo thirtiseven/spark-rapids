@@ -18,6 +18,7 @@ package com.nvidia.spark.rapids
 
 import ai.rapids.cudf.{ColumnVector, DType, Table}
 import ai.rapids.cudf.ast.{AstExpression, AstJitProgram, CompiledExpression}
+import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.ProjectAstTestUtils.collectExpressions
 import org.mockito.Mockito.{doThrow, mock, times, verify, when}
 import org.scalatest.funsuite.AnyFunSuite
@@ -499,6 +500,9 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
     val sibling = new GpuAstJitExpression(boundReference) {
       override protected def compileAst(ast: AstExpression): CompiledExpression = siblingCompiled
     }
+    val metrics = Seq(AST_JIT_PROGRAM_BUILD_ATTEMPTS, AST_JIT_PROGRAM_CACHE_HITS,
+      AST_JIT_PROGRAM_BUILD_TIME).map(_ -> new LocalGpuMetric).toMap
+    owner.injectMetrics(metrics)
     val group = Seq(owner, sibling)
     val firstSchema = mockTable(nullable = false)
     val compatibleSchema = mockTable(nullable = false)
@@ -513,12 +517,76 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
 
       assert(owner.getJitProgram(group, nullableSchema) eq secondProgram)
       assertResult(2)(compileCount)
+      assertResult(2L)(metrics(AST_JIT_PROGRAM_BUILD_ATTEMPTS).value)
+      assertResult(2L)(metrics(AST_JIT_PROGRAM_CACHE_HITS).value)
+      assert(metrics(AST_JIT_PROGRAM_BUILD_TIME).value > 0)
       verify(firstProgram, times(1)).close()
       verify(secondProgram, times(0)).close()
     }
     verify(secondProgram, times(1)).close()
     verify(ownerCompiled, times(1)).close()
     verify(siblingCompiled, times(1)).close()
+  }
+
+  test("project AST JIT metrics count failed group attempts without counting each output") {
+    val compiled = mock(classOf[CompiledExpression])
+    val program = mock(classOf[AstJitProgram])
+    val child = GpuBoundReference(0, IntegerType, nullable = true)(
+      NamedExpression.newExprId, "c0")
+    var builds = 0
+    val owner = new GpuAstJitExpression(child) {
+      override protected def compileAst(ast: AstExpression): CompiledExpression = compiled
+      override protected def compileJitProgram(
+          table: Table,
+          expressions: Array[CompiledExpression]): AstJitProgram = {
+        builds += 1
+        if (builds == 1) throw new IllegalStateException("build failure")
+        program
+      }
+    }
+    val metrics = Seq(AST_JIT_PROGRAM_BUILD_ATTEMPTS, AST_JIT_PROGRAM_CACHE_HITS,
+      AST_JIT_PROGRAM_BUILD_TIME, AST_JIT_EVAL_ATTEMPTS, AST_JIT_EVAL_ROWS,
+      AST_JIT_EVAL_TIME).map(_ -> new LocalGpuMetric).toMap
+    owner.injectMetrics(metrics)
+    val input = mockTable(nullable = false)
+    when(input.getRowCount).thenReturn(7L)
+    doThrow(new IllegalStateException("evaluation failure")).when(program).computeTable(input)
+    TestUtils.withMockTaskContext() {
+      val group = Seq(owner, owner)
+      intercept[IllegalStateException] { GpuAstJitExpression.computeColumns(group, input) }
+      assertResult(0L)(metrics(AST_JIT_EVAL_ATTEMPTS).value)
+      intercept[IllegalStateException] { GpuAstJitExpression.computeColumns(group, input) }
+      intercept[IllegalStateException] { GpuAstJitExpression.computeColumns(group, input) }
+      assertResult(2L)(metrics(AST_JIT_PROGRAM_BUILD_ATTEMPTS).value)
+      assertResult(1L)(metrics(AST_JIT_PROGRAM_CACHE_HITS).value)
+      assertResult(2L)(metrics(AST_JIT_EVAL_ATTEMPTS).value)
+      assertResult(14L)(metrics(AST_JIT_EVAL_ROWS).value)
+      assert(metrics(AST_JIT_PROGRAM_BUILD_TIME).value > 0)
+      assert(metrics(AST_JIT_EVAL_TIME).value > 0)
+    }
+  }
+
+  test("project AST JIT explain describes bound groups and honors singleton execution") {
+    val left = reference(0, IntegerType)
+    val right = reference(1, IntegerType)
+    val shared = GpuAdd(left, right, failOnError = false)()
+    val expressions = Seq(alias(GpuMultiply(shared, left, failOnError = false)(), "first"),
+      alias(GpuMultiply(shared, right, failOnError = false)(), "second"))
+    val tiered = bindProject(expressions, Seq(left, right), projectConf())
+    val grouped = GpuAstJitExpression.explainFinalSelections(tiered.exprTiers, all = true)
+    assert(grouped.contains("JIT GROUP 0 inputs=[0,1] outputs=[0,1]"), grouped)
+    assert(grouped.contains("plugin_unique_ops=3 plugin_shared_ops=1"), grouped)
+    val single = GpuAstJitExpression.explainFinalSelections(
+      tiered.exprTiers, all = true, multiOutputEnabled = false)
+    assert(single.contains("JIT GROUP 0 inputs=[0,1] outputs=[0]"), single)
+    assert(single.contains("JIT GROUP 1 inputs=[0,1] outputs=[1]"), single)
+    assert(!GpuAstJitExpression.explainFinalSelections(tiered.exprTiers, all = false)
+      .contains("JIT GROUP"))
+    val repeated = Seq(Seq(tiered.exprTiers.head.head, tiered.exprTiers.head.head))
+    val repeatedExplain = GpuAstJitExpression.explainFinalSelections(
+      repeated, all = true, multiOutputEnabled = false)
+    assert(repeatedExplain.contains("JIT GROUP 0 inputs=[0,1] outputs=[0]"), repeatedExplain)
+    assert(repeatedExplain.contains("JIT GROUP 1 inputs=[0,1] outputs=[1]"), repeatedExplain)
   }
 
   test("project AST JIT uses singleton programs when multi-output is disabled") {

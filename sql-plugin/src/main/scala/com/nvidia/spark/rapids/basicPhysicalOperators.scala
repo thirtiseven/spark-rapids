@@ -943,6 +943,12 @@ case class GpuProjectExec(
 
   override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
     KEY_NUM_PRE_SPLIT -> createMetric(DEBUG_LEVEL, "num pre-splits"),
+    AST_JIT_PROGRAM_BUILD_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT program build attempts"),
+    AST_JIT_PROGRAM_CACHE_HITS -> createMetric(DEBUG_LEVEL, "AST JIT bound program cache hits"),
+    AST_JIT_PROGRAM_BUILD_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT program build time"),
+    AST_JIT_EVAL_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT group evaluation attempts"),
+    AST_JIT_EVAL_ROWS -> createMetric(DEBUG_LEVEL, "AST JIT group input rows including retries"),
+    AST_JIT_EVAL_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT group evaluation time"),
     OP_TIME_LEGACY -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_OP_TIME_LEGACY),
     CPU_BRIDGE_PROCESSING_TIME -> createNanoTimingMetric(DEBUG_LEVEL, 
       DESCRIPTION_CPU_BRIDGE_PROCESSING_TIME),

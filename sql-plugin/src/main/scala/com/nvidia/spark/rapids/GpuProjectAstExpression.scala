@@ -50,7 +50,7 @@ trait GpuProjectAstExpressionBase
 
   override final def nullable: Boolean = child.nullable
 
-  override final def injectMetrics(metrics: Map[String, GpuMetric]): Unit = {
+  override def injectMetrics(metrics: Map[String, GpuMetric]): Unit = {
     // OP_TIME_LEGACY is the owning operator's non-RDD timing metric, not a legacy AST metric.
     opTime = metrics.getOrElse(OP_TIME_LEGACY, NoopMetric)
   }
@@ -72,14 +72,14 @@ trait GpuProjectAstExpressionBase
 
   private[rapids] final def computeColumn(table: Table): GpuColumnVector = {
     val compiled = getCompiledExpression
-    withComputeMetrics {
+    withComputeMetrics(table.getRowCount) {
       closeOnExcept(compiled.computeColumn(table)) { result =>
         GpuColumnVector.from(result, dataType)
       }
     }
   }
 
-  private[rapids] final def withComputeMetrics[T](body: => T): T =
+  private[rapids] def withComputeMetrics[T](rows: Long)(body: => T): T =
     NvtxIdWithMetrics(computeNvtxId, opTime)(body)
 
   private[rapids] final def withCompileMetrics[T](body: => T): T =

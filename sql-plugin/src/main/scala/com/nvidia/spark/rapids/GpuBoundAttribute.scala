@@ -48,7 +48,8 @@ object GpuBindReferences extends Logging {
     val explain = RapidsConf.EXPLAIN.get(conf)
     if (RapidsConf.shouldExplain(explain)) {
       val explanation = GpuAstJitExpression.explainFinalSelections(
-        tieredProject.exprTiers, RapidsConf.shouldExplainAll(explain))
+        tieredProject.exprTiers, RapidsConf.shouldExplainAll(explain),
+        RapidsConf.ENABLE_PROJECT_AST_JIT_MULTI_OUTPUT.get(conf))
       if (explanation.nonEmpty) {
         logWarning(s"FINAL PROJECT AST JIT SELECTION\n$explanation")
       }

@@ -22,6 +22,7 @@ import ai.rapids.cudf.{DType, Table}
 import ai.rapids.cudf.ast.{AstExpression, AstJitProgram, CompiledExpression}
 import com.nvidia.spark.Retryable
 import com.nvidia.spark.rapids.Arm.withResource
+import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 
 import org.apache.spark.sql.catalyst.expressions.{Expression, NamedExpression}
@@ -263,7 +264,7 @@ object GpuAstJitExpression {
     require(expressions.nonEmpty, "AST JIT requires at least one expression")
     val owner = expressions.head
     val program = owner.getJitProgram(expressions, table)
-    owner.withComputeMetrics {
+    owner.withComputeMetrics(table.getRowCount) {
       withResource(program.computeTable(table)) { result =>
         GpuColumnVector.from(result, expressions.map(_.dataType).toArray)
       }
@@ -286,15 +287,58 @@ object GpuAstJitExpression {
 
   private[rapids] def explainFinalSelections(
       expressionTiers: Seq[Seq[Expression]],
-      all: Boolean): String = {
+      all: Boolean,
+      multiOutputEnabled: Boolean = true): String = {
     expressionTiers.zipWithIndex.flatMap { case (expressions, tier) =>
-      val explanations = expressions.iterator.collect {
-        case expression if all ||
+      val explanations = expressions.iterator.zipWithIndex.collect {
+        case (expression, index) if all ||
             (extractTopLevel(expression).isEmpty && hasJitCandidate(expression)) =>
-          s"    $expression final backend: ${finalBackend(expression)}\n"
+          s"    output[$index] $expression final backend: ${finalBackend(expression)}\n"
       }.mkString
       if (explanations.nonEmpty) {
-        Some(s"  TIER $tier\n$explanations")
+        val structure = if (all) {
+          val indexedRoots = expressions.zipWithIndex.flatMap { case (expression, index) =>
+            extractTopLevel(expression).map(index -> _)
+          }
+          val groups = executionGroups(indexedRoots.map(_._2), multiOutputEnabled)
+          val remainingRoots = mutable.ArrayBuffer(indexedRoots: _*)
+          val groupDetails = groups.zipWithIndex.map { case (group, index) =>
+            val inputs = JitProgramGroup(group).referencedOrdinals.mkString("[", ",", "]")
+            val outputs = group.map { root =>
+              val position = remainingRoots.indexWhere(_._2 eq root)
+              remainingRoots.remove(position)._1
+            }.mkString("[", ",", "]")
+            val occurrences = group.flatMap(_.child.collect {
+              case expression: GpuExpression if expression.selfIsAstJitOperator =>
+                GpuExpressionEquals(expression)
+            })
+            val uniqueOps = occurrences.distinct.size
+            val sharedOps = occurrences.groupBy(identity).count(_._2.size > 1)
+            s"    JIT GROUP $index inputs=$inputs outputs=$outputs " +
+              s"plugin_unique_ops=$uniqueOps plugin_shared_ops=$sharedOps\n"
+          }.mkString
+          def forwarded(expression: Expression): Boolean = expression match {
+            case alias: GpuAlias => forwarded(alias.child)
+            case _: GpuBoundReference => true
+            case _ => false
+          }
+          val materialized = if (tier + 1 < expressionTiers.size) {
+            expressions.indices.filterNot(i => forwarded(expressions(i)))
+          } else {
+            Seq.empty
+          }
+          val inputs = expressions.flatMap(_.collect {
+            case reference: GpuBoundReference => reference.ordinal
+          }).distinct.sorted.mkString("[", ",", "]")
+          val forwardedOutputs = expressions.indices.filter(i => forwarded(expressions(i)))
+              .mkString("[", ",", "]")
+          s"    inputs=$inputs outputs=${expressions.size} forwarded_outputs=$forwardedOutputs " +
+            s"materialized_outputs_to_next_tier=${materialized.mkString("[", ",", "]")}\n" +
+            groupDetails
+        } else {
+          ""
+        }
+        Some(s"  TIER $tier\n$structure$explanations")
       } else {
         None
       }
@@ -308,6 +352,30 @@ case class GpuAstJitExpression(child: GpuExpression, groupId: Int = 0)
   @transient private[this] var jitProgram: AstJitProgram = _
   @transient private[this] var jitProgramGroup: GpuAstJitExpression.JitProgramGroup = _
   @transient private[this] var jitProgramSchema: Vector[GpuAstJitExpression.JitInputColumn] = _
+
+  private[this] var programBuildAttempts: GpuMetric = NoopMetric
+  private[this] var programCacheHits: GpuMetric = NoopMetric
+  private[this] var programBuildTime: GpuMetric = NoopMetric
+  private[this] var evalAttempts: GpuMetric = NoopMetric
+  private[this] var evalRows: GpuMetric = NoopMetric
+  private[this] var evalTime: GpuMetric = NoopMetric
+
+  override def injectMetrics(metrics: Map[String, GpuMetric]): Unit = {
+    super.injectMetrics(metrics)
+    programBuildAttempts = metrics.getOrElse(AST_JIT_PROGRAM_BUILD_ATTEMPTS, NoopMetric)
+    programCacheHits = metrics.getOrElse(AST_JIT_PROGRAM_CACHE_HITS, NoopMetric)
+    programBuildTime = metrics.getOrElse(AST_JIT_PROGRAM_BUILD_TIME, NoopMetric)
+    evalAttempts = metrics.getOrElse(AST_JIT_EVAL_ATTEMPTS, NoopMetric)
+    evalRows = metrics.getOrElse(AST_JIT_EVAL_ROWS, NoopMetric)
+    evalTime = metrics.getOrElse(AST_JIT_EVAL_TIME, NoopMetric)
+  }
+
+  override private[rapids] def withComputeMetrics[T](rows: Long)(body: => T): T = {
+    // Count group work, including retries, rather than unique Project input rows.
+    evalAttempts += 1
+    evalRows += rows
+    evalTime.ns { super.withComputeMetrics(rows)(body) }
+  }
 
   override def disableTieredProjectCombine: Boolean = true
 
@@ -336,14 +404,18 @@ case class GpuAstJitExpression(child: GpuExpression, groupId: Int = 0)
     val schema = GpuAstJitExpression.inputSchema(group, table)
     if (jitProgram == null || !groupMatches || jitProgramSchema != schema) {
       val compiledExpressions = group.expressions.map(_.getCompiledExpression).toArray
-      val replacement = withCompileMetrics {
-        compileJitProgram(table, compiledExpressions)
+      programBuildAttempts += 1
+      // A program build may hit the native kernel cache without invoking NVRTC.
+      val replacement = programBuildTime.ns {
+        withCompileMetrics { compileJitProgram(table, compiledExpressions) }
       }
       val previous = jitProgram
       jitProgram = replacement
       jitProgramGroup = group
       jitProgramSchema = schema
       Option(previous).foreach(_.safeClose())
+    } else {
+      programCacheHits += 1
     }
     jitProgram
   }

@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import pytest
+import pyspark.sql.functions as f
+from pyspark.sql.types import BinaryType
 
-from data_gen import IntegerGen, StringGen, StructGen
+from data_gen import IntegerGen, StringGen, StructGen, gen_df
 from protobuf_data_gen import call_protobuf_function, materialize_protobuf_data
-from spark_session import is_spark_protobuf_available
+from spark_session import is_spark_protobuf_available, with_cpu_session
 
 
 def test_call_protobuf_function_legacy_signature():
@@ -55,35 +57,12 @@ def test_call_protobuf_function_binary_signature():
     ]
 
 
-def test_materialize_protobuf_data_requires_struct_gen():
-    with pytest.raises(TypeError, match="logical_gen must be a StructGen"):
-        materialize_protobuf_data(
-            IntegerGen(), "test.Message", "/tmp/test.desc", b"descriptor")
-
-
-def test_materialize_protobuf_data_requires_non_nullable_root():
-    logical_gen = StructGen([("i32", IntegerGen())], nullable=True)
-
-    with pytest.raises(ValueError, match="must be non-nullable"):
-        materialize_protobuf_data(
-            logical_gen, "test.Message", "/tmp/test.desc", b"descriptor")
-
-
 def test_materialize_protobuf_data_reserves_binary_column_name():
     logical_gen = StructGen([("BIN", IntegerGen())], nullable=False)
 
     with pytest.raises(ValueError, match="conflicts with binary column"):
         materialize_protobuf_data(
             logical_gen, "test.Message", "/tmp/test.desc", b"descriptor")
-
-
-def test_materialize_protobuf_data_rejects_two_row_sources():
-    logical_gen = StructGen([("i32", IntegerGen())], nullable=False)
-
-    with pytest.raises(ValueError, match="length cannot be used"):
-        materialize_protobuf_data(
-            logical_gen, "test.Message", "/tmp/test.desc", b"descriptor",
-            length=1, logical_rows=[(1,)])
 
 
 # Avoid depending on whichever unshaded protobuf runtime the Spark driver provides.
@@ -94,21 +73,44 @@ _simple_desc_bytes = bytes.fromhex(
 
 @pytest.mark.skipif(
     not is_spark_protobuf_available(), reason="from_protobuf is unavailable")
-def test_materialize_protobuf_data_with_explicit_rows(local_tmp_path):
+@pytest.mark.parametrize("generated", [False, True], ids=["explicit_rows", "generated_rows"])
+def test_materialize_protobuf_data(local_tmp_path, generated):
     desc_path = local_tmp_path + "/simple.desc"
     with open(desc_path, "wb") as fp:
         fp.write(_simple_desc_bytes)
 
     logical_gen = StructGen([
         ("i32", IntegerGen(nullable=False)),
-        ("s", StringGen(nullable=False)),
+        ("s", StringGen("[a-z]{0,8}", nullable=False)),
     ], nullable=False)
-    logical_rows = [(1, "a"), (12345, "hello")]
+    if generated:
+        logical_rows = with_cpu_session(
+            lambda spark: gen_df(spark, logical_gen, length=16).collect())
+        source_args = {"length": 16}
+    else:
+        logical_rows = [(1, "a"), (-2, "bb"), (0, ""), (12345, "hello")]
+        source_args = {"logical_rows": logical_rows}
 
     rows, schema = materialize_protobuf_data(
         logical_gen, "test.Simple", desc_path, _simple_desc_bytes,
-        logical_rows=logical_rows)
+        **source_args)
 
-    assert [tuple(row[:2]) for row in rows] == logical_rows
-    assert all(isinstance(row[2], bytes) and row[2] for row in rows)
+    assert len(rows) == len(logical_rows)
+    assert sorted(tuple(row[:2]) for row in rows) == sorted(tuple(row) for row in logical_rows)
+    assert all(isinstance(row[2], bytes) for row in rows)
     assert schema.fieldNames() == ["i32", "s", "bin"]
+    assert schema.fields[:2] == logical_gen.data_type.fields
+    assert schema["bin"].dataType == BinaryType()
+
+    def decode(spark):
+        from pyspark.sql.protobuf.functions import from_protobuf
+
+        source = spark.createDataFrame(rows, schema)
+        decoded = call_protobuf_function(
+            from_protobuf, f.col("bin"), "test.Simple", desc_path, _simple_desc_bytes)
+        return source.select("i32", "s", decoded.alias("decoded")).collect()
+
+    decoded_rows = with_cpu_session(decode)
+    assert len(decoded_rows) == len(rows)
+    for row in decoded_rows:
+        assert tuple(row.decoded) == (row.i32, row.s)

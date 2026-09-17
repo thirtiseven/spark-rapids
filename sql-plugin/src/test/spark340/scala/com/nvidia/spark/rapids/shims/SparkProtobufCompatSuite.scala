@@ -145,7 +145,9 @@ class SparkProtobufCompatSuite extends AnyFunSuite {
 
   private object FakeSpark35ProtobufUtils {
     var calls = 0
-    def buildDescriptor(messageName: String, binaryFileDescriptorSet: Option[Array[Byte]]): String = {
+    def buildDescriptor(
+        messageName: String,
+        binaryFileDescriptorSet: Option[Array[Byte]]): String = {
       calls += 1
       s"$messageName:${binaryFileDescriptorSet.map(_.mkString(",")).getOrElse("none")}"
     }
@@ -318,6 +320,19 @@ class SparkProtobufCompatSuite extends AnyFunSuite {
       Right(ProtobufDefaultValue.BinaryValue(Array[Byte](4, 5))))
     assert(compat.toDefaultValue(Int.box(1), "ENUM", Some(enumMetadata)) ==
       Right(ProtobufDefaultValue.EnumValue(1, "READY")))
+  }
+
+  private final class FakeEnumValueDescriptor(val getNumber: Int, val getName: String)
+
+  test("enum defaults preserve explicit aliases and use the first name for numeric values") {
+    val metadata = Some(ProtobufEnumMetadata(Seq(
+      ProtobufEnumValue(0, "FIRST"), ProtobufEnumValue(0, "ALIAS"))))
+    Seq("FIRST", "ALIAS").foreach { name =>
+      assert(compat.toDefaultValue(new FakeEnumValueDescriptor(0, name), "ENUM", metadata) ==
+        Right(ProtobufDefaultValue.EnumValue(0, name)))
+    }
+    assert(compat.toDefaultValue(Int.box(0), "ENUM", metadata) ==
+      Right(ProtobufDefaultValue.EnumValue(0, "FIRST")))
   }
 
   test("compat returns Left for unsupported default value types") {

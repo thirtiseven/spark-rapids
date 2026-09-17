@@ -60,7 +60,7 @@ final case class ProtobufEnumValue(number: Int, name: String)
 
 final case class ProtobufEnumMetadata(values: Seq[ProtobufEnumValue]) {
   private lazy val namesByNumber: Map[Int, String] =
-    values.map(v => v.number -> v.name).toMap
+    values.reverseIterator.map(v => v.number -> v.name).toMap
 
   def enumDefault(number: Int): ProtobufDefaultValue.EnumValue = {
     val name = namesByNumber.getOrElse(number, number.toString)

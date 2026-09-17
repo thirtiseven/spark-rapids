@@ -180,8 +180,15 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
       Right(ProtobufDefaultValue.BinaryValue(extractBytes(rawDefault)))
     case "ENUM" =>
       val number = extractNumber(rawDefault).intValue()
-      Right(enumMetadata.map(_.enumDefault(number))
-        .getOrElse(ProtobufDefaultValue.EnumValue(number, rawDefault.toString)))
+      val value = rawDefault match {
+        case _: java.lang.Number =>
+          enumMetadata.map(_.enumDefault(number))
+            .getOrElse(ProtobufDefaultValue.EnumValue(number, number.toString))
+        case descriptor =>
+          // An explicit default can name any alias, not just the canonical name for its number.
+          ProtobufDefaultValue.EnumValue(number, PbReflect.invoke0[String](descriptor, "getName"))
+      }
+      Right(value)
     case "INT32" | "UINT32" | "SINT32" | "FIXED32" | "SFIXED32" |
          "INT64" | "UINT64" | "SINT64" | "FIXED64" | "SFIXED64" =>
       Right(ProtobufDefaultValue.IntValue(extractNumber(rawDefault).longValue()))

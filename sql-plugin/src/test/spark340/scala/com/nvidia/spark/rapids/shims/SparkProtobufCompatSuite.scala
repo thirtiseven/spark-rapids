@@ -54,6 +54,7 @@ import org.apache.spark.sql.rapids.protobuf._
 import org.apache.spark.sql.types._
 
 class SparkProtobufCompatSuite extends AnyFunSuite {
+  private val compat = new BinarySparkProtobufCompat {}
   private val outputSchema = StructType(Seq(
     StructField("id", IntegerType, nullable = true),
     StructField("name", StringType, nullable = true)))
@@ -81,17 +82,11 @@ class SparkProtobufCompatSuite extends AnyFunSuite {
     override protected def withNewChildInternal(newChild: Expression): Expression = this
   }
 
-  private case class FakePathProtobufExpr(override val child: Expression)
+  private case class FakeBytesProtobufExpr(
+      override val child: Expression,
+      binaryFileDescriptorSet: Option[Array[Byte]] = Some(Array[Byte](1, 2, 3)))
       extends FakeBaseProtobufExpr(child) {
     def messageName: String = "test.Message"
-    def descFilePath: Option[String] = Some("/tmp/test.desc")
-    def options: scala.collection.Map[String, String] = Map("mode" -> "FAILFAST")
-  }
-
-  private case class FakeBytesProtobufExpr(override val child: Expression)
-      extends FakeBaseProtobufExpr(child) {
-    def messageName: String = "test.Message"
-    def binaryDescriptorSet: Array[Byte] = Array[Byte](1, 2, 3)
     def options: scala.collection.Map[String, String] =
       Map("mode" -> "PERMISSIVE", "enums.as.ints" -> "true")
   }
@@ -102,21 +97,66 @@ class SparkProtobufCompatSuite extends AnyFunSuite {
     def descFilePath: Option[String] = Some("/tmp/test.desc")
   }
 
+  private case class FakePathProtobufExpr(override val child: Expression)
+      extends FakeBaseProtobufExpr(child) {
+    def messageName: String = "test.Message"
+    def descFilePath: Option[String] = Some("/tmp/test.desc")
+    def options: Map[String, String] = Map("mode" -> "FAILFAST")
+  }
 
-  private object FakeSpark34ProtobufUtils {
-    def buildDescriptor(messageName: String, descFilePath: Option[String]): String =
-      s"$messageName:${descFilePath.getOrElse("none")}"
+  private object RecordingBuilder {
+    var payload: Option[Any] = None
+    def buildDescriptor(messageName: String, descriptor: Option[Any]): String = {
+      payload = descriptor
+      messageName
+    }
+  }
+
+  private final class DescriptorWithExtensions(val descriptor: AnyRef)
+
+  test("selected shim uses the expected Spark descriptor contract") {
+    val legacy = org.apache.spark.SPARK_VERSION.startsWith("3.4.")
+    val expr = if (legacy) FakePathProtobufExpr(FakeExprChild())
+      else FakeBytesProtobufExpr(FakeExprChild())
+    val info = SparkProtobufCompat.extractExprInfo(expr).fold(fail(_), identity)
+    assert(info.messageName == "test.Message")
+    val source = if (legacy) ProtobufDescriptorSource.DescriptorPath("/tmp/test.desc")
+      else ProtobufDescriptorSource.DescriptorBytes(Array[Byte](1, 2, 3))
+    assert(info.descriptorSource == source)
+    val method = RecordingBuilder.getClass.getMethod(
+      "buildDescriptor", classOf[String], classOf[scala.Option[_]])
+    assert(SparkProtobufCompat.invokeBuildDescriptor(
+      method, RecordingBuilder, info.messageName, source,
+      _ => fail("expression descriptor source should not need conversion")) == "test.Message")
+    if (legacy) {
+      assert(RecordingBuilder.payload.contains("/tmp/test.desc"))
+    } else {
+      assert(RecordingBuilder.payload.get.asInstanceOf[Array[Byte]]
+        .sameElements(Array[Byte](1, 2, 3)))
+    }
+    val descriptor = new FakeModernDescriptor("proto2")
+    val raw = if (org.apache.spark.SPARK_VERSION.startsWith("4.2.")) {
+      new DescriptorWithExtensions(descriptor)
+    } else {
+      descriptor
+    }
+    assert(SparkProtobufCompat.unwrapMessageDescriptor(raw) eq descriptor)
   }
 
   private object FakeSpark35ProtobufUtils {
-    def buildDescriptor(messageName: String, binaryFileDescriptorSet: Option[Array[Byte]]): String =
+    var calls = 0
+    def buildDescriptor(messageName: String, binaryFileDescriptorSet: Option[Array[Byte]]): String = {
+      calls += 1
       s"$messageName:${binaryFileDescriptorSet.map(_.mkString(",")).getOrElse("none")}"
+    }
   }
 
-  private object FakeSpark35RetryFailureProtobufUtils {
+  private object FakeFailingProtobufUtils {
+    var calls = 0
     def buildDescriptor(
         messageName: String,
         binaryFileDescriptorSet: Option[Array[Byte]]): String = {
+      calls += 1
       val bytes = binaryFileDescriptorSet.getOrElse(Array.emptyByteArray)
       if (bytes.sameElements(Array[Byte](1, 2, 3))) {
         throw new IllegalArgumentException(s"Unknown message $messageName")
@@ -137,8 +177,6 @@ class SparkProtobufCompatSuite extends AnyFunSuite {
     def getFile: FakeModernFileDescriptor = new FakeModernFileDescriptor(syntax)
   }
 
-  private final class FakeDescriptorWithExtensions(val descriptor: AnyRef)
-
   private final class FakeLegacyFileDescriptor(syntax: String) {
     def getSyntax: String = syntax
   }
@@ -155,20 +193,12 @@ class SparkProtobufCompatSuite extends AnyFunSuite {
 
   private final class FakeDescriptorWithoutFile
 
-  test("compat extracts descriptor path and options from legacy expression") {
-    val exprInfo = SparkProtobufCompat.extractExprInfo(FakePathProtobufExpr(FakeExprChild()))
+  test("compat extracts a binary descriptor source") {
+    val exprInfo = compat.extractExprInfo(FakeBytesProtobufExpr(FakeExprChild()))
     assert(exprInfo.isRight)
     val info = exprInfo.toOption.get
     assert(info.messageName == "test.Message")
-    assert(info.options == Map("mode" -> "FAILFAST"))
-    assert(info.descriptorSource ==
-      ProtobufDescriptorSource.DescriptorPath("/tmp/test.desc"))
-  }
-
-  test("compat extracts a binary descriptor source") {
-    val exprInfo = SparkProtobufCompat.extractExprInfo(FakeBytesProtobufExpr(FakeExprChild()))
-    assert(exprInfo.isRight)
-    val info = exprInfo.toOption.get
+    assert(info.options == Map("mode" -> "PERMISSIVE", "enums.as.ints" -> "true"))
     info.descriptorSource match {
       case ProtobufDescriptorSource.DescriptorBytes(bytes) =>
         assert(bytes.sameElements(Array[Byte](1, 2, 3)))
@@ -177,36 +207,25 @@ class SparkProtobufCompatSuite extends AnyFunSuite {
     }
   }
 
-  test("compat invokes Spark 3.4 descriptor builder with descriptor path") {
-    val buildMethod = FakeSpark34ProtobufUtils.getClass.getMethod(
-      "buildDescriptor", classOf[String], classOf[scala.Option[_]])
-
-    val result = SparkProtobufCompat.invokeBuildDescriptor(
-      buildMethod,
-      FakeSpark34ProtobufUtils,
-      "test.Message",
-      ProtobufDescriptorSource.DescriptorPath("/tmp/test.desc"),
-      _ => fail("path-to-bytes fallback should not be needed for Spark 3.4"))
-
-    assert(result == "test.Message:/tmp/test.desc")
-  }
-
-  test("compat retries descriptor path as bytes for Spark 3.5 descriptor builder") {
+  test("binary shim reads descriptor path as bytes before invoking the builder") {
+    FakeSpark35ProtobufUtils.calls = 0
     val buildMethod = FakeSpark35ProtobufUtils.getClass.getMethod(
       "buildDescriptor", classOf[String], classOf[scala.Option[_]])
     var readCalls = 0
 
-    val result = SparkProtobufCompat.invokeBuildDescriptor(
+    val result = compat.invokeBuildDescriptor(
       buildMethod,
       FakeSpark35ProtobufUtils,
       "test.Message",
       ProtobufDescriptorSource.DescriptorPath("/tmp/test.desc"),
-      _ => {
+      path => {
+        assert(path == "/tmp/test.desc")
         readCalls += 1
         Array[Byte](1, 2, 3)
       })
 
     assert(readCalls == 1)
+    assert(FakeSpark35ProtobufUtils.calls == 1)
     assert(result == "test.Message:1,2,3")
   }
 
@@ -214,7 +233,7 @@ class SparkProtobufCompatSuite extends AnyFunSuite {
     val buildMethod = FakeSpark35ProtobufUtils.getClass.getMethod(
       "buildDescriptor", classOf[String], classOf[scala.Option[_]])
 
-    val result = SparkProtobufCompat.invokeBuildDescriptor(
+    val result = compat.invokeBuildDescriptor(
       buildMethod,
       FakeSpark35ProtobufUtils,
       "test.Message",
@@ -224,53 +243,52 @@ class SparkProtobufCompatSuite extends AnyFunSuite {
     assert(result == "test.Message:4,5,6")
   }
 
-  test("compat preserves retry context when descriptor bytes fallback also fails") {
-    val buildMethod = FakeSpark35RetryFailureProtobufUtils.getClass.getMethod(
+  test("binary shim preserves the builder failure without retrying") {
+    FakeFailingProtobufUtils.calls = 0
+    val buildMethod = FakeFailingProtobufUtils.getClass.getMethod(
       "buildDescriptor", classOf[String], classOf[scala.Option[_]])
 
-    val ex = intercept[RuntimeException] {
-      SparkProtobufCompat.invokeBuildDescriptor(
+    val ex = intercept[java.lang.reflect.InvocationTargetException] {
+      compat.invokeBuildDescriptor(
         buildMethod,
-        FakeSpark35RetryFailureProtobufUtils,
+        FakeFailingProtobufUtils,
         "test.Message",
         ProtobufDescriptorSource.DescriptorPath("/tmp/test.desc"),
         _ => Array[Byte](1, 2, 3))
     }
 
-    assert(ex.getMessage.contains("descriptor bytes retry failed"))
-    assert(ex.getMessage.contains("ClassCastException"))
-    assert(ex.getMessage.contains("Unknown message test.Message"))
     assert(ex.getCause.isInstanceOf[IllegalArgumentException])
-    assert(ex.getSuppressed.exists(_.isInstanceOf[java.lang.reflect.InvocationTargetException]))
+    assert(ex.getCause.getMessage == "Unknown message test.Message")
+    assert(ex.getSuppressed.isEmpty)
+    assert(FakeFailingProtobufUtils.calls == 1)
+  }
+
+  test("binary shim rejects missing descriptor sets") {
+    val result = compat.extractExprInfo(FakeBytesProtobufExpr(FakeExprChild(), None))
+    assert(result == Left("from_protobuf requires a binary descriptor set"))
+    assert(compat.extractExprInfo(FakePathProtobufExpr(FakeExprChild())).left.toOption
+      .exists(_.contains("Cannot read binaryFileDescriptorSet")))
   }
 
   test("compat reports missing options accessor as cpu fallback reason") {
-    val exprInfo = SparkProtobufCompat.extractExprInfo(FakeMissingOptionsExpr(FakeExprChild()))
+    val exprInfo = compat.extractExprInfo(FakeMissingOptionsExpr(FakeExprChild()))
     assert(exprInfo.left.toOption.exists(
       _.contains("Cannot read from_protobuf options via reflection")))
   }
 
   test("compat reads syntax through protobuf 4 FileDescriptor API") {
-    assert(SparkProtobufCompat.readDescriptorSyntax(
+    assert(compat.readDescriptorSyntax(
       new FakeModernDescriptor("proto2")) == "PROTO2")
-    assert(SparkProtobufCompat.readDescriptorSyntax(
+    assert(compat.readDescriptorSyntax(
       new FakeModernDescriptor("proto3")) == "PROTO3")
-    assert(SparkProtobufCompat.readDescriptorSyntax(
+    assert(compat.readDescriptorSyntax(
       new FakeModernDescriptor("")) == "PROTO2")
-    assert(SparkProtobufCompat.readDescriptorSyntax(
+    assert(compat.readDescriptorSyntax(
       new FakeLegacyDescriptor("PROTO2")) == "PROTO2")
-    assert(SparkProtobufCompat.readDescriptorSyntax(
+    assert(compat.readDescriptorSyntax(
       new FakeBrokenDescriptor) == "")
-    assert(SparkProtobufCompat.readDescriptorSyntax(
+    assert(compat.readDescriptorSyntax(
       new FakeDescriptorWithoutFile) == "")
-  }
-
-  test("compat unwraps Spark 4.2 descriptor with extensions") {
-    val descriptor = new FakeModernDescriptor("proto2")
-
-    assert(SparkProtobufCompat.unwrapMessageDescriptor(
-      new FakeDescriptorWithExtensions(descriptor)) eq descriptor)
-    assert(SparkProtobufCompat.unwrapMessageDescriptor(descriptor) eq descriptor)
   }
 
   test("descriptor bytes use content equality") {
@@ -286,24 +304,24 @@ class SparkProtobufCompatSuite extends AnyFunSuite {
       ProtobufEnumValue(0, "UNKNOWN"),
       ProtobufEnumValue(1, "READY")))
 
-    assert(SparkProtobufCompat.toDefaultValue(Boolean.box(true), "BOOL", None) ==
+    assert(compat.toDefaultValue(Boolean.box(true), "BOOL", None) ==
       Right(ProtobufDefaultValue.BoolValue(true)))
-    assert(SparkProtobufCompat.toDefaultValue(Int.box(7), "INT32", None) ==
+    assert(compat.toDefaultValue(Int.box(7), "INT32", None) ==
       Right(ProtobufDefaultValue.IntValue(7L)))
-    assert(SparkProtobufCompat.toDefaultValue(Float.box(1.5f), "FLOAT", None) ==
+    assert(compat.toDefaultValue(Float.box(1.5f), "FLOAT", None) ==
       Right(ProtobufDefaultValue.FloatValue(1.5f)))
-    assert(SparkProtobufCompat.toDefaultValue(Double.box(2.5), "DOUBLE", None) ==
+    assert(compat.toDefaultValue(Double.box(2.5), "DOUBLE", None) ==
       Right(ProtobufDefaultValue.DoubleValue(2.5)))
-    assert(SparkProtobufCompat.toDefaultValue("value", "STRING", None) ==
+    assert(compat.toDefaultValue("value", "STRING", None) ==
       Right(ProtobufDefaultValue.StringValue("value")))
-    assert(SparkProtobufCompat.toDefaultValue(Array[Byte](4, 5), "BYTES", None) ==
+    assert(compat.toDefaultValue(Array[Byte](4, 5), "BYTES", None) ==
       Right(ProtobufDefaultValue.BinaryValue(Array[Byte](4, 5))))
-    assert(SparkProtobufCompat.toDefaultValue(Int.box(1), "ENUM", Some(enumMetadata)) ==
+    assert(compat.toDefaultValue(Int.box(1), "ENUM", Some(enumMetadata)) ==
       Right(ProtobufDefaultValue.EnumValue(1, "READY")))
   }
 
   test("compat returns Left for unsupported default value types") {
-    val result = SparkProtobufCompat.toDefaultValue(
+    val result = compat.toDefaultValue(
       "opaque-default", "MESSAGE", None)
 
     assert(result.left.toOption.exists(_.contains("Unsupported protobuf default value type")))

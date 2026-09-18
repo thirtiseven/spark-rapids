@@ -18,17 +18,26 @@ package org.apache.spark.sql.rapids.protobuf
 
 import java.util.Arrays
 
+/** A serialized FileDescriptorSet (schema), supplied as a file path or bytes. */
 sealed trait ProtobufDescriptorSource
 
 object ProtobufDescriptorSource {
   final case class DescriptorPath(path: String) extends ProtobufDescriptorSource
-  final case class DescriptorBytes(bytes: Array[Byte]) extends ProtobufDescriptorSource {
+  final class DescriptorBytes private (private val snapshot: Array[Byte])
+      extends ProtobufDescriptorSource {
+    def bytes: Array[Byte] = snapshot.clone()
+
     override def equals(other: Any): Boolean = other match {
-      case DescriptorBytes(otherBytes) => Arrays.equals(bytes, otherBytes)
+      case that: DescriptorBytes => Arrays.equals(snapshot, that.snapshot)
       case _ => false
     }
 
-    override def hashCode(): Int = Arrays.hashCode(bytes)
+    override def hashCode(): Int = Arrays.hashCode(snapshot)
+  }
+
+  object DescriptorBytes {
+    def apply(bytes: Array[Byte]): DescriptorBytes = new DescriptorBytes(bytes.clone())
+    def unapply(value: DescriptorBytes): Option[Array[Byte]] = Option(value).map(_.bytes)
   }
 }
 
@@ -45,24 +54,35 @@ object ProtobufDefaultValue {
   final case class FloatValue(value: Float) extends ProtobufDefaultValue
   final case class DoubleValue(value: Double) extends ProtobufDefaultValue
   final case class StringValue(value: String) extends ProtobufDefaultValue
-  final case class BinaryValue(value: Array[Byte]) extends ProtobufDefaultValue {
+  final class BinaryValue private (private val snapshot: Array[Byte]) extends ProtobufDefaultValue {
+    def value: Array[Byte] = snapshot.clone()
+
     override def equals(other: Any): Boolean = other match {
-      case BinaryValue(otherBytes) => Arrays.equals(value, otherBytes)
+      case that: BinaryValue => Arrays.equals(snapshot, that.snapshot)
       case _ => false
     }
 
-    override def hashCode(): Int = Arrays.hashCode(value)
+    override def hashCode(): Int = Arrays.hashCode(snapshot)
   }
+
+  object BinaryValue {
+    def apply(value: Array[Byte]): BinaryValue = new BinaryValue(value.clone())
+    def unapply(value: BinaryValue): Option[Array[Byte]] = Option(value).map(_.value)
+  }
+  // Keep the name because multiple aliases can share the same number.
   final case class EnumValue(number: Int, name: String) extends ProtobufDefaultValue
 }
 
 final case class ProtobufEnumValue(number: Int, name: String)
 
+/**
+ * Enum entries in declaration order, including aliases. Numeric lookup uses the first name.
+ */
 final case class ProtobufEnumMetadata(values: Seq[ProtobufEnumValue]) {
   private lazy val namesByNumber: Map[Int, String] =
     values.reverseIterator.map(v => v.number -> v.name).toMap
 
-  def enumDefault(number: Int): ProtobufDefaultValue.EnumValue = {
+  def defaultFromNumber(number: Int): ProtobufDefaultValue.EnumValue = {
     val name = namesByNumber.getOrElse(number, number.toString)
     ProtobufDefaultValue.EnumValue(number, name)
   }
@@ -81,7 +101,10 @@ trait ProtobufFieldDescriptor {
   def isRepeated: Boolean
   def isRequired: Boolean
   def isInOneof: Boolean
-  def defaultValueResult: Either[String, Option[ProtobufDefaultValue]]
+  /**
+   * Right(None) means no explicit default; Left means the default could not be read or converted.
+   */
+  def explicitDefaultValue: Either[String, Option[ProtobufDefaultValue]]
   def enumMetadata: Option[ProtobufEnumMetadata]
   def messageDescriptor: Option[ProtobufMessageDescriptor]
   def referencedTypeSyntax: Option[String]

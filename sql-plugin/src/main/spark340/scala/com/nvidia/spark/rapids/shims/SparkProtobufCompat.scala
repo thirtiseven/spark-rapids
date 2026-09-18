@@ -34,7 +34,7 @@ import org.apache.spark.sql.rapids.protobuf._
 private[shims] object SparkProtobufCompat extends SparkProtobufCompatBase {
   override protected def reflectDescriptorSource(
       e: Expression): Either[String, ProtobufDescriptorSource] =
-    Try(PbReflect.invoke0[Option[String]](e, "descFilePath"))
+    Try(ProtobufReflection.invoke0[Option[String]](e, "descFilePath"))
       .toEither.left.map(t => s"Cannot read descFilePath: ${t.getMessage}")
       .flatMap(_.map(ProtobufDescriptorSource.DescriptorPath).toRight(
         "from_protobuf requires a descriptor path"))

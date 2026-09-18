@@ -293,12 +293,35 @@ class SparkProtobufCompatSuite extends AnyFunSuite {
       new FakeDescriptorWithoutFile) == "")
   }
 
-  test("descriptor bytes use content equality") {
-    val left = ProtobufDescriptorSource.DescriptorBytes(Array[Byte](1, 2, 3))
-    val right = ProtobufDescriptorSource.DescriptorBytes(Array[Byte](1, 2, 3))
+  private def checkMutationStability[T](
+      create: Array[Byte] => T,
+      read: T => Array[Byte],
+      extract: T => Array[Byte]): Unit = {
+    val input = Array[Byte](1, 2, 3)
+    val value = create(input)
+    val equalValue = create(input.clone())
+    val hash = value.hashCode()
+    val set = scala.collection.mutable.HashSet(value)
+    input(0) = 9
+    read(value)(1) = 9
+    extract(value)(2) = 9
+    assert(read(value).sameElements(Array[Byte](1, 2, 3)))
+    assert(value == equalValue)
+    assert(value.hashCode() == hash)
+    assert(value.hashCode() == equalValue.hashCode())
+    assert(set.contains(value) && set.contains(equalValue))
+  }
 
-    assert(left == right)
-    assert(left.hashCode() == right.hashCode())
+  test("descriptor bytes remain stable after input and accessor mutation") {
+    import ProtobufDescriptorSource.DescriptorBytes
+    checkMutationStability[DescriptorBytes](DescriptorBytes.apply, _.bytes,
+      value => DescriptorBytes.unapply(value).get)
+  }
+
+  test("binary defaults remain stable after input and accessor mutation") {
+    import ProtobufDefaultValue.BinaryValue
+    checkMutationStability[BinaryValue](BinaryValue.apply, _.value,
+      value => BinaryValue.unapply(value).get)
   }
 
   test("compat converts reflected defaults to neutral values") {

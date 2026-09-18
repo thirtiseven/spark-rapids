@@ -22,5 +22,5 @@ package com.nvidia.spark.rapids.shims
 
 private[shims] object SparkProtobufCompat extends BinarySparkProtobufCompat {
   override private[shims] def unwrapMessageDescriptor(raw: AnyRef): AnyRef =
-    PbReflect.invoke0[AnyRef](raw, "descriptor")
+    ProtobufReflection.invoke0[AnyRef](raw, "descriptor")
 }

@@ -28,10 +28,15 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.rapids.protobuf._
 
+/**
+ * Provides protobuf schema metadata through a common interface across Spark versions.
+ * Subclasses handle version-specific APIs; reflection keeps spark-protobuf an optional dependency.
+ */
 private[shims] abstract class SparkProtobufCompatBase extends Logging {
   private[this] val sparkProtobufUtilsObjectClassName =
     "org.apache.spark.sql.protobuf.utils.ProtobufUtils$"
 
+  /** Reads from_protobuf arguments; Left explains a missing or incompatible Spark API. */
   def extractExprInfo(e: Expression): Either[String, ProtobufExprInfo] = {
     for {
       messageName <- reflectMessageName(e)
@@ -40,6 +45,7 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
     } yield ProtobufExprInfo(messageName, descriptorSource, options)
   }
 
+  /** Resolves the schema or returns a failure reason; lazy metadata reads may still throw. */
   def resolveMessageDescriptor(
       exprInfo: ProtobufExprInfo): Either[String, ProtobufMessageDescriptor] = {
     Try(buildMessageDescriptor(exprInfo.messageName, exprInfo.descriptorSource))
@@ -57,18 +63,19 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
   }
 
   private def reflectMessageName(e: Expression): Either[String, String] =
-    Try(PbReflect.invoke0[String](e, "messageName")).toEither.left.map { t =>
+    Try(ProtobufReflection.invoke0[String](e, "messageName")).toEither.left.map { t =>
       s"Cannot read from_protobuf messageName via reflection: ${t.getMessage}"
     }
 
   private def reflectOptions(e: Expression): Either[String, Map[String, String]] = {
-    Try(PbReflect.invoke0[scala.collection.Map[String, String]](e, "options"))
+    Try(ProtobufReflection.invoke0[scala.collection.Map[String, String]](e, "options"))
       .map(_.toMap)
       .toEither.left.map { _ =>
         "Cannot read from_protobuf options via reflection; falling back to CPU"
       }
   }
 
+  /** Each shim reads the descriptor argument exposed by its Spark expression version. */
   protected def reflectDescriptorSource(e: Expression): Either[String, ProtobufDescriptorSource]
 
   private def buildMessageDescriptor(
@@ -87,8 +94,10 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
     unwrapMessageDescriptor(built)
   }
 
+  /** Shims override this when Spark wraps the descriptor together with extension metadata. */
   private[shims] def unwrapMessageDescriptor(raw: AnyRef): AnyRef = raw
 
+  /** Supplies the path or bytes expected by Spark; readDescriptorFile is only needed for paths. */
   private[shims] def invokeBuildDescriptor(
       buildMethod: Method,
       module: AnyRef,
@@ -97,42 +106,46 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
       readDescriptorFile: String => Array[Byte]): AnyRef
 
   private def typeName(t: AnyRef): String =
-    if (t == null) "" else Try(PbReflect.invoke0[String](t, "name")).getOrElse(t.toString)
+    if (t == null) "" else Try(ProtobufReflection.invoke0[String](t, "name")).getOrElse(t.toString)
 
   private def readFileSyntax(fileDesc: AnyRef): String =
-    PbReflect.getFileSyntax(fileDesc, typeName)
+    ProtobufReflection.getFileSyntax(fileDesc, typeName)
 
+  /** Returns PROTO2/PROTO3, or an empty string when the syntax cannot be read. */
   private[shims] def readDescriptorSyntax(desc: AnyRef): String =
-    Try(readFileSyntax(PbReflect.getFile(desc))).getOrElse("")
+    Try(readFileSyntax(ProtobufReflection.getFile(desc))).getOrElse("")
 
   private final class ReflectiveMessageDescriptor(raw: AnyRef) extends ProtobufMessageDescriptor {
     override lazy val syntax: String = readDescriptorSyntax(raw)
     override lazy val javaStringCheckUtf8: Boolean = Try {
-      val fileOptions = PbReflect.invoke0[AnyRef](PbReflect.getFile(raw), "getOptions")
-      PbReflect.invoke0[java.lang.Boolean](fileOptions, "getJavaStringCheckUtf8").booleanValue()
+      val fileOptions =
+        ProtobufReflection.invoke0[AnyRef](ProtobufReflection.getFile(raw), "getOptions")
+      ProtobufReflection.invoke0[java.lang.Boolean](fileOptions, "getJavaStringCheckUtf8")
+        .booleanValue()
     }.getOrElse(true)
 
     override def findField(name: String): Option[ProtobufFieldDescriptor] =
-      Option(PbReflect.findFieldByName(raw, name)).map(new ReflectiveFieldDescriptor(_))
+      Option(ProtobufReflection.findFieldByName(raw, name)).map(new ReflectiveFieldDescriptor(_))
   }
 
   private final class ReflectiveFieldDescriptor(raw: AnyRef) extends ProtobufFieldDescriptor {
-    override lazy val name: String = PbReflect.invoke0[String](raw, "getName")
-    override lazy val fieldNumber: Int = PbReflect.getFieldNumber(raw)
-    override lazy val protoTypeName: String = typeName(PbReflect.getFieldType(raw))
-    override lazy val isRepeated: Boolean = PbReflect.isRepeated(raw)
-    override lazy val isRequired: Boolean = PbReflect.isRequired(raw)
-    override lazy val isInOneof: Boolean = PbReflect.getContainingOneof(raw) != null
+    override lazy val name: String = ProtobufReflection.invoke0[String](raw, "getName")
+    override lazy val fieldNumber: Int = ProtobufReflection.getFieldNumber(raw)
+    override lazy val protoTypeName: String = typeName(ProtobufReflection.getFieldType(raw))
+    override lazy val isRepeated: Boolean = ProtobufReflection.isRepeated(raw)
+    override lazy val isRequired: Boolean = ProtobufReflection.isRequired(raw)
+    override lazy val isInOneof: Boolean = ProtobufReflection.getContainingOneof(raw) != null
     override lazy val enumMetadata: Option[ProtobufEnumMetadata] =
       if (protoTypeName == "ENUM") {
-        Some(ProtobufEnumMetadata(PbReflect.getEnumValues(PbReflect.getEnumType(raw))))
+        Some(ProtobufEnumMetadata(
+          ProtobufReflection.getEnumValues(ProtobufReflection.getEnumType(raw))))
       } else {
         None
       }
-    override lazy val defaultValueResult: Either[String, Option[ProtobufDefaultValue]] =
+    override lazy val explicitDefaultValue: Either[String, Option[ProtobufDefaultValue]] =
       Try {
-        if (PbReflect.hasDefaultValue(raw)) {
-          PbReflect.getDefaultValue(raw) match {
+        if (ProtobufReflection.hasDefaultValue(raw)) {
+          ProtobufReflection.getDefaultValue(raw) match {
             case Some(default) =>
               toDefaultValue(default, protoTypeName, enumMetadata).map(Some(_))
             case None =>
@@ -146,56 +159,58 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
       }.flatMap(identity)
     override lazy val messageDescriptor: Option[ProtobufMessageDescriptor] =
       if (protoTypeName == "MESSAGE") {
-        Some(new ReflectiveMessageDescriptor(PbReflect.getMessageType(raw)))
+        Some(new ReflectiveMessageDescriptor(ProtobufReflection.getMessageType(raw)))
       } else {
         None
       }
     override lazy val referencedTypeSyntax: Option[String] = protoTypeName match {
       case "MESSAGE" =>
-        Some(Try(readDescriptorSyntax(PbReflect.getMessageType(raw))).getOrElse(""))
+        Some(Try(readDescriptorSyntax(ProtobufReflection.getMessageType(raw))).getOrElse(""))
       case "ENUM" =>
-        Some(Try(readDescriptorSyntax(PbReflect.getEnumType(raw))).getOrElse(""))
+        Some(Try(readDescriptorSyntax(ProtobufReflection.getEnumType(raw))).getOrElse(""))
       case _ => None
     }
   }
 
+  /** Converts runtime defaults to plugin values; explicit enum aliases retain their names. */
   private[shims] def toDefaultValue(
       rawDefault: AnyRef,
       protoTypeName: String,
       enumMetadata: Option[ProtobufEnumMetadata]): Either[String, ProtobufDefaultValue] =
     protoTypeName match {
-    case "BOOL" =>
-      Right(ProtobufDefaultValue.BoolValue(
-        rawDefault.asInstanceOf[java.lang.Boolean].booleanValue()))
-    case "FLOAT" =>
-      Right(ProtobufDefaultValue.FloatValue(
-        rawDefault.asInstanceOf[java.lang.Float].floatValue()))
-    case "DOUBLE" =>
-      Right(ProtobufDefaultValue.DoubleValue(
-        rawDefault.asInstanceOf[java.lang.Double].doubleValue()))
-    case "STRING" =>
-      Right(ProtobufDefaultValue.StringValue(
-        if (rawDefault == null) null else rawDefault.toString))
-    case "BYTES" =>
-      Right(ProtobufDefaultValue.BinaryValue(extractBytes(rawDefault)))
-    case "ENUM" =>
-      val number = extractNumber(rawDefault).intValue()
-      val value = rawDefault match {
-        case _: java.lang.Number =>
-          enumMetadata.map(_.enumDefault(number))
-            .getOrElse(ProtobufDefaultValue.EnumValue(number, number.toString))
-        case descriptor =>
-          // An explicit default can name any alias, not just the canonical name for its number.
-          ProtobufDefaultValue.EnumValue(number, PbReflect.invoke0[String](descriptor, "getName"))
-      }
-      Right(value)
-    case "INT32" | "UINT32" | "SINT32" | "FIXED32" | "SFIXED32" |
-         "INT64" | "UINT64" | "SINT64" | "FIXED64" | "SFIXED64" =>
-      Right(ProtobufDefaultValue.IntValue(extractNumber(rawDefault).longValue()))
-    case other =>
-      Left(
-        s"Unsupported protobuf default value type '$other' for value ${rawDefault.toString}")
-  }
+      case "BOOL" =>
+        Right(ProtobufDefaultValue.BoolValue(
+          rawDefault.asInstanceOf[java.lang.Boolean].booleanValue()))
+      case "FLOAT" =>
+        Right(ProtobufDefaultValue.FloatValue(
+          rawDefault.asInstanceOf[java.lang.Float].floatValue()))
+      case "DOUBLE" =>
+        Right(ProtobufDefaultValue.DoubleValue(
+          rawDefault.asInstanceOf[java.lang.Double].doubleValue()))
+      case "STRING" =>
+        Right(ProtobufDefaultValue.StringValue(
+          if (rawDefault == null) null else rawDefault.toString))
+      case "BYTES" =>
+        Right(ProtobufDefaultValue.BinaryValue(extractBytes(rawDefault)))
+      case "ENUM" =>
+        val number = extractNumber(rawDefault).intValue()
+        val value = rawDefault match {
+          case _: java.lang.Number =>
+            enumMetadata.map(_.defaultFromNumber(number))
+              .getOrElse(ProtobufDefaultValue.EnumValue(number, number.toString))
+          case descriptor =>
+            // An explicit default can name any alias, not just the canonical name for its number.
+            ProtobufDefaultValue.EnumValue(
+              number, ProtobufReflection.invoke0[String](descriptor, "getName"))
+        }
+        Right(value)
+      case "INT32" | "UINT32" | "SINT32" | "FIXED32" | "SFIXED32" |
+           "INT64" | "UINT64" | "SINT64" | "FIXED64" | "SFIXED64" =>
+        Right(ProtobufDefaultValue.IntValue(extractNumber(rawDefault).longValue()))
+      case other =>
+        Left(
+          s"Unsupported protobuf default value type '$other' for value ${rawDefault.toString}")
+    }
 
   private def extractNumber(rawDefault: AnyRef): java.lang.Number = rawDefault match {
     case n: java.lang.Number => n
@@ -219,7 +234,7 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
       }
   }
 
-  protected object PbReflect {
+  protected object ProtobufReflection {
     private val cache = new java.util.concurrent.ConcurrentHashMap[String, Method]()
 
     private def protobufJavaVersion: String = Try {
@@ -304,12 +319,16 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
 }
 
 
+/**
+ * Supports Spark 3.5+'s binary-descriptor API, reading path-based sources into bytes when needed.
+ * Subclasses handle differences in the builder's return type.
+ */
 private[shims] abstract class BinarySparkProtobufCompat extends SparkProtobufCompatBase {
   override protected def reflectDescriptorSource(
       e: Expression): Either[String, ProtobufDescriptorSource] =
-    Try(PbReflect.invoke0[Option[Array[Byte]]](e, "binaryFileDescriptorSet"))
+    Try(ProtobufReflection.invoke0[Option[Array[Byte]]](e, "binaryFileDescriptorSet"))
       .toEither.left.map(t => s"Cannot read binaryFileDescriptorSet: ${t.getMessage}")
-      .flatMap(_.map(ProtobufDescriptorSource.DescriptorBytes).toRight(
+      .flatMap(_.map(ProtobufDescriptorSource.DescriptorBytes.apply).toRight(
         "from_protobuf requires a binary descriptor set"))
 
   override private[shims] def invokeBuildDescriptor(
@@ -319,7 +338,7 @@ private[shims] abstract class BinarySparkProtobufCompat extends SparkProtobufCom
       descriptorSource: ProtobufDescriptorSource,
       readDescriptorFile: String => Array[Byte]): AnyRef = {
     val bytes = descriptorSource match {
-      case ProtobufDescriptorSource.DescriptorBytes(value) => value
+      case source: ProtobufDescriptorSource.DescriptorBytes => source.bytes
       case ProtobufDescriptorSource.DescriptorPath(path) => readDescriptorFile(path)
     }
     buildMethod.invoke(module, messageName, Some(bytes))

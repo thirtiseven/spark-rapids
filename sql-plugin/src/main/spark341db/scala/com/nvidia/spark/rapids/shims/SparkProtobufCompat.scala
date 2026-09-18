@@ -29,32 +29,36 @@ import scala.util.Try
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.rapids.protobuf._
 
-// Keep vendor API probing isolated until the Databricks runtime contracts are verified.
+/**
+ * Probes descriptor APIs because Databricks backports may differ from the matching Spark version.
+ */
 private[shims] object SparkProtobufCompat extends SparkProtobufCompatBase {
   override protected def reflectDescriptorSource(
       e: Expression): Either[String, ProtobufDescriptorSource] = {
     reflectDescFilePath(e).map(ProtobufDescriptorSource.DescriptorPath).orElse(
-      reflectDescriptorBytes(e).map(ProtobufDescriptorSource.DescriptorBytes)).toRight(
+      reflectDescriptorBytes(e).map(ProtobufDescriptorSource.DescriptorBytes.apply)).toRight(
       "from_protobuf requires a descriptor set (descFilePath or binaryFileDescriptorSet)")
   }
 
   private def reflectDescFilePath(e: Expression): Option[String] =
-    Try(PbReflect.invoke0[Option[String]](e, "descFilePath")).toOption.flatten
+    Try(ProtobufReflection.invoke0[Option[String]](e, "descFilePath")).toOption.flatten
 
   private def reflectDescriptorBytes(e: Expression): Option[Array[Byte]] = {
-    val spark35Result = Try(PbReflect.invoke0[Option[Array[Byte]]](e, "binaryFileDescriptorSet"))
+    val spark35Result =
+      Try(ProtobufReflection.invoke0[Option[Array[Byte]]](e, "binaryFileDescriptorSet"))
       .toOption.flatten
     spark35Result.orElse {
-      val direct = Try(PbReflect.invoke0[Array[Byte]](e, "binaryDescriptorSet")).toOption
+      val direct = Try(ProtobufReflection.invoke0[Array[Byte]](e, "binaryDescriptorSet")).toOption
       direct.orElse {
-        Try(PbReflect.invoke0[Option[Array[Byte]]](e, "binaryDescriptorSet")).toOption.flatten
+        Try(ProtobufReflection.invoke0[Option[Array[Byte]]](e, "binaryDescriptorSet"))
+          .toOption.flatten
       }
     }
   }
 
   // Vendor runtimes can backport the descriptor-and-extensions return type.
   override private[shims] def unwrapMessageDescriptor(raw: AnyRef): AnyRef =
-    Try(PbReflect.invoke0[AnyRef](raw, "descriptor")).getOrElse(raw)
+    Try(ProtobufReflection.invoke0[AnyRef](raw, "descriptor")).getOrElse(raw)
 
   override private[shims] def invokeBuildDescriptor(
       buildMethod: Method,
@@ -63,8 +67,8 @@ private[shims] object SparkProtobufCompat extends SparkProtobufCompatBase {
       descriptorSource: ProtobufDescriptorSource,
       readDescriptorFile: String => Array[Byte]): AnyRef = {
     descriptorSource match {
-      case ProtobufDescriptorSource.DescriptorBytes(bytes) =>
-        buildMethod.invoke(module, messageName, Some(bytes)).asInstanceOf[AnyRef]
+      case source: ProtobufDescriptorSource.DescriptorBytes =>
+        buildMethod.invoke(module, messageName, Some(source.bytes)).asInstanceOf[AnyRef]
       case ProtobufDescriptorSource.DescriptorPath(filePath) =>
         try {
           buildMethod.invoke(module, messageName, Some(filePath)).asInstanceOf[AnyRef]

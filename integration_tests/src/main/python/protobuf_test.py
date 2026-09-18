@@ -18,7 +18,8 @@ import pytest
 
 from asserts import assert_gpu_fallback_collect
 from marks import allow_non_gpu
-from spark_session import is_spark_protobuf_available
+from protobuf_data_gen import call_protobuf_function
+from spark_session import is_before_spark_340, is_spark_protobuf_available, with_cpu_session
 import pyspark.sql.functions as f
 
 pytestmark = pytest.mark.skipif(
@@ -68,6 +69,64 @@ def simple_desc(local_tmp_path):
     with open(desc_path, "wb") as fp:
         fp.write(_simple_desc_bytes)
     return desc_path, _simple_desc_bytes
+
+
+@pytest.mark.skipif(is_before_spark_340(), reason="descriptor compatibility shims start at Spark 3.4")
+def test_protobuf_descriptor_compat(local_tmp_path, from_protobuf_fn):
+    # proto2 test.Compat: optional int32 id = 1 [default = 7]; Status FIRST = ALIAS = 0;
+    # optional Status first = 2 [default = FIRST]; optional Status alias = 3 [default = ALIAS].
+    desc_bytes = bytes.fromhex(
+        "0ab0010a0c636f6d7061742e70726f746f1204746573742291010a06436f6d706174"
+        "120d0a0269641801200128053a013712290a05666972737418022001280e32132e74"
+        "6573742e436f6d7061742e5374617475733a05464952535412290a05616c696173"
+        "18032001280e32132e746573742e436f6d7061742e5374617475733a05414c494153"
+        "22220a0653746174757312090a054649525354100012090a05414c49415310001a02"
+        "1001620670726f746f32")
+    desc_path = local_tmp_path + "/compat.desc"
+    with open(desc_path, "wb") as fp:
+        fp.write(desc_bytes)
+
+    def check(spark):
+        decoded = call_protobuf_function(
+            from_protobuf_fn, f.lit(bytearray()), "test.Compat", desc_path, desc_bytes,
+            options={"mode": "FAILFAST"})
+        expr = spark.range(1).select(decoded.alias("d"))._jdf.queryExecution() \
+            .analyzed().projectList().apply(0).child()
+        cls = spark._jvm.com.nvidia.spark.rapids.ShimReflectionUtils.loadClass(
+            "com.nvidia.spark.rapids.shims.SparkProtobufCompat$")
+        compat = cls.getField("MODULE$").get(None)
+        extracted = compat.extractExprInfo(expr)
+        assert extracted.isRight(), str(extracted)
+        info = extracted.toOption().get()
+        assert info.messageName() == "test.Compat"
+        assert info.options().apply("mode") == "FAILFAST"
+        resolved = compat.resolveMessageDescriptor(info)
+        assert resolved.isRight(), str(resolved)
+        descriptor = resolved.toOption().get()
+        assert descriptor.syntax() == "PROTO2"
+        assert descriptor.findField("missing").isEmpty()
+        for name, number, proto_type, default in [
+                ("id", 1, "INT32", 7), ("first", 2, "ENUM", "FIRST"),
+                ("alias", 3, "ENUM", "ALIAS")]:
+            field = descriptor.findField(name).get()
+            assert (field.name(), field.fieldNumber(), field.protoTypeName()) == \
+                (name, number, proto_type)
+            assert not field.isRepeated() and not field.isRequired() and not field.isInOneof()
+            result = field.defaultValueResult()
+            assert result.isRight(), str(result)
+            value = result.toOption().get().get()
+            if proto_type == "ENUM":
+                assert (value.number(), value.name()) == (0, default)
+                values = field.enumMetadata().get().values()
+                assert [(values.apply(i).number(), values.apply(i).name())
+                        for i in range(values.size())] == [(0, "FIRST"), (0, "ALIAS")]
+            else:
+                assert value.value() == default
+        missing = info.copy("test.Missing", info.descriptorSource(), info.options())
+        assert compat.resolveMessageDescriptor(missing).isLeft()
+
+    # This exercises the CPU-side metadata API, not execution of a GPU expression.
+    with_cpu_session(check)
 
 
 _smoke_rows = [(1, "a"), (-2, "bb"), (0, ""), (12345, "hello")]

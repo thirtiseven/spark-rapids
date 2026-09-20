@@ -324,6 +324,10 @@ class SparkProtobufCompatSuite extends AnyFunSuite {
       value => BinaryValue.unapply(value).get)
   }
 
+  private final class FakeBytesDefault {
+    def toByteArray: Array[Byte] = Array[Byte](4, 5)
+  }
+
   test("compat converts reflected defaults to neutral values") {
     val enumMetadata = ProtobufEnumMetadata(Seq(
       ProtobufEnumValue(0, "UNKNOWN"),
@@ -341,11 +345,29 @@ class SparkProtobufCompatSuite extends AnyFunSuite {
       Right(ProtobufDefaultValue.StringValue("value")))
     assert(compat.toDefaultValue(Array[Byte](4, 5), "BYTES", None) ==
       Right(ProtobufDefaultValue.BinaryValue(Array[Byte](4, 5))))
+    assert(compat.toDefaultValue(new FakeBytesDefault, "BYTES", None) ==
+      Right(ProtobufDefaultValue.BinaryValue(Array[Byte](4, 5))))
     assert(compat.toDefaultValue(Int.box(1), "ENUM", Some(enumMetadata)) ==
       Right(ProtobufDefaultValue.EnumValue(1, "READY")))
   }
 
   private final class FakeEnumValueDescriptor(val getNumber: Int, val getName: String)
+
+  test("enum metadata snapshots mutable entries before caching numeric lookup") {
+    val original = Vector(ProtobufEnumValue(0, "FIRST"), ProtobufEnumValue(0, "ALIAS"))
+    val entries = scala.collection.mutable.ArrayBuffer(original: _*)
+    val metadata = ProtobufEnumMetadata(entries)
+    val equalValue = ProtobufEnumMetadata(original)
+    val hash = metadata.hashCode()
+    val set = scala.collection.mutable.HashSet(metadata)
+    assert(metadata.defaultFromNumber(0) == ProtobufDefaultValue.EnumValue(0, "FIRST"))
+    entries(0) = ProtobufEnumValue(0, "CHANGED")
+    entries.clear()
+    assert(metadata.values == original)
+    assert(metadata.defaultFromNumber(0) == ProtobufDefaultValue.EnumValue(0, "FIRST"))
+    assert(metadata == equalValue && metadata.hashCode() == hash)
+    assert(set.contains(metadata) && set.contains(equalValue))
+  }
 
   test("enum defaults preserve explicit aliases and use the first name for numeric values") {
     val metadata = Some(ProtobufEnumMetadata(Seq(

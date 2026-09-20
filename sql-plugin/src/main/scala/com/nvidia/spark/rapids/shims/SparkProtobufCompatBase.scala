@@ -36,7 +36,10 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
   private[this] val sparkProtobufUtilsObjectClassName =
     "org.apache.spark.sql.protobuf.utils.ProtobufUtils$"
 
-  /** Reads from_protobuf arguments; Left explains a missing or incompatible Spark API. */
+  /**
+   * Reads arguments from ProtobufDataToCatalyst after runtime replacement, not an analyzed wrapper.
+   * Left explains a missing or incompatible Spark API.
+   */
   def extractExprInfo(e: Expression): Either[String, ProtobufExprInfo] = {
     for {
       messageName <- reflectMessageName(e)
@@ -158,13 +161,13 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
         s"Failed to read protobuf default value for field '$name': ${t.getMessage}"
       }.flatMap(identity)
     override lazy val messageDescriptor: Option[ProtobufMessageDescriptor] =
-      if (protoTypeName == "MESSAGE") {
+      if (protoTypeName == "MESSAGE" || protoTypeName == "GROUP") {
         Some(new ReflectiveMessageDescriptor(ProtobufReflection.getMessageType(raw)))
       } else {
         None
       }
     override lazy val referencedTypeSyntax: Option[String] = protoTypeName match {
-      case "MESSAGE" =>
+      case "MESSAGE" | "GROUP" =>
         Some(Try(readDescriptorSyntax(ProtobufReflection.getMessageType(raw))).getOrElse(""))
       case "ENUM" =>
         Some(Try(readDescriptorSyntax(ProtobufReflection.getEnumType(raw))).getOrElse(""))
@@ -296,7 +299,7 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
 
     def getFile(desc: AnyRef): AnyRef = invoke0[AnyRef](desc, "getFile")
 
-    def getEnumValues(enumType: AnyRef): Seq[ProtobufEnumValue] = {
+    def getEnumValues(enumType: AnyRef): Vector[ProtobufEnumValue] = {
       import scala.collection.JavaConverters._
       val values = invoke0[java.util.List[_]](enumType, "getValues")
       values.asScala.map { v =>
@@ -304,7 +307,7 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
         val num = invoke0[java.lang.Integer](ev, "getNumber").intValue()
         val enumName = invoke0[String](ev, "getName")
         ProtobufEnumValue(num, enumName)
-      }.toSeq
+      }.toVector
     }
 
     def getFileSyntax(fileDesc: AnyRef, typeNameFn: AnyRef => String): String = Try {

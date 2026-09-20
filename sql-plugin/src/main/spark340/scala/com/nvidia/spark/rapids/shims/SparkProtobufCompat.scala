@@ -29,7 +29,7 @@ import java.lang.reflect.Method
 import scala.util.Try
 
 import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.rapids.protobuf._
+import org.apache.spark.sql.rapids.protobuf.ProtobufDescriptorSource
 
 private[shims] object SparkProtobufCompat extends SparkProtobufCompatBase {
   override protected def reflectDescriptorSource(

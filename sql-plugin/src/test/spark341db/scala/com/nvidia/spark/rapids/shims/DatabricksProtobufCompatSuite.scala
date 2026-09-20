@@ -32,6 +32,15 @@ import org.apache.spark.sql.rapids.protobuf.ProtobufDescriptorSource
 import org.apache.spark.sql.types.{BinaryType, DataType}
 
 class DatabricksProtobufCompatSuite extends AnyFunSuite {
+  private final class DescriptorWrapper(val descriptor: AnyRef)
+
+  test("descriptor wrapper probing also accepts an unwrapped descriptor") {
+    val descriptor = new Object
+    assert(SparkProtobufCompat.unwrapMessageDescriptor(
+      new DescriptorWrapper(descriptor)) eq descriptor)
+    assert(SparkProtobufCompat.unwrapMessageDescriptor(descriptor) eq descriptor)
+  }
+
   private abstract class FakeExpr extends LeafExpression with CodegenFallback {
     override def nullable: Boolean = true
     override def dataType: DataType = BinaryType

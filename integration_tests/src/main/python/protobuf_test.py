@@ -79,9 +79,10 @@ def test_protobuf_descriptor_compat(local_tmp_path, from_protobuf_fn, check_utf8
     # repeated int32 items = 4; required string required_name = 5;
     # oneof choice { int32 selected = 6; }
     # message Nested { optional string value = 1; } optional Nested nested = 7;
+    # message GroupContainer { optional group Legacy = 1 { optional string value = 1; } }
     # The final byte sets the file's java_string_check_utf8 option.
     desc_bytes = bytes.fromhex(
-        "0aef020a0c636f6d7061742e70726f746f12047465737422d3020a06436f6d70617412110a0269641801200128"
+        "0ad6030a0c636f6d7061742e70726f746f12047465737422d3020a06436f6d70617412110a0269641801200128"
         "053a01375202696412300a05666972737418022001280e32132e746573742e436f6d7061742e5374617475733a"
         "0546495253545205666972737412300a05616c69617318032001280e32132e746573742e436f6d7061742e5374"
         "617475733a05414c4941535205616c69617312140a056974656d7318042003280552056974656d7312230a0d72"
@@ -89,17 +90,22 @@ def test_protobuf_descriptor_compat(local_tmp_path, from_protobuf_fn, check_utf8
         "06200128054800520873656c6563746564122b0a066e657374656418072001280b32132e746573742e436f6d70"
         "61742e4e657374656452066e65737465641a1e0a064e657374656412140a0576616c7565180120012809520576"
         "616c756522220a0653746174757312090a054649525354100012090a05414c49415310001a02100142080a0663"
-        "686f6963654203d801" + ("01" if check_utf8 else "00"))
+        "686f69636522650a0e47726f7570436f6e7461696e657212330a066c656761637918012001280a321b2e746573"
+        "742e47726f7570436f6e7461696e65722e4c656761637952066c65676163791a1e0a064c656761637912140a05"
+        "76616c7565180120012809520576616c75654203d801" + ("01" if check_utf8 else "00"))
     desc_path = local_tmp_path + "/compat.desc"
     with open(desc_path, "wb") as fp:
         fp.write(desc_bytes)
 
     def check(spark):
         decoded = call_protobuf_function(
-            from_protobuf_fn, f.lit(bytearray()), "test.Compat", desc_path, desc_bytes,
+            from_protobuf_fn, f.col("bin"), "test.Compat", desc_path, desc_bytes,
             options={"mode": "FAILFAST"})
-        expr = spark.range(1).select(decoded.alias("d"))._jdf.queryExecution() \
-            .analyzed().projectList().apply(0).child()
+        # Match the plugin's planning phase: replace RuntimeReplaceable, but avoid constant folding.
+        source = spark.createDataFrame([(bytearray(),)], "bin binary")
+        expr = source.select(decoded.alias("d"))._jdf.queryExecution() \
+            .optimizedPlan().projectList().apply(0).child()
+        assert expr.getClass().getName() == "org.apache.spark.sql.protobuf.ProtobufDataToCatalyst"
         cls = spark._jvm.com.nvidia.spark.rapids.ShimReflectionUtils.loadClass(
             "com.nvidia.spark.rapids.shims.SparkProtobufCompat$")
         compat = cls.getField("MODULE$").get(None)
@@ -157,6 +163,19 @@ def test_protobuf_descriptor_compat(local_tmp_path, from_protobuf_fn, check_utf8
             else:
                 assert field.messageDescriptor().isEmpty()
                 assert field.referencedTypeSyntax().isEmpty()
+        # Inspect GROUP metadata without requiring Spark SQL to support group decoding.
+        group_info = info.copy("test.GroupContainer", info.descriptorSource(), info.options())
+        group_result = compat.resolveMessageDescriptor(group_info)
+        assert group_result.isRight(), str(group_result)
+        group = group_result.toOption().get().findField("legacy").get()
+        assert (group.fieldNumber(), group.protoTypeName()) == (1, "GROUP")
+        assert group.referencedTypeSyntax().get() == "PROTO2"
+        nested = group.messageDescriptor().get()
+        assert nested.syntax() == "PROTO2"
+        assert nested.javaStringCheckUtf8() == check_utf8
+        value = nested.findField("value").get()
+        assert (value.fieldNumber(), value.protoTypeName()) == (1, "STRING")
+        assert nested.findField("missing").isEmpty()
         missing = info.copy("test.Missing", info.descriptorSource(), info.options())
         assert compat.resolveMessageDescriptor(missing).isLeft()
 

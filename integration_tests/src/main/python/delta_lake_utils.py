@@ -410,7 +410,10 @@ def assert_delta_row_tracking_dml(spark_tmp_path, dml_sql, conf,
     with_cpu_session(lambda spark: assert_gpu_and_cpu_latest_delta_log_equivalent(spark, data_path),
                      conf=conf)
 
-def assert_rapids_delta_write(do_test, conf):
+def assert_rapids_delta_write(
+        do_test, conf, required_gpu_classes=delta_write, require_same_plan=False,
+        forbidden_cpu_fallback_classes=None, require_non_empty=False,
+        expected_command=None, expected_classes=None):
     """
     Validates that a Delta write operation executed on the GPU produces the expected execution plans.
     This function starts a plan capture mechanism using the Spark JVM's ExecutionPlanCaptureCallback,
@@ -424,6 +427,19 @@ def assert_rapids_delta_write(do_test, conf):
         A function that performs the Delta write operation to be validated.
     conf : dict
         A dictionary of configuration options to be passed to the GPU session.
+    required_gpu_classes : list[str]
+        GPU class names that must occur in the captured plans.
+    require_same_plan : bool
+        Whether all required GPU classes must occur in the same captured plan.
+    forbidden_cpu_fallback_classes : list[str] or None
+        CPU class names that must not be reported as falling back in any captured plan.
+    require_non_empty : bool
+        When true, require at least one captured plan. This is useful when a no-op is not valid
+        evidence for the feature being tested.
+    expected_command : str, optional
+        Additional GPU command or execution class that must be present in a captured plan.
+    expected_classes : iterable of str, optional
+        Additional GPU plan classes that must be present in a captured plan.
 
     Returns
     -------
@@ -431,22 +447,43 @@ def assert_rapids_delta_write(do_test, conf):
         The result returned by the `do_test` function.
     """
     jvm = spark_jvm()
-    jvm.org.apache.spark.sql.rapids.ExecutionPlanCaptureCallback.startCapture()
+    callback = jvm.org.apache.spark.sql.rapids.ExecutionPlanCaptureCallback
+    callback.startCapture()
     try:
         result = with_gpu_session(do_test, conf=conf)
-        captured_plans = jvm.org.apache.spark.sql.rapids.ExecutionPlanCaptureCallback.getResultsWithTimeout(10000)
+        captured_plans = callback.getResultsWithTimeout(10000)
+        if require_non_empty:
+            assert len(captured_plans) > 0, "No execution plans captured for Delta write"
+        if expected_command is not None:
+            assert any(
+                callback.contains(plan, expected_command) for plan in captured_plans), \
+                f"{expected_command} is not found in any captured plan"
+        for cls in expected_classes or ():
+            assert any(
+                callback.contains(plan, cls) for plan in captured_plans), \
+                f"{cls} is not found in any captured plan"
         # Some write functions are no-op. We may not capture any GPU plan.
-        if len(captured_plans) > 0:
-            for cls in delta_write:
+        if require_same_plan:
+            found = any(
+                all(callback.contains(plan, cls) for cls in required_gpu_classes)
+                for plan in captured_plans)
+            assert found, \
+                f"No captured plan contains all required GPU classes: {required_gpu_classes}"
+        elif len(captured_plans) > 0:
+            for cls in required_gpu_classes:
                 found = False
                 for plan in captured_plans:
-                    found = jvm.org.apache.spark.sql.rapids.ExecutionPlanCaptureCallback.contains(plan, cls)
+                    found = callback.contains(plan, cls)
                     if found:
                         break
                 assert found, f"{cls} is not found in any captured plan"
+        for plan in captured_plans:
+            for cls in forbidden_cpu_fallback_classes or []:
+                assert not callback.didFallBack(plan, cls), \
+                    f"Captured Delta write plan fell back to CPU {cls}"
         return result
     finally:
-        jvm.org.apache.spark.sql.rapids.ExecutionPlanCaptureCallback.endCapture()
+        callback.endCapture()
 
 def assert_db173_gpu_data_writing_command(
         do_test, conf, optimized_write, expected_atomic_gpu_class, aqe_enabled=None,

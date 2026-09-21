@@ -93,6 +93,13 @@ def test_protobuf_descriptor_compat(local_tmp_path, from_protobuf_fn, check_utf8
         "686f69636522650a0e47726f7570436f6e7461696e657212330a066c656761637918012001280a321b2e746573"
         "742e47726f7570436f6e7461696e65722e4c656761637952066c65676163791a1e0a064c656761637912140a05"
         "76616c7565180120012809520576616c75654203d801" + ("01" if check_utf8 else "00"))
+    # Add a proto3 file: message Presence { optional int32 optional_value = 1;
+    # oneof choice { int32 selected = 2; } int32 plain = 3; }
+    desc_bytes += bytes.fromhex(
+        "0a87010a0e70726573656e63652e70726f746f12047465737422670a0850726573656e6365121b0a0e6f7074"
+        "696f6e616c5f76616c7565180120012805480188010112120a0873656c65637465641802200128054800120d"
+        "0a05706c61696e18032001280542080a0663686f69636542110a0f5f6f7074696f6e616c5f76616c75656206"
+        "70726f746f33")
     desc_path = local_tmp_path + "/compat.desc"
     with open(desc_path, "wb") as fp:
         fp.write(desc_bytes)
@@ -178,6 +185,13 @@ def test_protobuf_descriptor_compat(local_tmp_path, from_protobuf_fn, check_utf8
         assert nested.findField("missing").isEmpty()
         missing = info.copy("test.Missing", info.descriptorSource(), info.options())
         assert compat.resolveMessageDescriptor(missing).isLeft()
+        presence_info = info.copy("test.Presence", info.descriptorSource(), info.options())
+        presence_result = compat.resolveMessageDescriptor(presence_info)
+        assert presence_result.isRight(), str(presence_result)
+        presence = presence_result.toOption().get()
+        assert presence.syntax() == "PROTO3"
+        for name, in_oneof in [("optional_value", False), ("selected", True), ("plain", False)]:
+            assert presence.findField(name).get().isInOneof() == in_oneof, name
 
     # This exercises the CPU-side metadata API, not execution of a GPU expression.
     with_cpu_session(check)

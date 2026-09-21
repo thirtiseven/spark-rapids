@@ -137,7 +137,7 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
     override lazy val protoTypeName: String = typeName(ProtobufReflection.getFieldType(raw))
     override lazy val isRepeated: Boolean = ProtobufReflection.isRepeated(raw)
     override lazy val isRequired: Boolean = ProtobufReflection.isRequired(raw)
-    override lazy val isInOneof: Boolean = ProtobufReflection.getContainingOneof(raw) != null
+    override lazy val isInOneof: Boolean = ProtobufReflection.getRealContainingOneof(raw) != null
     override lazy val enumMetadata: Option[ProtobufEnumMetadata] =
       if (protoTypeName == "ENUM") {
         Some(ProtobufEnumMetadata(
@@ -285,7 +285,7 @@ private[shims] abstract class SparkProtobufCompatBase extends Logging {
     def isRequired(fd: AnyRef): Boolean =
       invoke0[java.lang.Boolean](fd, "isRequired").booleanValue()
 
-    def getContainingOneof(fd: AnyRef): AnyRef = invoke0[AnyRef](fd, "getContainingOneof")
+    def getRealContainingOneof(fd: AnyRef): AnyRef = invoke0[AnyRef](fd, "getRealContainingOneof")
 
     def hasDefaultValue(fd: AnyRef): Boolean =
       invoke0[java.lang.Boolean](fd, "hasDefaultValue").booleanValue()

@@ -125,7 +125,7 @@ trait ProtobufFieldDescriptor {
   def isRepeated: Boolean
   /** Whether the field has the proto2 required label. */
   def isRequired: Boolean
-  /** Whether the field belongs to a oneof declaration. */
+  /** Whether the field belongs to a real oneof, excluding synthetic ones for proto3 optional. */
   def isInOneof: Boolean
   /**
    * Right(None) means no explicit default; Left means the default could not be read or converted.

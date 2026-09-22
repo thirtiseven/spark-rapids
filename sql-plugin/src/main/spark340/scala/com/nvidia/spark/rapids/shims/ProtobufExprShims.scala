@@ -493,7 +493,7 @@ object ProtobufExprShims extends org.apache.spark.internal.Logging {
                   collectStructFieldReferences(
                     _, fieldReqs, holder, allowSemanticReferenceMatch))
                 advanceToParent()
-              case _: org.apache.spark.sql.execution.window.WindowExec =>
+              case window: SparkPlan if SparkShimImpl.isWindowFunctionExec(window) =>
                 planMeta match {
                   case windowMeta: GpuBaseWindowExecMeta[_] =>
                     windowMeta.getInputWindowExpressions.foreach(

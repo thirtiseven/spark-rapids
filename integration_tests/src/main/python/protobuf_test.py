@@ -1014,8 +1014,9 @@ def test_from_protobuf_nested_repeated_enum_string(
 
 @pytest.mark.skipif(is_before_spark_340(), reason="from_protobuf is Spark 3.4.0+")
 @ignore_order(local=True)
+@pytest.mark.parametrize("ansi_enabled", ["true", "false"])
 def test_from_protobuf_nested_repeated_enum_string_invalid_permissive(
-        local_tmp_path, from_protobuf_fn):
+        local_tmp_path, from_protobuf_fn, ansi_enabled):
     desc_path, desc_bytes = _setup_protobuf_desc(
         local_tmp_path, "nested_repeated_enum.desc",
         _build_nested_repeated_enum_descriptor_set_bytes)
@@ -1045,11 +1046,12 @@ def test_from_protobuf_nested_repeated_enum_string_invalid_permissive(
             decoded.isNull().alias("decoded_is_null"),
             decoded.getField("id").alias("id"),
             decoded.getField("name").alias("name"),
-            decoded.getField("inner").getField("priority").getItem(0).alias("priority0"),
-            decoded.getField("inner").getField("priority").getItem(1).alias("priority1")
+            f.get(decoded.getField("inner").getField("priority"), 0).alias("priority0"),
+            f.get(decoded.getField("inner").getField("priority"), 1).alias("priority1")
         )
 
-    assert_gpu_and_cpu_are_equal_collect(run_on_spark)
+    assert_gpu_and_cpu_are_equal_collect(
+        run_on_spark, conf={"spark.sql.ansi.enabled": ansi_enabled})
 
 
 def _build_required_field_descriptor_set_bytes(spark):

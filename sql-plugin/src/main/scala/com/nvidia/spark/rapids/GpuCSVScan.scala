@@ -20,6 +20,7 @@ import java.io.IOException
 import java.nio.charset.{Charset, StandardCharsets}
 import java.util.Locale
 
+import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 
 import ai.rapids.cudf
@@ -445,20 +446,25 @@ object CSVPartitionReader {
       buffer.getByte(offset + 1) == 0xbb.toByte && buffer.getByte(offset + 2) == 0xbf.toByte
   }
 
+  @tailrec
+  private def offsetAfterLine(buffer: HostMemoryBuffer, size: Long, pos: Long): Long = {
+    if (pos >= size) size
+    else if (buffer.getByte(pos) == '\n'.toByte) pos + 1
+    else offsetAfterLine(buffer, size, pos + 1)
+  }
+
   private def headerStart(buffer: HostMemoryBuffer, size: Long, comment: Byte): Long = {
-    // cuDF ignores a UTF-8 BOM before checking for leading comments and the header.
-    var pos = if (startsWithBom(buffer, 0, size)) {
-      3L
-    } else {
-      0L
-    }
-    while (pos < size && comment != 0 && buffer.getByte(pos) == comment) {
-      while (pos < size && buffer.getByte(pos) != '\n'.toByte) {
-        pos += 1
+    @tailrec
+    def skipComments(pos: Long): Long = {
+      if (pos < size && comment != 0 && buffer.getByte(pos) == comment) {
+        skipComments(offsetAfterLine(buffer, size, pos))
+      } else {
+        pos
       }
-      pos = math.min(pos + 1, size)
     }
-    pos
+
+    // cuDF ignores a UTF-8 BOM before checking for leading comments and the header.
+    skipComments(if (startsWithBom(buffer, 0, size)) 3L else 0L)
   }
 
   private[rapids] case class CsvReadChunk(
@@ -467,39 +473,41 @@ object CSVPartitionReader {
       comment: Byte) extends AutoCloseable {
     override def close(): Unit = buffer.close()
 
-    private def lineEnd(start: Long): Long = {
-      var pos = start
-      while (pos < buffer.getLength && buffer.getByte(pos) != '\n'.toByte) {
-        pos += 1
-      }
-      math.min(pos + 1, buffer.getLength)
+    @tailrec
+    private def previousLineBoundary(pos: Long, headerEnd: Long): Long = {
+      if (pos < headerEnd || buffer.getByte(pos) == '\n'.toByte) pos + 1
+      else previousLineBoundary(pos - 1, headerEnd)
     }
 
-    def split(): Seq[CsvReadChunk] = withResource(this) { _ =>
+    private def splitOffsets: (Long, Long) = {
+      val size = buffer.getLength
       val headerEnd = if (hasHeader) {
-        lineEnd(CSVPartitionReader.headerStart(buffer, buffer.getLength, comment))
+        offsetAfterLine(buffer, size, headerStart(buffer, size, comment))
       } else {
         0L
       }
-      val midpoint = math.max(buffer.getLength / 2, headerEnd)
-      var splitAt = lineEnd(midpoint)
-      if (splitAt == buffer.getLength) {
-        var pos = midpoint - 1
-        while (pos >= headerEnd && buffer.getByte(pos) != '\n'.toByte) {
-          pos -= 1
-        }
-        splitAt = pos + 1
+      val midpoint = math.max(size / 2, headerEnd)
+      val nextLineBoundary = offsetAfterLine(buffer, size, midpoint)
+      val leftEnd = if (nextLineBoundary < size) {
+        nextLineBoundary
+      } else {
+        previousLineBoundary(midpoint - 1, headerEnd)
       }
       // Keep the preceding newline so cuDF cannot strip an interior U+FEFF as a file BOM.
-      val rightStart = if (startsWithBom(buffer, splitAt, buffer.getLength)) {
-        splitAt - 1
+      val rightStart = if (startsWithBom(buffer, leftEnd, size)) {
+        leftEnd - 1
       } else {
-        splitAt
+        leftEnd
       }
-      if (rightStart <= 0 || splitAt >= buffer.getLength || splitAt < headerEnd) {
+      if (rightStart <= 0 || leftEnd >= size || leftEnd < headerEnd) {
         throw new GpuSplitAndRetryOOM("CSV input cannot be split at a record boundary")
       }
-      closeOnExcept(buffer.slice(0, splitAt)) { left =>
+      (leftEnd, rightStart)
+    }
+
+    def split(): Seq[CsvReadChunk] = withResource(this) { _ =>
+      val (leftEnd, rightStart) = splitOffsets
+      closeOnExcept(buffer.slice(0, leftEnd)) { left =>
         val right = buffer.slice(rightStart, buffer.getLength - rightStart)
         Seq(CsvReadChunk(left, hasHeader, comment), CsvReadChunk(right, false, comment))
       }

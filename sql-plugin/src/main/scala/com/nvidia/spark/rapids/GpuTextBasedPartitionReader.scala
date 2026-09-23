@@ -22,6 +22,7 @@ import java.time.DateTimeException
 import java.util
 import java.util.Optional
 
+import scala.annotation.tailrec
 import scala.collection.mutable.ListBuffer
 
 import ai.rapids.cudf.{CaptureGroups, ColumnVector, DType, HostColumnVector, HostColumnVectorCore, HostMemoryBuffer, RegexProgram, Scalar, Schema, Table}
@@ -384,7 +385,7 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
   private val lineReader = new HadoopFileLinesReader(partFile, lineSeparatorInRead, conf)
   private var isFirstChunkForIterator: Boolean = true
   private var isExhausted: Boolean = false
-  private var tables: Iterator[Table] = Iterator.empty
+  private var pendingTables: Iterator[Table] = Iterator.empty
 
   metrics = execMetrics
 
@@ -548,31 +549,35 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
     }
   }
 
-  private def closeTables(): Unit = {
-    tables match {
+  private def closePendingTables(): Unit = {
+    pendingTables match {
       case closeable: AutoCloseable => closeable.close()
-      case _ => tables.foreach(_.close())
+      case _ => pendingTables.foreach(_.close())
     }
-    tables = Iterator.empty
+    pendingTables = Iterator.empty
   }
 
-  private def readToTable(isFirstChunk: Boolean): Option[Table] = {
-    if (!tables.hasNext) {
-      closeTables()
+  private def ensurePendingTables(isFirstChunk: Boolean): Unit = {
+    if (!pendingTables.hasNext) {
+      closePendingTables()
       val (dataBuffer, dataSize) = metrics(BUFFER_TIME).ns {
         readPartFile()
       }
       withResource(dataBuffer) { _ =>
         if (dataSize != 0) {
           GpuSemaphore.acquireIfNecessary(TaskContext.get())
-          tables = readToTables(dataBuffer, getCudfSchema(dataSchema), effectiveReadSchema,
+          pendingTables = readToTables(dataBuffer, getCudfSchema(dataSchema), effectiveReadSchema,
             getCudfSchema(effectiveReadSchema), isFirstChunk, metrics(GPU_DECODE_TIME))
         }
       }
     }
-    if (tables.hasNext) {
+  }
+
+  private def readToTable(isFirstChunk: Boolean): Option[Table] = {
+    ensurePendingTables(isFirstChunk)
+    if (pendingTables.hasNext) {
       GpuSemaphore.acquireIfNecessary(TaskContext.get())
-      val castTable = castToOutputTypesWithRetryAndClose(tables.next(), effectiveReadSchema)
+      val castTable = castToOutputTypesWithRetryAndClose(pendingTables.next(), effectiveReadSchema)
       handleResult(effectiveReadSchema, castTable)
     } else {
       None
@@ -701,16 +706,26 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
     }
   }
 
+  @tailrec
+  private def readNextBatch(): Option[ColumnarBatch] = {
+    if (isExhausted && !pendingTables.hasNext) {
+      None
+    } else {
+      readBatch() match {
+        case None => readNextBatch()
+        case result => result
+      }
+    }
+  }
+
   override def next(): Boolean = {
     batch.foreach(_.close())
     batch = None
-    try {
-      while (batch.isEmpty && (!isExhausted || tables.hasNext)) {
-        batch = readBatch()
-      }
+    batch = try {
+      readNextBatch()
     } catch {
       case t: Throwable =>
-        closeTables()
+        closePendingTables()
         throw t
     }
 
@@ -730,7 +745,7 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
   }
 
   override def close(): Unit = {
-    closeTables()
+    closePendingTables()
     lineReader.close()
     batch.foreach(_.close())
     batch = None

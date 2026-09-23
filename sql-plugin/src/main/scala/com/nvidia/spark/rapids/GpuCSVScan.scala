@@ -20,7 +20,6 @@ import java.io.IOException
 import java.nio.charset.{Charset, StandardCharsets}
 import java.util.Locale
 
-import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 
 import ai.rapids.cudf
@@ -446,25 +445,21 @@ object CSVPartitionReader {
       buffer.getByte(offset + 1) == 0xbb.toByte && buffer.getByte(offset + 2) == 0xbf.toByte
   }
 
-  @tailrec
-  private def offsetAfterLine(buffer: HostMemoryBuffer, size: Long, pos: Long): Long = {
-    if (pos >= size) size
-    else if (buffer.getByte(pos) == '\n'.toByte) pos + 1
-    else offsetAfterLine(buffer, size, pos + 1)
+  private def offsetAfterLine(buffer: HostMemoryBuffer, size: Long, start: Long): Long = {
+    var pos = start
+    while (pos < size && buffer.getByte(pos) != '\n'.toByte) {
+      pos += 1
+    }
+    math.min(pos + 1, size)
   }
 
   private def headerStart(buffer: HostMemoryBuffer, size: Long, comment: Byte): Long = {
-    @tailrec
-    def skipComments(pos: Long): Long = {
-      if (pos < size && comment != 0 && buffer.getByte(pos) == comment) {
-        skipComments(offsetAfterLine(buffer, size, pos))
-      } else {
-        pos
-      }
-    }
-
     // cuDF ignores a UTF-8 BOM before checking for leading comments and the header.
-    skipComments(if (startsWithBom(buffer, 0, size)) 3L else 0L)
+    var pos = if (startsWithBom(buffer, 0, size)) 3L else 0L
+    while (pos < size && comment != 0 && buffer.getByte(pos) == comment) {
+      pos = offsetAfterLine(buffer, size, pos)
+    }
+    pos
   }
 
   private[rapids] case class CsvReadChunk(
@@ -473,10 +468,12 @@ object CSVPartitionReader {
       comment: Byte) extends AutoCloseable {
     override def close(): Unit = buffer.close()
 
-    @tailrec
-    private def previousLineBoundary(pos: Long, headerEnd: Long): Long = {
-      if (pos < headerEnd || buffer.getByte(pos) == '\n'.toByte) pos + 1
-      else previousLineBoundary(pos - 1, headerEnd)
+    private def previousLineBoundary(start: Long, headerEnd: Long): Long = {
+      var pos = start
+      while (pos >= headerEnd && buffer.getByte(pos) != '\n'.toByte) {
+        pos -= 1
+      }
+      pos + 1
     }
 
     private def splitOffsets: (Long, Long) = {

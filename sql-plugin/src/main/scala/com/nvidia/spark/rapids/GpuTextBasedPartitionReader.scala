@@ -22,7 +22,6 @@ import java.time.DateTimeException
 import java.util
 import java.util.Optional
 
-import scala.annotation.tailrec
 import scala.collection.mutable.ListBuffer
 
 import ai.rapids.cudf.{CaptureGroups, ColumnVector, DType, HostColumnVector, HostColumnVectorCore, HostMemoryBuffer, RegexProgram, Scalar, Schema, Table}
@@ -706,16 +705,12 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
     }
   }
 
-  @tailrec
   private def readNextBatch(): Option[ColumnarBatch] = {
-    if (isExhausted && !pendingTables.hasNext) {
-      None
-    } else {
-      readBatch() match {
-        case None => readNextBatch()
-        case result => result
-      }
+    var result: Option[ColumnarBatch] = None
+    while (result.isEmpty && (!isExhausted || pendingTables.hasNext)) {
+      result = readBatch()
     }
+    result
   }
 
   override def next(): Boolean = {

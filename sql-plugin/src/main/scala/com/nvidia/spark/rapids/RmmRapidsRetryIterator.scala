@@ -23,7 +23,7 @@ import scala.collection.mutable
 
 import ai.rapids.cudf.CudfColumnSizeOverflowException
 import com.nvidia.spark.Retryable
-import com.nvidia.spark.rapids.Arm.withResource
+import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.ScalableTaskCompletion.onTaskCompletion
 import com.nvidia.spark.rapids.SplitReason.SplitReason
@@ -852,27 +852,38 @@ object RmmRapidsRetryIterator extends Logging {
           throw new GpuSplitAndRetryOOM(
             s"GPU OutOfMemory: a batch of $toSplitRows cannot be split!")
         }
-        val splitIx = toSplitRows / 2
-        if (spillable.dataTypes.isEmpty) {
-          // A rows-only batch has no columns to put in a cuDF table.
-          Seq(new JustRowsColumnarBatch(splitIx),
-            new JustRowsColumnarBatch(toSplitRows - splitIx))
-        } else {
-          val table = withResource(spillable.getColumnarBatch()) { src =>
-            GpuColumnVector.from(src)
-          }
-          val splits = withResource(table)(_.contiguousSplit(splitIx))
-          withResource(splits) { _ =>
-            require(splits.length == 2,
-              s"Contiguous split returned ${splits.length} tables but two were expected!")
-            splits.safeMap { ct =>
-              withResource(GpuColumnVector.from(ct.getTable, spillable.dataTypes)) { batch =>
-                SpillableColumnarBatch(
-                  GpuColumnVector.incRefCounts(batch), SpillPriorities.ACTIVE_BATCHING_PRIORITY)
+        val (firstHalf, secondHalf) = withResource(spillable.getColumnarBatch()) { src =>
+          if (src.numCols() == 0) {
+            // A rows-only batch carries nothing but its row count, and a cudf table needs at
+            // least one column to hold it, so cut the count instead. The cut matches the
+            // contiguousSplit below so both paths halve a batch the same way.
+            val splitIx = toSplitRows / 2
+            (new JustRowsColumnarBatch(splitIx),
+                new JustRowsColumnarBatch(toSplitRows - splitIx))
+          } else {
+            withResource(GpuColumnVector.from(src)) { tbl =>
+              val splitIx = (tbl.getRowCount / 2).toInt
+              withResource(tbl.contiguousSplit(splitIx)) { cts =>
+                val tables = cts.map(_.getTable)
+                withResource(tables.safeMap(GpuColumnVector.from(_, spillable.dataTypes))) {
+                  batches =>
+                    val spillables = batches.safeMap { b =>
+                      SpillableColumnarBatch(
+                        GpuColumnVector.incRefCounts(b),
+                        SpillPriorities.ACTIVE_BATCHING_PRIORITY)
+                    }
+                    closeOnExcept(spillables) { _ =>
+                      require(spillables.length == 2,
+                        s"Contiguous split returned ${spillables.length} tables but two were " +
+                            s"expected!")
+                    }
+                    (spillables.head, spillables.last)
+                }
               }
-            }.toSeq
+            }
           }
         }
+        Seq(firstHalf, secondHalf)
       }
     }
   }

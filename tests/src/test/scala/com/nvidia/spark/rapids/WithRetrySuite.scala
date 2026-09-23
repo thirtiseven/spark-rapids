@@ -29,6 +29,8 @@ import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.rapids.execution.TrampolineUtil
+import org.apache.spark.sql.rapids.metrics.source.MockTaskContext
 import org.apache.spark.sql.types.{DataType, LongType}
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector => SparkColumnVector}
 
@@ -87,6 +89,50 @@ class WithRetrySuite
         verify(myItems.head, times(1)).close()
         verify(myItems.last, times(0)).close()
         myItems(1).close()
+      }
+    }
+  }
+
+  test("withRetry can close a single input before its first attempt") {
+    val input = mock[AutoCloseable]
+    withResource(withRetry(input, splitPolicy = null) { _ =>
+      fail("Closing an unused retry iterator must not execute the operation")
+    }) { attempts =>
+      assert(attempts.hasNext)
+      attempts.close()
+      assert(!attempts.hasNext)
+    }
+    verify(input, times(1)).close()
+  }
+
+  for (consume <- Seq(false, true)) {
+    test(s"withRetry closes from another task-completion callback, consumed=$consume") {
+      var completed = false
+      val context = new MockTaskContext(1, partitionId = 0) {
+        override def isCompleted(): Boolean = completed
+      }
+      TrampolineUtil.setTaskContext(context)
+      val input = mock[AutoCloseable]
+      try {
+        withResource(withRetry(input, splitPolicy = null)(_ => 1)) { attempts =>
+          ScalableTaskCompletion.onTaskCompletion(context) {
+            attempts.close()
+          }
+          if (consume) assert(attempts.next() == 1)
+          completed = true
+          context.markTaskComplete()
+          assert(!attempts.hasNext)
+        }
+        verify(input, times(1)).close()
+      } finally {
+        try {
+          if (!completed) {
+            completed = true
+            context.markTaskComplete()
+          }
+        } finally {
+          TrampolineUtil.unsetTaskContext()
+        }
       }
     }
   }

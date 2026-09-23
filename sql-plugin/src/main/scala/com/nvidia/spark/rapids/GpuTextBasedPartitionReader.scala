@@ -381,6 +381,7 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
   private val lineReader = new HadoopFileLinesReader(partFile, lineSeparatorInRead, conf)
   private var isFirstChunkForIterator: Boolean = true
   private var isExhausted: Boolean = false
+  private var tables: Iterator[Table] = Iterator.empty
 
   metrics = execMetrics
 
@@ -429,7 +430,8 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
       try {
         while (lineReader.hasNext
           && totalRows != maxRowsPerChunk
-          && totalSize <= maxBytesPerChunk /* soft limit and returns at least one row */) {
+          && totalSize <= maxBytesPerChunk
+          && fitsGpuMemoryBudget(totalSize, totalRows)) {
           val (lineBytes, bytesLen) = toUTF8Bytes(lineReader.next())
           hmb.add(lineBytes, 0, bytesLen)
           totalRows = hmb.getNumLines
@@ -446,6 +448,8 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
       (hmb, totalSize)
     }
   }
+
+  protected def fitsGpuMemoryBudget(bytes: Long, rows: Int): Boolean = true
 
   private def readBatch(): Option[ColumnarBatch] = {
     NvtxRegistry.FILE_FORMAT_READ_BATCH {
@@ -534,41 +538,56 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
     }
   }
 
+  private lazy val effectiveReadSchema: StructType = {
+    if (readDataSchema.isEmpty) {
+      val smallestField =
+        dataSchema.min(Ordering.by[StructField, Integer](_.dataType.defaultSize))
+      StructType(Seq(smallestField))
+    } else {
+      readDataSchema
+    }
+  }
+
+  private def closeTables(): Unit = {
+    tables match {
+      case closeable: AutoCloseable => closeable.close()
+      case _ => tables.foreach(_.close())
+    }
+    tables = Iterator.empty
+  }
+
   private def readToTable(isFirstChunk: Boolean): Option[Table] = {
-    val (dataBuffer, dataSize) = metrics(BUFFER_TIME).ns {
-      readPartFile()
-    }
-    try {
-      if (dataSize == 0) {
-        None
-      } else {
-        val newReadDataSchema: StructType = if (readDataSchema.isEmpty) {
-          val smallestField =
-            dataSchema.min(Ordering.by[StructField, Integer](_.dataType.defaultSize))
-          StructType(Seq(smallestField))
-        } else {
-          readDataSchema
-        }
-
-        val cudfSchema = getCudfSchema(dataSchema)
-        val cudfReadSchema = getCudfSchema(newReadDataSchema)
-
-        // about to start using the GPU
-        GpuSemaphore.acquireIfNecessary(TaskContext.get())
-
-        // The buffer that is sent down
-        val table = readToTable(dataBuffer, cudfSchema, newReadDataSchema, cudfReadSchema,
-          isFirstChunk, metrics(GPU_DECODE_TIME))
-
-        // parse boolean and numeric columns that were read as strings
-        val castTable =
-          castToOutputTypesWithRetryAndClose(table, newReadDataSchema)
-
-        handleResult(newReadDataSchema, castTable)
+    if (!tables.hasNext) {
+      closeTables()
+      val (dataBuffer, dataSize) = metrics(BUFFER_TIME).ns {
+        readPartFile()
       }
-    } finally {
-      dataBuffer.close()
+      withResource(dataBuffer) { _ =>
+        if (dataSize != 0) {
+          GpuSemaphore.acquireIfNecessary(TaskContext.get())
+          tables = readToTables(dataBuffer, getCudfSchema(dataSchema), effectiveReadSchema,
+            getCudfSchema(effectiveReadSchema), isFirstChunk, metrics(GPU_DECODE_TIME))
+        }
+      }
     }
+    if (tables.hasNext) {
+      GpuSemaphore.acquireIfNecessary(TaskContext.get())
+      val castTable = castToOutputTypesWithRetryAndClose(tables.next(), effectiveReadSchema)
+      handleResult(effectiveReadSchema, castTable)
+    } else {
+      None
+    }
+  }
+
+  protected def readToTables(
+      dataBuffer: BUFF,
+      cudfDataSchema: Schema,
+      readDataSchema: StructType,
+      cudfReadDataSchema: Schema,
+      isFirstChunk: Boolean,
+      decodeTime: GpuMetric): Iterator[Table] = {
+    Iterator.single(readToTable(dataBuffer, cudfDataSchema, readDataSchema,
+      cudfReadDataSchema, isFirstChunk, decodeTime))
   }
 
   def dateFormat: Option[String]
@@ -684,10 +703,15 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
 
   override def next(): Boolean = {
     batch.foreach(_.close())
-    batch = if (isExhausted) {
-      None
-    } else {
-      readBatch()
+    batch = None
+    try {
+      while (batch.isEmpty && (!isExhausted || tables.hasNext)) {
+        batch = readBatch()
+      }
+    } catch {
+      case t: Throwable =>
+        closeTables()
+        throw t
     }
 
     // NOTE: At this point, the task may not have yet acquired the semaphore if `batch` is `None`.
@@ -706,6 +730,7 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
   }
 
   override def close(): Unit = {
+    closeTables()
     lineReader.close()
     batch.foreach(_.close())
     batch = None

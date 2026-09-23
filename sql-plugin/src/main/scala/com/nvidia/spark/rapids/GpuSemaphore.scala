@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -288,7 +288,7 @@ object GpuSemaphore {
       .getOrElse(RapidsConf.DYNAMIC_CONCURRENT_GPU_TASKS.defaultValue)
   }
 
-  private def computeDefaultMemory(conf: SQLConf): Long = {
+  private[rapids] def computeDefaultMemory(conf: SQLConf): Long = {
     val totalMemory = GpuDeviceManager.getMemorySize
     val concurrentInt: Integer = RapidsConf.CONCURRENT_GPU_TASKS.get(conf).getOrElse {
       val batchBytes = RapidsConf.GPU_BATCH_SIZE_BYTES.get(conf)

@@ -23,9 +23,9 @@ import java.util.Locale
 import scala.collection.JavaConverters._
 
 import ai.rapids.cudf
-import ai.rapids.cudf.{ColumnVector, DType, Scalar, Schema, Table}
+import ai.rapids.cudf.{ColumnVector, DType, HostMemoryBuffer, Scalar, Schema, Table}
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
-import com.nvidia.spark.rapids.jni.CastStrings
+import com.nvidia.spark.rapids.jni.{CastStrings, GpuSplitAndRetryOOM}
 import com.nvidia.spark.rapids.shims.{ColumnDefaultValuesShims, ShimFilePartitionReaderFactory}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
@@ -440,6 +440,92 @@ abstract class CSVPartitionReaderBase[BUFF <: LineBufferer, FACT <: LineBufferer
 
 
 object CSVPartitionReader {
+  private[rapids] def estimatedGpuBytes(bytes: Long, rows: Int, columns: Int): Long = {
+    // Input and output characters overlap with per-cell pairs, quote flags, offsets and masks.
+    val bytesPerCell = 24L
+    val bytesPerRowOffset = 8L
+    2 * bytes + rows.toLong * (bytesPerRowOffset + math.max(1, columns) * bytesPerCell)
+  }
+
+  private[rapids] case class CsvReadChunk(
+      buffer: HostMemoryBuffer,
+      hasHeader: Boolean,
+      comment: Byte) extends AutoCloseable {
+    override def close(): Unit = buffer.close()
+
+    private def lineEnd(start: Long): Long = {
+      var pos = start
+      while (pos < buffer.getLength && buffer.getByte(pos) != '\n'.toByte) {
+        pos += 1
+      }
+      math.min(pos + 1, buffer.getLength)
+    }
+
+    def split(): Seq[CsvReadChunk] = withResource(this) { _ =>
+      var headerEnd = 0L
+      if (hasHeader) {
+        // cuDF ignores a UTF-8 BOM before checking for leading comments and the header.
+        if (buffer.getLength >= 3 && buffer.getByte(0) == 0xef.toByte &&
+            buffer.getByte(1) == 0xbb.toByte && buffer.getByte(2) == 0xbf.toByte) {
+          headerEnd = 3
+        }
+        while (headerEnd < buffer.getLength && comment != 0 &&
+            buffer.getByte(headerEnd) == comment) {
+          headerEnd = lineEnd(headerEnd)
+        }
+        headerEnd = lineEnd(headerEnd)
+      }
+      val midpoint = math.max(buffer.getLength / 2, headerEnd)
+      var splitAt = lineEnd(midpoint)
+      if (splitAt == buffer.getLength) {
+        var pos = midpoint - 1
+        while (pos >= headerEnd && buffer.getByte(pos) != '\n'.toByte) {
+          pos -= 1
+        }
+        splitAt = pos + 1
+      }
+      if (splitAt <= 0 || splitAt >= buffer.getLength || splitAt < headerEnd) {
+        throw new GpuSplitAndRetryOOM("CSV input cannot be split at a record boundary")
+      }
+      closeOnExcept(buffer.slice(0, splitAt)) { left =>
+        val right = buffer.slice(splitAt, buffer.getLength - splitAt)
+        Seq(CsvReadChunk(left, hasHeader, comment), CsvReadChunk(right, false, comment))
+      }
+    }
+  }
+
+  private[rapids] def readToTables(
+      dataBufferer: HostLineBufferer,
+      cudfSchema: Schema,
+      decodeTime: GpuMetric,
+      csvOpts: Boolean => cudf.CSVOptions,
+      hasHeader: Boolean,
+      comment: Byte,
+      partFile: PartitionedFile): Iterator[Table] with AutoCloseable = {
+    val size = dataBufferer.getLength
+    val buffer = withResource(dataBufferer.getBufferAndRelease)(_.slice(0, size))
+    val chunks = closeOnExcept(buffer) { _ =>
+      RmmRapidsRetryIterator.withRetry(CsvReadChunk(buffer, hasHeader, comment),
+        (chunk: CsvReadChunk) => chunk.split()) { chunk =>
+        NvtxIdWithMetrics(NvtxRegistry.CSV_DECODE, decodeTime) {
+          Table.readCSV(cudfSchema, csvOpts(chunk.hasHeader), chunk.buffer, 0,
+            chunk.buffer.getLength)
+        }
+      }
+    }
+    new Iterator[Table] with AutoCloseable {
+      override def hasNext: Boolean = chunks.hasNext
+      override def next(): Table = {
+        try {
+          chunks.next()
+        } catch {
+          case e: Exception => throw new IOException(s"Error when processing file [$partFile]", e)
+        }
+      }
+      override def close(): Unit = chunks.close()
+    }
+  }
+
   def readToTable(
       dataBufferer: HostLineBufferer,
       cudfSchema: Schema,
@@ -478,6 +564,39 @@ class CSVPartitionReader(
     // legitimate data and must not be filtered out.
     if (parsedOptions.multiLine) HostLineBuffererFactory
     else FilterCsvEmptyHostLineBuffererFactory) {
+
+  protected lazy val gpuMemoryBudget: Long = {
+    if (GpuDeviceManager.getMemorySize > 0) {
+      val taskMemory = GpuSemaphore.computeDefaultMemory(SQLConf.get)
+      // Leave room for resident state and allocations outside the CSV parse estimate.
+      taskMemory - taskMemory / 4
+    } else {
+      maxBytesPerChunk
+    }
+  }
+
+  override protected def fitsGpuMemoryBudget(bytes: Long, rows: Int): Boolean = {
+    parsedOptions.multiLine ||
+      CSVPartitionReader.estimatedGpuBytes(bytes, rows, readDataSchema.length) <= gpuMemoryBudget
+  }
+
+  override protected def readToTables(
+      dataBufferer: HostLineBufferer,
+      cudfDataSchema: Schema,
+      readDataSchema: StructType,
+      cudfReadDataSchema: Schema,
+      isFirstChunk: Boolean,
+      decodeTime: GpuMetric): Iterator[Table] = {
+    if (parsedOptions.multiLine) {
+      // Physical newlines are not record boundaries for multiline CSV.
+      super.readToTables(dataBufferer, cudfDataSchema, readDataSchema, cudfReadDataSchema,
+        isFirstChunk, decodeTime)
+    } else {
+      CSVPartitionReader.readToTables(dataBufferer, cudfDataSchema, decodeTime,
+        hasHeader => buildCsvOptions(parsedOptions, readDataSchema, hasHeader).build(),
+        isFirstChunk && parsedOptions.headerFlag, parsedOptions.comment.toByte, partFile)
+    }
+  }
 
   def buildCsvOptions(
       parsedOptions: CSVOptions,

@@ -466,6 +466,39 @@ class WithRetrySuite
     }
   }
 
+  test("splitSpillableInHalfByRows preserves values and releases GPU allocations") {
+    val baseline = Rmm.getTotalBytesAllocated
+    val toSplit = withResource(new Table.TestBuilder()
+      .column(5L, null.asInstanceOf[java.lang.Long], 3L, 1L, 9L).build()) { table =>
+      spy(SpillableColumnarBatch(GpuColumnVector.from(table, Array[DataType](LongType)), -1))
+    }
+    withResource(splitSpillableInHalfByRows(toSplit)) { halves =>
+      verify(toSplit, times(1)).close()
+      assert(halves.map(_.numRows()) == Seq(2, 3))
+      val values = halves.flatMap { half =>
+        withResource(half.getColumnarBatch()) { batch =>
+          withResource(batch.column(0).asInstanceOf[GpuColumnVector].getBase.copyToHost()) { col =>
+            (0 until batch.numRows()).map(i => if (col.isNull(i)) None else Some(col.getLong(i)))
+          }
+        }
+      }
+      assert(values == Seq(Some(5L), None, Some(3L), Some(1L), Some(9L)))
+    }
+    assert(Rmm.getTotalBytesAllocated == baseline)
+  }
+
+  test("splitSpillableInHalfByRows closes its input when splitting runs out of memory") {
+    val baseline = Rmm.getTotalBytesAllocated
+    val toSplit = buildBatch
+    RmmSpark.forceRetryOOM(RmmSpark.getCurrentThreadId, 1,
+      RmmSpark.OomInjectionType.GPU.ordinal, 0)
+    intercept[GpuRetryOOM] {
+      splitSpillableInHalfByRows(toSplit)
+    }
+    verify(toSplit, times(1)).close()
+    assert(Rmm.getTotalBytesAllocated == baseline)
+  }
+
   test("splitSpillableInHalfByRows splits a rows-only batch by row count") {
     val toSplit = buildRowsOnlyBatch(4001)
     val halves = splitSpillableInHalfByRows(toSplit)

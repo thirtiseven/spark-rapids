@@ -433,7 +433,7 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
       try {
         while (lineReader.hasNext
           && totalRows != maxRowsPerChunk
-          && totalSize <= maxBytesPerChunk) {
+          && totalSize <= maxBytesPerChunk /* soft limit and returns at least one row */) {
           val (lineBytes, bytesLen) = toUTF8Bytes(lineReader.next())
           hmb.add(lineBytes, 0, bytesLen)
           totalRows = hmb.getNumLines

@@ -66,16 +66,3 @@ placed in one of the following methods:
 
 When overriding v2 operators in the plugin, we can override both `BatchScanExec` and the individual scans, such
 as `CsvScanExec`.
-
-## CSV memory usage
-
-For `multiLine=false`, `spark.rapids.sql.reader.batchSizeBytes` remains a soft limit
-on input bytes per batch. The reader may stop earlier when the estimated parse memory
-exceeds 75% of the GPU semaphore's default per-task memory share. The estimate accounts
-for input bytes, row count, and selected columns because temporary parsing allocations
-can substantially exceed the returned batch size.
-
-If parsing still runs out of GPU memory, the reader can split the buffered input at
-record boundaries and retry smaller chunks without decompressing the input again.
-The estimate is a heuristic, so a single record that cannot fit can still fail.
-This split retry does not apply to `multiLine=true` or subsequent type conversion.

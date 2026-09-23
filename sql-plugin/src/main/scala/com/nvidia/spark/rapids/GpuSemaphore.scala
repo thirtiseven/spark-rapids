@@ -288,7 +288,7 @@ object GpuSemaphore {
       .getOrElse(RapidsConf.DYNAMIC_CONCURRENT_GPU_TASKS.defaultValue)
   }
 
-  private[rapids] def computeDefaultMemory(conf: SQLConf): Long = {
+  private def computeDefaultMemory(conf: SQLConf): Long = {
     val totalMemory = GpuDeviceManager.getMemorySize
     val concurrentInt: Integer = RapidsConf.CONCURRENT_GPU_TASKS.get(conf).getOrElse {
       val batchBytes = RapidsConf.GPU_BATCH_SIZE_BYTES.get(conf)

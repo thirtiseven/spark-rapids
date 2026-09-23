@@ -147,6 +147,9 @@ class HostLineBufferer(size: Long,
     }
   }
 
+  // Borrowed until this bufferer is modified or closed.
+  private[rapids] def getBuffer: HostMemoryBuffer = buffer
+
   def getBufferAndRelease: HostMemoryBuffer = {
     val ret = buffer
     buffer = null
@@ -430,8 +433,7 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
       try {
         while (lineReader.hasNext
           && totalRows != maxRowsPerChunk
-          && totalSize <= maxBytesPerChunk
-          && fitsGpuMemoryBudget(totalSize, totalRows)) {
+          && totalSize <= maxBytesPerChunk) {
           val (lineBytes, bytesLen) = toUTF8Bytes(lineReader.next())
           hmb.add(lineBytes, 0, bytesLen)
           totalRows = hmb.getNumLines
@@ -448,8 +450,6 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
       (hmb, totalSize)
     }
   }
-
-  protected def fitsGpuMemoryBudget(bytes: Long, rows: Int): Boolean = true
 
   private def readBatch(): Option[ColumnarBatch] = {
     NvtxRegistry.FILE_FORMAT_READ_BATCH {

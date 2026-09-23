@@ -440,11 +440,21 @@ abstract class CSVPartitionReaderBase[BUFF <: LineBufferer, FACT <: LineBufferer
 
 
 object CSVPartitionReader {
-  private[rapids] def estimatedGpuBytes(bytes: Long, rows: Int, columns: Int): Long = {
-    // Input and output characters overlap with per-cell pairs, quote flags, offsets and masks.
-    val bytesPerCell = 24L
-    val bytesPerRowOffset = 8L
-    2 * bytes + rows.toLong * (bytesPerRowOffset + math.max(1, columns) * bytesPerCell)
+  private def headerStart(buffer: HostMemoryBuffer, size: Long, comment: Byte): Long = {
+    // cuDF ignores a UTF-8 BOM before checking for leading comments and the header.
+    var pos = if (size >= 3 && buffer.getByte(0) == 0xef.toByte &&
+        buffer.getByte(1) == 0xbb.toByte && buffer.getByte(2) == 0xbf.toByte) {
+      3L
+    } else {
+      0L
+    }
+    while (pos < size && comment != 0 && buffer.getByte(pos) == comment) {
+      while (pos < size && buffer.getByte(pos) != '\n'.toByte) {
+        pos += 1
+      }
+      pos = math.min(pos + 1, size)
+    }
+    pos
   }
 
   private[rapids] case class CsvReadChunk(
@@ -462,18 +472,10 @@ object CSVPartitionReader {
     }
 
     def split(): Seq[CsvReadChunk] = withResource(this) { _ =>
-      var headerEnd = 0L
-      if (hasHeader) {
-        // cuDF ignores a UTF-8 BOM before checking for leading comments and the header.
-        if (buffer.getLength >= 3 && buffer.getByte(0) == 0xef.toByte &&
-            buffer.getByte(1) == 0xbb.toByte && buffer.getByte(2) == 0xbf.toByte) {
-          headerEnd = 3
-        }
-        while (headerEnd < buffer.getLength && comment != 0 &&
-            buffer.getByte(headerEnd) == comment) {
-          headerEnd = lineEnd(headerEnd)
-        }
-        headerEnd = lineEnd(headerEnd)
+      val headerEnd = if (hasHeader) {
+        lineEnd(CSVPartitionReader.headerStart(buffer, buffer.getLength, comment))
+      } else {
+        0L
       }
       val midpoint = math.max(buffer.getLength / 2, headerEnd)
       var splitAt = lineEnd(midpoint)
@@ -565,20 +567,7 @@ class CSVPartitionReader(
     if (parsedOptions.multiLine) HostLineBuffererFactory
     else FilterCsvEmptyHostLineBuffererFactory) {
 
-  protected lazy val gpuMemoryBudget: Long = {
-    if (GpuDeviceManager.getMemorySize > 0) {
-      val taskMemory = GpuSemaphore.computeDefaultMemory(SQLConf.get)
-      // Leave room for resident state and allocations outside the CSV parse estimate.
-      taskMemory - taskMemory / 4
-    } else {
-      maxBytesPerChunk
-    }
-  }
-
-  override protected def fitsGpuMemoryBudget(bytes: Long, rows: Int): Boolean = {
-    parsedOptions.multiLine ||
-      CSVPartitionReader.estimatedGpuBytes(bytes, rows, readDataSchema.length) <= gpuMemoryBudget
-  }
+  private var headerPending = partFile.start == 0 && parsedOptions.headerFlag
 
   override protected def readToTables(
       dataBufferer: HostLineBufferer,
@@ -592,9 +581,15 @@ class CSVPartitionReader(
       super.readToTables(dataBufferer, cudfDataSchema, readDataSchema, cudfReadDataSchema,
         isFirstChunk, decodeTime)
     } else {
+      val hasHeader = headerPending
+      if (headerPending && CSVPartitionReader.headerStart(dataBufferer.getBuffer,
+          dataBufferer.getLength, parsedOptions.comment.toByte) < dataBufferer.getLength) {
+        // A header-only chunk consumes the header, but a comment-only chunk does not.
+        headerPending = false
+      }
       CSVPartitionReader.readToTables(dataBufferer, cudfDataSchema, decodeTime,
         hasHeader => buildCsvOptions(parsedOptions, readDataSchema, hasHeader).build(),
-        isFirstChunk && parsedOptions.headerFlag, parsedOptions.comment.toByte, partFile)
+        hasHeader, parsedOptions.comment.toByte, partFile)
     }
   }
 

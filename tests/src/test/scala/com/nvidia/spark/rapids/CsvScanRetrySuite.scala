@@ -131,8 +131,7 @@ class CsvScanRetrySuite extends RmmSparkRetrySuiteBase {
     assert(buffer.getRefCount == 0)
   }
 
-  private def withReader[T](text: String, readSchema: StructType, maxBytes: Long,
-      memoryBudget: Long = Long.MaxValue)
+  private def withReader[T](text: String, readSchema: StructType, maxBytes: Long)
       (fn: CSVPartitionReader => T): T = {
     val file = Files.createTempFile("csv-reader-retry", ".csv")
     Files.write(file, text.getBytes(StandardCharsets.UTF_8))
@@ -142,9 +141,7 @@ class CsvScanRetrySuite extends RmmSparkRetrySuiteBase {
           InternalRow.empty, file.toString, 0, Files.size(file)),
         stringSchema, readSchema,
         new SparkCSVOptions(Map("header" -> "true", "comment" -> "#"), false, "UTC"),
-        1024, maxBytes, Map[String, GpuMetric]().withDefaultValue(NoopMetric)) {
-        override protected lazy val gpuMemoryBudget: Long = memoryBudget
-      })(fn)
+        1024, maxBytes, Map[String, GpuMetric]().withDefaultValue(NoopMetric)))(fn)
     } finally {
       Files.deleteIfExists(file)
     }
@@ -158,6 +155,41 @@ class CsvScanRetrySuite extends RmmSparkRetrySuiteBase {
           withResource(reader.get()) { batch => rows += batch.numRows() }
         }
         assert(rows == 2)
+      }
+    }
+  }
+
+  for (readSchema <- Seq(stringSchema, StructType(Seq.empty));
+      bom <- Seq("", "\uFEFF")) {
+    test(s"CSV header after comment chunks: $readSchema, ${bom.length}") {
+      withReader(bom + "# leading comment\n" * 8 + "a,b\n1,2\n3,4\n",
+        readSchema, 1) { reader =>
+        var rows = 0
+        val actual = ArrayBuffer[String]()
+        while (reader.next()) {
+          withResource(reader.get()) { batch =>
+            rows += batch.numRows()
+            if (batch.numCols() > 0) {
+              withResource(GpuColumnVector.from(batch)) { table =>
+                withResource(table.getColumn(0).copyToHost()) { host =>
+                  (0 until batch.numRows()).foreach(i => actual += host.getJavaString(i))
+                }
+              }
+            }
+          }
+        }
+        assert(rows == 2)
+        if (readSchema.nonEmpty) {
+          assert(actual.toSeq == Seq("1", "3"))
+        }
+      }
+    }
+  }
+
+  for (text <- Seq("", "# comment\n" * 8, "# comment\na,b\n")) {
+    test(s"CSV handles input without data rows: ${text.length}") {
+      withReader(text, stringSchema, 1) { reader =>
+        assert(!reader.next())
       }
     }
   }
@@ -201,33 +233,11 @@ class CsvScanRetrySuite extends RmmSparkRetrySuiteBase {
     }
   }
 
-  test("CSV memory estimate accounts for projected cells before allocating GPU input") {
-    val wide = CSVPartitionReader.estimatedGpuBytes(1024, 100, 46)
-    val narrow = CSVPartitionReader.estimatedGpuBytes(1024, 100, 1)
-    assert(wide > narrow)
-    assert(CSVPartitionReader.estimatedGpuBytes(1024, 100, 0) == narrow)
-    assert(CSVPartitionReader.estimatedGpuBytes(Int.MaxValue, Int.MaxValue, 46) > Int.MaxValue)
-    withReader("a,b\n" + (0 until 32).map(i => s"$i,$i\n").mkString,
-      stringSchema, 1024 * 1024, memoryBudget = 256) { reader =>
-      var rows = 0
-      var batches = 0
-      while (reader.next()) {
-        withResource(reader.get()) { batch =>
-          assert(batch.numRows() <= 5)
-          rows += batch.numRows()
-        }
-        batches += 1
-      }
-      assert(rows == 32)
-      assert(batches > 1)
-    }
-  }
-
-  test("CSV preserves the input byte limit when the GPU budget is ample") {
+  test("CSV preserves input byte batching without OOM") {
     val text = "a,b\n" + (0 until 32).map(i => s"$i,$i\n").mkString
     withReader(text, stringSchema, 256) { reader =>
       assert(reader.next())
-      assert(reader.get().numRows() == 32)
+      withResource(reader.get()) { batch => assert(batch.numRows() == 32) }
       assert(!reader.next())
     }
     withReader(text, stringSchema, 16) { reader =>

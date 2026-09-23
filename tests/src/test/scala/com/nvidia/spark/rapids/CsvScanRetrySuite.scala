@@ -84,6 +84,53 @@ class CsvScanRetrySuite extends RmmSparkRetrySuiteBase {
     }
   }
 
+  for (header <- Seq(false, true); value <- Seq("\uFEFFx", "\uFEFF#x")) {
+    test(s"CSV split preserves an interior U+FEFF: header=$header, value=$value") {
+      val data = Seq("a" * 40 + ",0", s"$value,1")
+      val lines = if (header) Seq("\uFEFFa,b") ++ data else data
+      val expected = Seq(Seq("a" * 40, "0"), Seq(value, "1"))
+      withCsvTables(lines, header) { tables =>
+        assert(collectStrings(tables)._1 == expected)
+      }
+      withCsvTables(lines, header) { tables =>
+        RmmSpark.forceSplitAndRetryOOM(RmmSpark.getCurrentThreadId, 1,
+          RmmSpark.OomInjectionType.GPU.ordinal, 0)
+        val (actual, batches) = collectStrings(tables)
+        assert(actual == expected)
+        assert(batches == 2)
+      }
+    }
+  }
+
+  test("CSV recursively splits chunks beginning with an interior U+FEFF") {
+    val values = Seq("a" * 80, "\uFEFF#x", "\uFEFFy", "\uFEFF#z")
+    val bytes = values.map(_ + ",1\n").mkString.getBytes(StandardCharsets.UTF_8)
+    val buffer = HostMemoryBuffer.allocate(bytes.length)
+    buffer.setBytes(0, bytes, 0, bytes.length)
+    val parts = CSVPartitionReader.CsvReadChunk(buffer, false, '#'.toByte).split()
+    withResource(parts.head) { left =>
+      withResource(parts.last.split()) { children =>
+        val actual = (Seq(left) ++ children).flatMap { chunk =>
+          collectStrings(Iterator.single(Table.readCSV(GpuColumnVector.from(stringSchema),
+            CSVOptions.builder().hasHeader(false).withComment('#').build(),
+            chunk.buffer, 0, chunk.buffer.getLength)))._1
+        }
+        assert(actual == values.map(v => Seq(v, "1")))
+      }
+    }
+    assert(buffer.getRefCount == 0)
+  }
+
+  test("CSV cannot repeatedly split the protective newline from one record") {
+    val bytes = "\n\uFEFFx,1\n".getBytes(StandardCharsets.UTF_8)
+    val buffer = HostMemoryBuffer.allocate(bytes.length)
+    buffer.setBytes(0, bytes, 0, bytes.length)
+    intercept[GpuSplitAndRetryOOM] {
+      withResource(CSVPartitionReader.CsvReadChunk(buffer, false, '#'.toByte).split()) { _ => () }
+    }
+    assert(buffer.getRefCount == 0)
+  }
+
   test("CSV single record split failure is terminal") {
     withCsvTables(Seq("one,two")) { tables =>
       RmmSpark.forceSplitAndRetryOOM(RmmSpark.getCurrentThreadId, 1,

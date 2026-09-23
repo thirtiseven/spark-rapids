@@ -440,10 +440,14 @@ abstract class CSVPartitionReaderBase[BUFF <: LineBufferer, FACT <: LineBufferer
 
 
 object CSVPartitionReader {
+  private def startsWithBom(buffer: HostMemoryBuffer, offset: Long, size: Long): Boolean = {
+    size - offset >= 3 && buffer.getByte(offset) == 0xef.toByte &&
+      buffer.getByte(offset + 1) == 0xbb.toByte && buffer.getByte(offset + 2) == 0xbf.toByte
+  }
+
   private def headerStart(buffer: HostMemoryBuffer, size: Long, comment: Byte): Long = {
     // cuDF ignores a UTF-8 BOM before checking for leading comments and the header.
-    var pos = if (size >= 3 && buffer.getByte(0) == 0xef.toByte &&
-        buffer.getByte(1) == 0xbb.toByte && buffer.getByte(2) == 0xbf.toByte) {
+    var pos = if (startsWithBom(buffer, 0, size)) {
       3L
     } else {
       0L
@@ -486,11 +490,17 @@ object CSVPartitionReader {
         }
         splitAt = pos + 1
       }
-      if (splitAt <= 0 || splitAt >= buffer.getLength || splitAt < headerEnd) {
+      // Keep the preceding newline so cuDF cannot strip an interior U+FEFF as a file BOM.
+      val rightStart = if (startsWithBom(buffer, splitAt, buffer.getLength)) {
+        splitAt - 1
+      } else {
+        splitAt
+      }
+      if (rightStart <= 0 || splitAt >= buffer.getLength || splitAt < headerEnd) {
         throw new GpuSplitAndRetryOOM("CSV input cannot be split at a record boundary")
       }
       closeOnExcept(buffer.slice(0, splitAt)) { left =>
-        val right = buffer.slice(splitAt, buffer.getLength - splitAt)
+        val right = buffer.slice(rightStart, buffer.getLength - rightStart)
         Seq(CsvReadChunk(left, hasHeader, comment), CsvReadChunk(right, false, comment))
       }
     }

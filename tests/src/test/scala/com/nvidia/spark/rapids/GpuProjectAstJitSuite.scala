@@ -94,6 +94,22 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
 
   test("project AST JIT is disabled by default") {
     assert(!new RapidsConf(Map.empty[String, String]).isProjectAstJitEnabled)
+    assert(!new RapidsConf(Map.empty[String, String]).isProjectAstJitLtoEnabled)
+  }
+
+  test("project AST JIT captures the LTO preference during binding") {
+    val left = reference(0, IntegerType)
+    val right = reference(1, IntegerType)
+    val expression = alias(GpuAdd(left, right, failOnError = false)(), "sum")
+    for (tiered <- Seq(false, true); preferLto <- Seq(false, true)) {
+      val conf = projectConf(tiered = tiered)
+      conf.setConfString(RapidsConf.ENABLE_PROJECT_AST_JIT_LTO.key, preferLto.toString)
+      val bound = bindProject(Seq(expression), Seq(left, right), conf)
+      conf.setConfString(RapidsConf.ENABLE_PROJECT_AST_JIT_LTO.key, (!preferLto).toString)
+      val expressions = collectExpressions[GpuAstJitExpression](bound.exprTiers.flatten)
+      assert(expressions.nonEmpty)
+      assert(expressions.forall(_.preferLto == preferLto))
+    }
   }
 
   test("project AST JIT group safety guards use conservative defaults") {
@@ -482,11 +498,13 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
     val siblingCompiled = mock(classOf[CompiledExpression])
     val firstProgram = mock(classOf[AstJitProgram])
     val secondProgram = mock(classOf[AstJitProgram])
+    when(firstProgram.usesLto()).thenReturn(true)
+    when(secondProgram.usesLto()).thenReturn(false)
     val programs = Iterator(firstProgram, secondProgram)
     var compileCount = 0
     val boundReference = GpuBoundReference(0, IntegerType, nullable = true)(
       NamedExpression.newExprId, "c0")
-    val owner = new GpuAstJitExpression(boundReference) {
+    val owner = new GpuAstJitExpression(boundReference, preferLto = true) {
       override protected def compileAst(ast: AstExpression): CompiledExpression = ownerCompiled
 
       override protected def compileJitProgram(
@@ -497,11 +515,12 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
         programs.next()
       }
     }
-    val sibling = new GpuAstJitExpression(boundReference) {
+    val sibling = new GpuAstJitExpression(boundReference, preferLto = true) {
       override protected def compileAst(ast: AstExpression): CompiledExpression = siblingCompiled
     }
     val metrics = Seq(AST_JIT_PROGRAM_BUILD_ATTEMPTS, AST_JIT_PROGRAM_CACHE_HITS,
-      AST_JIT_PROGRAM_BUILD_TIME).map(_ -> new LocalGpuMetric).toMap
+      AST_JIT_PROGRAM_BUILD_TIME, AST_JIT_LTO_PROGRAMS, AST_JIT_LTO_FALLBACKS)
+      .map(_ -> new LocalGpuMetric).toMap
     owner.injectMetrics(metrics)
     val group = Seq(owner, sibling)
     val firstSchema = mockTable(nullable = false)
@@ -519,6 +538,8 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
       assertResult(2)(compileCount)
       assertResult(2L)(metrics(AST_JIT_PROGRAM_BUILD_ATTEMPTS).value)
       assertResult(2L)(metrics(AST_JIT_PROGRAM_CACHE_HITS).value)
+      assertResult(1L)(metrics(AST_JIT_LTO_PROGRAMS).value)
+      assertResult(1L)(metrics(AST_JIT_LTO_FALLBACKS).value)
       assert(metrics(AST_JIT_PROGRAM_BUILD_TIME).value > 0)
       verify(firstProgram, times(1)).close()
       verify(secondProgram, times(0)).close()

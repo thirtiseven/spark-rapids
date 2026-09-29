@@ -393,15 +393,18 @@ def test_multiplication(data_descr):
             f.col('a') * f.col('b')))
 
 @pytest.mark.parametrize('data_gen', [int_gen, long_gen], ids=idfn)
+@pytest.mark.parametrize("lto_enabled", ["false", "true"])
 @disable_ansi_mode
-def test_jit_add_multiply(data_gen):
+def test_jit_add_multiply(data_gen, lto_enabled):
     assert_cpu_and_gpu_are_equal_collect_with_capture(
         lambda spark: binary_op_df(spark, data_gen).select(
             f.col('a') + f.col('b'),
             f.col('a') * f.col('b')),
         exist_classes=r"GpuProject.*AST_JIT",
         non_exist_classes="GpuProjectAst",
-        conf=_project_ast_jit_enabled_conf)
+        conf=copy_and_update(_project_ast_jit_enabled_conf, {
+            "spark.rapids.sql.projectAstJitLtoEnabled": lto_enabled
+        }))
 
 @pytest.mark.parametrize('data_gen', [int_gen, long_gen], ids=idfn)
 @disable_ansi_mode
@@ -414,8 +417,9 @@ def test_jit_partial_project_with_unique_unsupported_expression(data_gen):
         conf=_project_ast_jit_enabled_conf)
 
 @pytest.mark.parametrize('data_gen', [int_gen, long_gen], ids=idfn)
+@pytest.mark.parametrize("lto_enabled", ["false", "true"])
 @disable_ansi_mode
-def test_jit_multi_output_shared_subtree(data_gen):
+def test_jit_multi_output_shared_subtree(data_gen, lto_enabled):
     def project_shared_expression(spark):
         df = binary_op_df(spark, data_gen)
         shared = f.col('a') + f.col('b')
@@ -427,7 +431,31 @@ def test_jit_multi_output_shared_subtree(data_gen):
         project_shared_expression,
         exist_classes=r"GpuProject.*AST_JIT.*AS left.*AST_JIT.*AS right",
         non_exist_classes="GpuProjectAst",
-        conf=_project_ast_jit_enabled_conf)
+        conf=copy_and_update(_project_ast_jit_enabled_conf, {
+            "spark.rapids.sql.projectAstJitLtoEnabled": lto_enabled
+        }))
+
+@pytest.mark.parametrize('data_gen', [int_gen, long_gen,
+    IntegerGen(nullable=False), LongGen(nullable=False)], ids=idfn)
+@pytest.mark.parametrize('output_count', [1, 2, 3, 4, 8, 16])
+@disable_ansi_mode
+def test_jit_lto_wrapper_signatures(data_gen, output_count):
+    def project(spark):
+        df = gen_df(spark, [("a", data_gen), ("b", data_gen), ("c", data_gen)])
+        shared = f.col("a") + f.col("b")
+        return df.select(*[
+            (shared * (f.col("c") + f.lit(i + 2).cast(data_gen.data_type))).alias(f"out_{i}")
+            for i in range(output_count)])
+
+    # Include width 3 to guard against reintroducing a power-of-two wrapper catalog.
+    assert_cpu_and_gpu_are_equal_collect_with_capture(
+        project,
+        exist_classes=r"GpuProject.*AST_JIT",
+        non_exist_classes="GpuProjectAst",
+        conf=copy_and_update(_project_ast_jit_enabled_conf, {
+            "spark.rapids.sql.projectAstJitLtoEnabled": "true"
+        }))
+
 
 @pytest.mark.parametrize('data_gen', [int_gen, long_gen], ids=idfn)
 @disable_ansi_mode

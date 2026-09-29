@@ -65,7 +65,7 @@ class GpuProjectExecMeta(
     val gpuExprs = childExprs.map(_.convertToGpu().asInstanceOf[NamedExpression]).toList
     val gpuChild = childPlans.head.convertIfNeeded()
     val jitExprs = if (conf.isProjectAstJitEnabled) {
-      GpuAstJitExpression.wrapProjectExpressions(gpuExprs)
+      GpuAstJitExpression.wrapProjectExpressions(gpuExprs, conf.isProjectAstJitLtoEnabled)
     } else {
       gpuExprs
     }
@@ -946,6 +946,8 @@ case class GpuProjectExec(
     AST_JIT_PROGRAM_BUILD_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT program build attempts"),
     AST_JIT_PROGRAM_CACHE_HITS -> createMetric(DEBUG_LEVEL, "AST JIT bound program cache hits"),
     AST_JIT_PROGRAM_BUILD_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT program build time"),
+    AST_JIT_LTO_PROGRAMS -> createMetric(DEBUG_LEVEL, "AST JIT LTO programs built"),
+    AST_JIT_LTO_FALLBACKS -> createMetric(DEBUG_LEVEL, "AST JIT LTO source fallbacks"),
     AST_JIT_EVAL_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT group evaluation attempts"),
     AST_JIT_EVAL_ROWS -> createMetric(DEBUG_LEVEL, "AST JIT group input rows including retries"),
     AST_JIT_EVAL_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT group evaluation time"),

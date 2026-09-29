@@ -21,7 +21,7 @@ import scala.collection.mutable
 import ai.rapids.cudf.{DType, Table}
 import ai.rapids.cudf.ast.{AstExpression, AstJitProgram, CompiledExpression}
 import com.nvidia.spark.Retryable
-import com.nvidia.spark.rapids.Arm.withResource
+import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 
@@ -109,20 +109,27 @@ object GpuAstJitExpression {
     case _ => None
   }
 
-  private def asAstJit(child: GpuExpression): Option[GpuAstJitExpression] = child match {
-    case jitExpression: GpuAstJitExpression => Some(jitExpression)
-    case other => astJitChild(other).map(GpuAstJitExpression(_))
+  private def asAstJit(
+      child: GpuExpression,
+      preferLto: Boolean): Option[GpuAstJitExpression] = child match {
+    case jitExpression: GpuAstJitExpression if jitExpression.preferLto == preferLto =>
+      Some(jitExpression)
+    case other => astJitChild(other).map(GpuAstJitExpression(_, preferLto = preferLto))
   }
 
-  private[rapids] def wrapTierExpression(expression: Expression): Expression = expression match {
+  private[rapids] def wrapTierExpression(
+      expression: Expression,
+      preferLto: Boolean = false): Expression = expression match {
     case alias @ GpuAlias(child: GpuExpression, _) =>
-      asAstJit(child).map(GpuProjectAstExpressionBase.replaceChild(alias, _)).getOrElse(alias)
+      asAstJit(child, preferLto)
+        .map(GpuProjectAstExpressionBase.replaceChild(alias, _)).getOrElse(alias)
     case other => other
   }
 
   private[rapids] def wrapProjectExpressions(
-      expressions: List[NamedExpression]): List[NamedExpression] = {
-    expressions.map(wrapTierExpression(_).asInstanceOf[NamedExpression])
+      expressions: List[NamedExpression],
+      preferLto: Boolean = false): List[NamedExpression] = {
+    expressions.map(wrapTierExpression(_, preferLto).asInstanceOf[NamedExpression])
   }
 
   private def operationSet(expression: GpuExpression): Set[GpuExpressionEquals] = {
@@ -233,7 +240,8 @@ object GpuAstJitExpression {
       (expression, rootsByIndex.get(index), groupIds.get(index)) match {
         case (alias: GpuAlias, Some(root), Some(groupId)) =>
           GpuProjectAstExpressionBase.replaceChild(
-            alias, GpuAstJitExpression(root.child, groupId))
+            alias, GpuAstJitExpression(root.child, groupId,
+              preferLto = RapidsConf.ENABLE_PROJECT_AST_JIT_LTO.get(conf)))
         case _ => expression
       }
     }
@@ -346,7 +354,10 @@ object GpuAstJitExpression {
   }
 }
 
-case class GpuAstJitExpression(child: GpuExpression, groupId: Int = 0)
+case class GpuAstJitExpression(
+    child: GpuExpression,
+    groupId: Int = 0,
+    preferLto: Boolean = false)
     extends GpuProjectAstExpressionBase with Retryable {
 
   @transient private[this] var jitProgram: AstJitProgram = _
@@ -356,6 +367,8 @@ case class GpuAstJitExpression(child: GpuExpression, groupId: Int = 0)
   private[this] var programBuildAttempts: GpuMetric = NoopMetric
   private[this] var programCacheHits: GpuMetric = NoopMetric
   private[this] var programBuildTime: GpuMetric = NoopMetric
+  private[this] var ltoPrograms: GpuMetric = NoopMetric
+  private[this] var ltoFallbacks: GpuMetric = NoopMetric
   private[this] var evalAttempts: GpuMetric = NoopMetric
   private[this] var evalRows: GpuMetric = NoopMetric
   private[this] var evalTime: GpuMetric = NoopMetric
@@ -365,6 +378,8 @@ case class GpuAstJitExpression(child: GpuExpression, groupId: Int = 0)
     programBuildAttempts = metrics.getOrElse(AST_JIT_PROGRAM_BUILD_ATTEMPTS, NoopMetric)
     programCacheHits = metrics.getOrElse(AST_JIT_PROGRAM_CACHE_HITS, NoopMetric)
     programBuildTime = metrics.getOrElse(AST_JIT_PROGRAM_BUILD_TIME, NoopMetric)
+    ltoPrograms = metrics.getOrElse(AST_JIT_LTO_PROGRAMS, NoopMetric)
+    ltoFallbacks = metrics.getOrElse(AST_JIT_LTO_FALLBACKS, NoopMetric)
     evalAttempts = metrics.getOrElse(AST_JIT_EVAL_ATTEMPTS, NoopMetric)
     evalRows = metrics.getOrElse(AST_JIT_EVAL_ROWS, NoopMetric)
     evalTime = metrics.getOrElse(AST_JIT_EVAL_TIME, NoopMetric)
@@ -388,13 +403,14 @@ case class GpuAstJitExpression(child: GpuExpression, groupId: Int = 0)
   protected def compileJitProgram(
       table: Table,
       expressions: Array[CompiledExpression]): AstJitProgram = {
-    AstJitProgram.compile(table, expressions: _*)
+    AstJitProgram.compile(table, preferLto, expressions: _*)
   }
 
   private[rapids] def getJitProgram(
       expressions: Seq[GpuAstJitExpression],
       table: Table): AstJitProgram = synchronized {
     require(expressions.head eq this, "The first AST JIT expression must own the group program")
+    require(expressions.forall(_.preferLto == preferLto), "AST JIT group backends must agree")
     val groupMatches = jitProgramGroup != null && jitProgramGroup.matches(expressions)
     val group = if (groupMatches) {
       jitProgramGroup
@@ -407,7 +423,18 @@ case class GpuAstJitExpression(child: GpuExpression, groupId: Int = 0)
       programBuildAttempts += 1
       // A program build may hit the native kernel cache without invoking NVRTC.
       val replacement = programBuildTime.ns {
-        withCompileMetrics { compileJitProgram(table, compiledExpressions) }
+        withCompileMetrics {
+          closeOnExcept(compileJitProgram(table, compiledExpressions)) { program =>
+            if (preferLto) {
+              if (program.usesLto()) {
+                ltoPrograms += 1
+              } else {
+                ltoFallbacks += 1
+              }
+            }
+            program
+          }
+        }
       }
       val previous = jitProgram
       jitProgram = replacement

@@ -91,6 +91,8 @@ object GpuMetric extends Logging {
   val AST_JIT_PROGRAM_BUILD_ATTEMPTS = "astJitProgramBuildAttempts"
   val AST_JIT_PROGRAM_CACHE_HITS = "astJitProgramCacheHits"
   val AST_JIT_PROGRAM_BUILD_TIME = "astJitProgramBuildTime"
+  val AST_JIT_LTO_PROGRAMS = "astJitLtoPrograms"
+  val AST_JIT_LTO_FALLBACKS = "astJitLtoFallbacks"
   val AST_JIT_EVAL_ATTEMPTS = "astJitEvalAttempts"
   val AST_JIT_EVAL_ROWS = "astJitEvalRows"
   val AST_JIT_EVAL_TIME = "astJitEvalTime"

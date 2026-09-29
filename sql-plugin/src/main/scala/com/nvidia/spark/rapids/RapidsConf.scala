@@ -1262,6 +1262,13 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .booleanConf
       .createWithDefault(true)
 
+  val ENABLE_PROJECT_AST_JIT_LTO = conf("spark.rapids.sql.projectAstJitLtoEnabled")
+      .doc("Prefer the experimental fixed-ABI LTO backend for Project AST JIT. " +
+        "Unsupported expressions use source JIT; compilation and linking errors propagate.")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
   val PROJECT_AST_JIT_MAX_GROUP_OPS =
     conf("spark.rapids.sql.projectAstJit.maxGroupOps")
       .doc("Maximum number of unique AST JIT operations in one multi-output group. " +
@@ -3673,6 +3680,7 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val isProjectAstEnabled: Boolean = get(ENABLE_PROJECT_AST)
 
   lazy val isProjectAstJitEnabled: Boolean = get(ENABLE_PROJECT_AST_JIT)
+  lazy val isProjectAstJitLtoEnabled: Boolean = get(ENABLE_PROJECT_AST_JIT_LTO)
 
   lazy val isTieredProjectEnabled: Boolean = get(ENABLE_TIERED_PROJECT)
 

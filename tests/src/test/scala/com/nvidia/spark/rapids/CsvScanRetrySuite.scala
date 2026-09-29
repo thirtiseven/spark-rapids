@@ -22,17 +22,19 @@ import java.nio.file.Files
 
 import scala.collection.mutable.ArrayBuffer
 
-import ai.rapids.cudf.{CSVOptions, HostMemoryBuffer, Table}
+import ai.rapids.cudf.{CSVOptions, HostMemoryBuffer, Schema, Table}
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.jni.{GpuSplitAndRetryOOM, RmmSpark}
 import com.nvidia.spark.rapids.shims.PartitionedFileUtilsShim
 import org.apache.hadoop.conf.Configuration
+import org.mockito.Mockito.{doThrow, times, verify}
+import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.csv.{CSVOptions => SparkCSVOptions}
 import org.apache.spark.sql.types._
 
-class CsvScanRetrySuite extends RmmSparkRetrySuiteBase {
+class CsvScanRetrySuite extends RmmSparkRetrySuiteBase with MockitoSugar {
   private val stringSchema = StructType(Seq(
     StructField("a", StringType), StructField("b", StringType)))
 
@@ -178,7 +180,8 @@ class CsvScanRetrySuite extends RmmSparkRetrySuiteBase {
     assert(buffer.getRefCount == 0)
   }
 
-  private def withReader[T](text: String, readSchema: StructType, maxBytes: Long)
+  private def withReader[T](text: String, readSchema: StructType, maxBytes: Long,
+      wrapTables: Iterator[Table] => Iterator[Table] = identity[Iterator[Table]] _)
       (fn: CSVPartitionReader => T): T = {
     val file = Files.createTempFile("csv-reader-retry", ".csv")
     Files.write(file, text.getBytes(StandardCharsets.UTF_8))
@@ -188,9 +191,64 @@ class CsvScanRetrySuite extends RmmSparkRetrySuiteBase {
           InternalRow.empty, file.toString, 0, Files.size(file)),
         stringSchema, readSchema,
         new SparkCSVOptions(Map("header" -> "true", "comment" -> "#"), false, "UTC"),
-        1024, maxBytes, Map[String, GpuMetric]().withDefaultValue(NoopMetric)))(fn)
+        1024, maxBytes, Map[String, GpuMetric]().withDefaultValue(NoopMetric)) {
+        override protected def readToTables(
+            dataBufferer: HostLineBufferer,
+            cudfDataSchema: Schema,
+            readDataSchema: StructType,
+            cudfReadDataSchema: Schema,
+            isFirstChunk: Boolean,
+            decodeTime: GpuMetric): Iterator[Table] = {
+          wrapTables(super.readToTables(dataBufferer, cudfDataSchema, readDataSchema,
+            cudfReadDataSchema, isFirstChunk, decodeTime))
+        }
+      })(fn)
     } finally {
       Files.deleteIfExists(file)
+    }
+  }
+
+  test("CSV pending table cleanup continues after a close failure and clears ownership") {
+    val first = mock[Table]
+    val second = mock[Table]
+    val error = new IllegalStateException("close failed")
+    doThrow(error).when(first).close()
+    withReader("a,b\n1,2\n", stringSchema, 1024,
+      tables => tables ++ Iterator(first, second)) { reader =>
+      assert(reader.next())
+      assert(intercept[IllegalStateException](reader.close()) eq error)
+      reader.close()
+      verify(first, times(1)).close()
+      verify(second, times(1)).close()
+    }
+  }
+
+  test("CSV closes a pending retry iterator without consuming it after a close failure") {
+    val error = new IllegalStateException("close failed")
+    var closes = 0
+    withReader("a,b\n1,2\n", stringSchema, 1024, tables => {
+      new Iterator[Table] with AutoCloseable {
+        private var consumed = false
+        override def hasNext: Boolean = {
+          assert(!consumed, "Cleanup must not inspect pending retry input")
+          tables.hasNext
+        }
+        override def next(): Table = {
+          assert(!consumed, "Cleanup must not parse pending retry input")
+          consumed = true
+          tables.next()
+        }
+        override def close(): Unit = {
+          closes += 1
+          withResource(tables.asInstanceOf[AutoCloseable]) { _ => () }
+          throw error
+        }
+      }
+    }) { reader =>
+      assert(reader.next())
+      assert(intercept[IllegalStateException](reader.close()) eq error)
+      reader.close()
+      assert(closes == 1)
     }
   }
 

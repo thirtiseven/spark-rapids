@@ -549,11 +549,12 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
   }
 
   private def closePendingTables(): Unit = {
-    pendingTables match {
-      case closeable: AutoCloseable => closeable.close()
-      case _ => pendingTables.foreach(_.close())
-    }
+    val toClose = pendingTables
     pendingTables = Iterator.empty
+    toClose match {
+      case closeable: AutoCloseable => withResource(closeable) { _ => () }
+      case _ => withResource(toClose.toVector) { _ => () }
+    }
   }
 
   private def ensurePendingTables(isFirstChunk: Boolean): Unit = {
@@ -740,11 +741,14 @@ abstract class GpuTextBasedPartitionReader[BUFF <: LineBufferer, FACT <: LineBuf
   }
 
   override def close(): Unit = {
-    closePendingTables()
-    lineReader.close()
-    batch.foreach(_.close())
+    val toClose = batch
     batch = None
     isExhausted = true
+    withResource(lineReader) { _ =>
+      withResource(toClose) { _ =>
+        closePendingTables()
+      }
+    }
   }
 }
 

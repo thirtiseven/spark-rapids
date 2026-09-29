@@ -312,10 +312,12 @@ satisfy the query, the ORC read falls back to the CPU as it is a metadata-only q
 ## Parquet
 
 The Parquet format has more configs because there are multiple versions with some compatibility
-issues between them. Dates and timestamps are where the known issues exist.  For reads when
-`spark.sql.legacy.parquet.datetimeRebaseModeInWrite` is set to `CORRECTED`
-[timestamps](https://github.com/NVIDIA/cudf-spark/issues/132) before the transition between the
-Julian and Gregorian calendars are wrong, but dates are fine. When
+issues between them. Dates and timestamps are where the known issues exist. For files written
+by the CPU on supported Spark versions with both
+`spark.sql.parquet.datetimeRebaseModeInWrite` and `spark.sql.parquet.int96RebaseModeInWrite`
+set to `CORRECTED`, GPU reads support timestamps before the transition between the Julian
+and Gregorian calendars. This does not change LEGACY rebasing or INT96 timestamp-conversion
+limitations. When
 `spark.sql.legacy.parquet.datetimeRebaseModeInWrite` is set to `LEGACY`, the read may fail for
 values occurring before the transition between the Julian and Gregorian calendars, i.e.: date <= 1582-10-04.
 
@@ -507,9 +509,19 @@ The following regular expression patterns are not yet supported on the GPU and w
 - Line and string anchors are not supported by `string_split` and `str_to_map`
 - Lazy quantifiers within a choice block such as `(2|\u2029??)+` 
 - Possessive quantifiers, such as `a*+`
+- Repetition counts greater than 999, such as `a{1000}`
 - Character classes that use union, intersection, or subtraction semantics, such as `[a-d[m-p]]`, `[a-z&&[def]]`,
   or `[a-z&&[^bc]]`
+- Lookahead/lookbehind groups: `(?=a)`, `(?!a)`, `(?<=a)`, `(?<!a)`
+- Independent groups: `(?>a)`
+- Named capture groups: `(?<n>a)`
 - Empty groups: `()`
+- Inline flags other than case-insensitive matching, such as `(?m)`, `(?s)`, or `(?x)`
+- Case-insensitive matching (`(?i)`) whose scope would extend across a choice, such as `(?i)a|b`
+  or `a(?i)b|c` (in Java the flag applies to the end of the enclosing group, crossing `|`), or that
+  applies to a letter-valued escape, such as `(?i)\x61`
+- Case-insensitive matching of `\p{Lower}` and `\p{Upper}` (and their `\P` counterparts) on Spark versions
+  below 4.0, to preserve pre-[JDK-8214245](https://bugs.openjdk.org/browse/JDK-8214245) behavior
 - Empty pattern: `""`
 
 Work is ongoing to increase the range of regular expressions that can run on the GPU.
@@ -891,6 +903,14 @@ The GPU implementation of `approximate_percentile` uses
 distribution. The results are not bit-for-bit identical with the Apache Spark implementation of
 `approximate_percentile`. This feature is enabled by default and can be disabled by setting
 `spark.rapids.sql.expression.ApproximatePercentile=false`.
+
+## Exact Percentile
+
+On Spark 5.0 and later, exact `percentile` aggregation over `FLOAT` or `DOUBLE` input falls back
+to CPU. Spark 5.0 changed its interpolation formula, and the GPU implementation does not yet match
+the resulting `NaN` and infinity semantics. Exact `percentile` over integral input remains GPU
+accelerated. Native GPU support for the Spark 5.0 interpolation behavior is tracked by
+[issue-15516](https://github.com/NVIDIA/cudf-spark/issues/15516).
 
 ## Conditionals and operations with side effects (ANSI mode)
 

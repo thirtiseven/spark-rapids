@@ -25,6 +25,7 @@ import com.nvidia.spark.rapids.iceberg.ShimUtils;
 import com.nvidia.spark.rapids.jni.fileio.RapidsInputFile;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.metrics.Counter;
 import org.apache.spark.TaskContext;
 import org.apache.spark.sql.rapids.GpuTaskMetrics$;
 import org.slf4j.Logger;
@@ -37,6 +38,8 @@ import java.util.List;
  * S3-backed {@link RapidsInputFile} that delegates byte-range reads to
  * {@link IcebergS3RangeCopier}. The supplied {@link FileIO} is only used for
  * its property map and any per-prefix storage-credential overlays.
+ *
+ * <p>The package-private S3 file access is isolated in {@link IcebergS3InputFileAccess}.
  */
 public final class IcebergS3InputFile extends IcebergInputFile {
   private static final Logger LOG = LoggerFactory.getLogger(IcebergS3InputFile.class);
@@ -44,16 +47,19 @@ public final class IcebergS3InputFile extends IcebergInputFile {
   private final String s3Bucket;
   private final String s3Key;
   private final IcebergS3Client icebergS3Client;
+  private final Counter readBytes;
 
   private IcebergS3InputFile(
       InputFile delegate,
       String s3Bucket,
       String s3Key,
-      IcebergS3Client icebergS3Client) {
+      IcebergS3Client icebergS3Client,
+      Counter readBytes) {
     super(delegate);
     this.s3Bucket = s3Bucket;
     this.s3Key = s3Key;
     this.icebergS3Client = icebergS3Client;
+    this.readBytes = readBytes;
   }
 
   public static IcebergInputFile maybeCreate(InputFile inputFile, FileIO fileIO) {
@@ -63,12 +69,12 @@ public final class IcebergS3InputFile extends IcebergInputFile {
     if (!RapidsInputFiles.isS3PerfEnabled()) {
       return delegate;
     }
-    if (!(inputFile instanceof BaseS3File)) {
+    String[] s3BucketAndKey = IcebergS3InputFileAccess.s3BucketAndKey(inputFile);
+    if (s3BucketAndKey == null) {
       return delegate;
     }
-    S3URI s3Uri = ((BaseS3File) inputFile).uri();
-    String s3Bucket = s3Uri.bucket();
-    String s3Key = s3Uri.key();
+    String s3Bucket = s3BucketAndKey[0];
+    String s3Key = s3BucketAndKey[1];
     // Iceberg < 1.7 does not have SupportsStorageCredentials; ShimUtils returns
     // the per-prefix credential overlays (or an empty map on 1.6).
     IcebergS3Client icebergS3Client = IcebergS3RangeCopier.resolveClient(
@@ -83,14 +89,17 @@ public final class IcebergS3InputFile extends IcebergInputFile {
       return delegate;
     }
     LOG.debug("IcebergS3RangeCopier path active for {}", inputFile.location());
-    return new IcebergS3InputFile(inputFile, s3Bucket, s3Key, icebergS3Client);
+    Counter readBytes = IcebergS3InputFileAccess.readBytesCounter(inputFile);
+    return new IcebergS3InputFile(
+        inputFile, s3Bucket, s3Key, icebergS3Client, readBytes);
   }
 
   @Override
   public void readVectored(HostMemoryBuffer output, List<CopyRange> copyRanges)
       throws IOException {
-    IcebergS3RangeCopier.copyToHMB(
+    long bytesRead = IcebergS3RangeCopier.copyToHMB(
         icebergS3Client, output, s3Bucket, s3Key, copyRanges);
+    readBytes.increment(bytesRead);
   }
 
   /**
@@ -106,8 +115,9 @@ public final class IcebergS3InputFile extends IcebergInputFile {
     if (length < 0) {
       throw new IllegalArgumentException("length must be non-negative");
     }
-    IcebergS3RangeCopier.copyTailToHMB(
+    long bytesRead = IcebergS3RangeCopier.copyTailToHMB(
         icebergS3Client, output, s3Bucket, s3Key, length, /*dstOffset*/ 0L);
+    readBytes.increment(bytesRead);
     LOG.debug(
         "PerfIO S3 Iceberg readTail suffix-range GET completed: uri=s3://{}/{}, "
             + "range=bytes=-{}",

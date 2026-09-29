@@ -419,6 +419,8 @@ trait GpuDecimalMultiplyBase extends GpuExpression {
   def right: Expression
   def useLongMultiply: Boolean
 
+  override def hasSideEffects: Boolean = super.hasSideEffects || failOnError
+
   override def toString: String = s"($left * $right)"
 
   override def sql: String = s"(${left.sql} * ${right.sql})"
@@ -913,6 +915,9 @@ trait GpuDecimalDivideBase extends GpuExpression {
   def failOnError: Boolean
   def failOnDivideByZero: Boolean
   def integerDivide: Boolean
+
+  override def hasSideEffects: Boolean =
+    super.hasSideEffects || failOnError || failOnDivideByZero
 
   // For all decimal128 output we will use the long division version.
   protected lazy val useLongDivision: Boolean = decimalType.precision > Decimal.MAX_LONG_DIGITS

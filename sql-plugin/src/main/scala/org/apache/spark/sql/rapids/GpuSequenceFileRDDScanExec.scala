@@ -109,7 +109,7 @@ case class GpuSequenceFileRDDScanExec(
   override protected def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val scanTime = gpuLongMetric(SCAN_TIME)
-    GpuDataSourceRDD(sparkContext, filePartitions, readerFactory)
+    GpuDataSourceRDD(sparkContext, filePartitions, readerFactory, includeRefreshHint = false)
       .asInstanceOf[RDD[ColumnarBatch]]
       .mapPartitionsInternal { batches =>
         new Iterator[ColumnarBatch] {

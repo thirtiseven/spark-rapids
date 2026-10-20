@@ -161,7 +161,7 @@ issue as you can see e.g., comparing shim implementations across versions:
 2. [Shim service provider for 3.5.1](https://github.com/NVIDIA/cudf-spark/blob/main/sql-plugin/src/main/spark351/scala/com/nvidia/spark/rapids/shims/spark351/SparkShimServiceProvider.scala)
 
 The `ShimExpression` and related traits themselves live in a single shared file,
-[TreeNode.scala](../../sql-plugin/src/main/scala/com/nvidia/spark/rapids/shims/TreeNode.scala),
+[TreeNode.scala](../../sql-plugin-api/src/main/scala/com/nvidia/spark/rapids/shims/TreeNode.scala),
 which is built as regular unshimmed source.
 
 This resolves compile-time problems, however, now we face the problem at run time.
@@ -181,18 +181,32 @@ Using JarURLConnection URLs we create a Parallel World of the current version wi
 Spark 3.3.0's URLs:
 
 ```text
-jar:file:/home/spark/rapids-4-spark_2.12-26.10.0.jar!/
-jar:file:/home/spark/rapids-4-spark_2.12-26.10.0.jar!/spark-shared/
-jar:file:/home/spark/rapids-4-spark_2.12-26.10.0.jar!/spark330/
+jar:file:/home/spark/rapids-4-spark_2.12-26.12.0.jar!/
+jar:file:/home/spark/rapids-4-spark_2.12-26.12.0.jar!/spark-shared/
+jar:file:/home/spark/rapids-4-spark_2.12-26.12.0.jar!/spark330/
 ```
 
 Spark 3.5.1's URLs:
 
 ```text
-jar:file:/home/spark/rapids-4-spark_2.12-26.10.0.jar!/
-jar:file:/home/spark/rapids-4-spark_2.12-26.10.0.jar!/spark-shared/
-jar:file:/home/spark/rapids-4-spark_2.12-26.10.0.jar!/spark351/
+jar:file:/home/spark/rapids-4-spark_2.12-26.12.0.jar!/
+jar:file:/home/spark/rapids-4-spark_2.12-26.12.0.jar!/spark-shared/
+jar:file:/home/spark/rapids-4-spark_2.12-26.12.0.jar!/spark351/
 ```
+
+### Classloader Coupling for Package-Private Integrations
+
+The cuDF Plugin directly accesses package-private APIs in some dependency runtimes, including
+Apache Iceberg. The JVM treats classes as members of the same runtime package only when they have
+the same package name and defining classloader. Therefore, the cuDF Plugin distribution jar and the
+dependency runtime jar must be deployed so the relevant classes are defined by the same classloader.
+
+For Iceberg, deploy both jars through `spark.driver.extraClassPath` and
+`spark.executor.extraClassPath`, or deploy both through `spark.jars`/`--jars`/`--packages`. Mixed
+deployment, with one jar on an extra classpath and the other added as a Spark jar, is unsupported for
+package-private access paths and can fail with `IllegalAccessError`. Placing an access bridge in the
+conventional root of the cuDF Plugin jar allows it to share the application classloader when both
+jars use an extra classpath; root placement does not remove the classloader-coupling requirement.
 
 ### Late Inheritance in Public Classes
 

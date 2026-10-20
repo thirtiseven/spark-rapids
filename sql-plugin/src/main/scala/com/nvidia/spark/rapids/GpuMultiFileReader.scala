@@ -16,7 +16,7 @@
 
 package com.nvidia.spark.rapids
 
-import java.io.{File, IOException}
+import java.io.{File, FileNotFoundException, IOException}
 import java.net.{URI, URISyntaxException}
 import java.util.concurrent.{CancellationException, CompletionService, ConcurrentLinkedQueue,
   ExecutionException, ExecutorCompletionService, Future, ThreadPoolExecutor, TimeUnit}
@@ -311,6 +311,14 @@ object MultiFileReaderUtils {
       files: Array[String],
       cloudSchemes: Set[String]): Boolean =
     !coalescingEnabled || (multiThreadEnabled && hasPathInCloud(files, cloudSchemes))
+
+  private[rapids] def attachFilePathToMissingFile[T](runner: AsyncRunner[T], file: Path): Unit = {
+    runner.addFailureTransformer {
+      case error: FileNotFoundException =>
+        GpuFileNotFoundException(file.toUri.toString, error)
+      case error => error
+    }
+  }
 }
 
 /**
@@ -433,35 +441,6 @@ abstract class FilePartitionReaderBase(conf: Configuration, execMetrics: Map[Str
     isDone = true
   }
 }
-
-case class CombineConf(
-    combineThresholdSize: Long, // The size to combine to when combining small files
-    combineWaitTime: Int) // The amount of time to wait for other files ready for combination.
-
-// TODO: Refactor thread pool components into a common utility, since it is not specific to
-//  multi-file reading.
-trait ThreadPoolConf {
-  /**
-   * The maximum number of threads used by the thread pool, not necessarily the final number
-   */
-  def maxThreadNumber: Int
-
-  /**
-   * Whether to create pools for each Spark stage, only for testing for now
-   */
-  def stageLevelPool: Boolean
-}
-
-case class DefaultThreadPoolConf(
-    maxThreadNumber: Int,
-    stageLevelPool: Boolean) extends ThreadPoolConf
-
-case class MemoryBoundedPoolConf(
-    maxThreadNumber: Int,
-    stageLevelPool: Boolean,
-    memoryCapacity: Long, // The maximum host memory being used in bytes, must be > 0
-    waitMemTimeoutMs: Long // The timeout for acquiring host memory in milliseconds
-) extends ThreadPoolConf
 
 class ThreadPoolConfBuilder(
     private val maxThreadNumber: Int,
@@ -610,6 +589,11 @@ abstract class MultiFileCloudPartitionReaderBase(
     // An AsyncRunner wrapper used to update related metrics
     val newTaskRunner = (file: PartitionedFile) => {
       val runner = getBatchRunner(tc, file, conf, filters)
+      runner.addFailureTransformer {
+        case error: FileNotFoundException =>
+          GpuFileNotFoundException(file.filePath.toString, error)
+        case error => error
+      }
       val metrics = GpuTaskMetrics.get
       val taskId = tc.taskAttemptId()
       runner.addPreHook(() => {
@@ -1028,56 +1012,6 @@ abstract class MultiFileCloudPartitionReaderBase(
   }
 }
 
-// A trait to describe a data block info
-trait DataBlockBase {
-  // get the row number of this data block
-  def getRowCount: Long
-  // the data read size
-  def getReadDataSize: Long
-  // the block size to be used to slice the whole HostMemoryBuffer
-  def getBlockSize: Long
-}
-
-/**
- * A common trait for different schema in the MultiFileCoalescingPartitionReaderBase.
- *
- * The sub-class should wrap the real schema for the specific file format
- */
-trait SchemaBase {
-  def isEmpty: Boolean
-}
-
-/**
- * A common trait for the extra information for different file format.
- */
-trait ExtraInfo extends AutoCloseable {
-  override def close(): Unit = {}
-}
-
-/**
- * A single block info of a file,
- * Eg, A parquet file has 3 RowGroup, then it will produce 3 SingleBlockInfoWithMeta
- */
-trait SingleDataBlockInfo {
-  def filePath: Path // file path info
-  def partitionValues: InternalRow // partition value
-  def dataBlock: DataBlockBase // a single block info of a single file
-  def schema: SchemaBase // schema information
-  def readSchema: StructType // read schema information
-  def extraInfo: ExtraInfo // extra information
-}
-
-/**
- * A context lives during the whole process of reading partitioned files
- * to a batch buffer (aka HostMemoryBuffer) to build a memory file.
- * Children can extend this to add more necessary fields.
- * @param origChunkedBlocks mapping of file path to data blocks
- * @param schema schema info
- */
-class BatchContext(
-  val origChunkedBlocks: mutable.LinkedHashMap[Path, ArrayBuffer[DataBlockBase]],
-  val schema: SchemaBase) {}
-
 /**
  * The abstracted multi-file coalescing reading class, which tries to coalesce small
  * ColumnarBatch into a bigger ColumnarBatch according to maxReadBatchSizeRows,
@@ -1106,6 +1040,7 @@ class BatchContext(
  * @param maxReadBatchSizeRows  soft limit on the maximum number of rows the reader reads per batch
  * @param maxReadBatchSizeBytes soft limit on the maximum number of bytes the reader reads per batch
  * @param maxGpuColumnSizeBytes maximum number of bytes for a GPU column
+ * @param skipReadEstimate      whether to ignore the schema based GPU memory estimate for a batch
  * @param poolConf              the thread pool configuration
  * @param execMetrics           metrics
  */
@@ -1116,6 +1051,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
     maxReadBatchSizeRows: Integer,
     maxReadBatchSizeBytes: Long,
     maxGpuColumnSizeBytes: Long,
+    skipReadEstimate: Boolean,
     poolConf: ThreadPoolConf,
     execMetrics: Map[String, GpuMetric]) extends FilePartitionReaderBase(conf, execMetrics)
     with MultiFileReaderFunctions {
@@ -1346,7 +1282,8 @@ abstract class MultiFileCoalescingPartitionReaderBase(
       return true
     }
     batchIter = EmptyGpuColumnarBatchIterator
-    if (!isDone) {
+    // Row-level deletes can empty a batch while later row groups still contain live rows.
+    while (!batchIter.hasNext && !isDone) {
       if (!blockIterator.hasNext) {
         isDone = true
       } else {
@@ -1510,8 +1447,9 @@ abstract class MultiFileCoalescingPartitionReaderBase(
             // use a single buffer and slice it up for different files if we need
             val outLocal = hmb.slice(offset, fileBlockSize)
             // Third, copy the blocks for each file in parallel using background threads
-            tasks.add(threadPool.submit(
-              getBatchRunner(tc, file, outLocal, blocks, offset, batchContext)))
+            val runner = getBatchRunner(tc, file, outLocal, blocks, offset, batchContext)
+            MultiFileReaderUtils.attachFilePathToMissingFile(runner, file)
+            tasks.add(threadPool.submit(runner))
             offset += fileBlockSize
           }
 
@@ -1617,7 +1555,11 @@ abstract class MultiFileCoalescingPartitionReaderBase(
         }
 
         if (numRows == 0 || numRows + peekedRowCount <= maxReadBatchSizeRows) {
-          val estimatedBytes = GpuBatchUtils.estimateGpuMemory(currentReadSchema, peekedRowCount)
+          val estimatedBytes = if (skipReadEstimate) {
+            0L
+          } else {
+            GpuBatchUtils.estimateGpuMemory(currentReadSchema, peekedRowCount)
+          }
           if (numBytes == 0 || numBytes + estimatedBytes <= maxReadBatchSizeBytes) {
             // only care to check if we are actually adding in the next chunk
             if (currentFile != blockIterator.head.filePath) {

@@ -17,8 +17,10 @@ from pyspark import BarrierTaskContext, TaskContext
 
 from conftest import is_at_least_precommit_run, is_databricks_runtime
 from spark_session import (is_before_spark_331, is_before_spark_350,
+                           is_databricks173_or_later,
                            is_spark_400_or_later,
-                           is_spark_411_or_later, is_spark_420_or_later)
+                           is_spark_411_or_later, is_spark_420_or_later,
+                           with_cpu_session)
 
 from pyspark.sql.pandas.utils import require_minimum_pyarrow_version, require_minimum_pandas_version
 
@@ -263,6 +265,50 @@ def test_window_aggregate_udf(data_gen, window):
             pandas_sum(f.col('b')).over(window)),
         # use unsafe mode to avoid overflow
         conf=arrow_udf_conf_unsafe)
+
+
+@ignore_order
+@pytest.mark.skipif(not is_databricks173_or_later(),
+                    reason="Databricks UDF logging requires DBR 17.3 or later")
+@pytest.mark.parametrize('logging_settings', [(0, 'WARNING'), (7, 'INFO')],
+                         ids=['default_logging', 'configured_logging'])
+@pytest.mark.parametrize('bounded', [False, True], ids=['unbounded', 'bounded'])
+@pytest.mark.parametrize('project_array', [False, True], ids=['scalar', 'array_projection'])
+def test_window_aggregate_udf_logging(logging_settings, bounded, project_array):
+    max_entries, log_level = logging_settings
+
+    def checked_sum(values):
+        from pyspark.sql.udf_logger import PySparkUDFLogger
+        # Verify the worker receives the settings, not just that the query returns results.
+        assert PySparkUDFLogger._max_entries == max_entries
+        assert PySparkUDFLogger._log_level == log_level
+        return int(values.sum())
+
+    if project_array:
+        @f.pandas_udf('array<long>')
+        def pandas_sum(values: pd.Series) -> list:
+            total = checked_sum(values)
+            return [total, total + 1]
+    else:
+        @f.pandas_udf('long')
+        def pandas_sum(values: pd.Series) -> int:
+            return checked_sum(values)
+
+    def query(spark):
+        df = spark.range(0, 32, 1, 2).withColumn('key', f.col('id') % 3)
+        window = Window.partitionBy('key')
+        if bounded:
+            window = window.orderBy('id').rowsBetween(-1, 1)
+        result = df.select('id', pandas_sum(f.col('id')).over(window).alias('value'))
+        if project_array:
+            result = result.select('id', f.col('value')[1].alias('value'))
+        return result
+
+    conf = copy_and_update(arrow_udf_conf, {
+        'spark.sql.pyspark.udf.logging.maxEntries': str(max_entries),
+        'spark.sql.pyspark.udf.logging.logLevel': log_level,
+    })
+    assert_gpu_and_cpu_are_equal_collect(query, conf=conf)
 
 
 @ignore_order
@@ -553,6 +599,22 @@ def test_pandas_udf_rows_only():
         conf=arrow_udf_conf)
 
 
+def test_pandas_iter_udf_rows_only_spanning_batches():
+    # One output Series for all inputs makes the GPU join it back to several rows-only batches.
+    def concat_all(it: Iterator[pd.Series]) -> Iterator[pd.Series]:
+        parts = [s + 1 for s in it]
+        if parts:
+            yield pd.concat(parts, ignore_index=True)
+    my_udf = f.pandas_udf(concat_all, returnType=LongType())
+    # 8000 bytes makes GpuRangeExec emit 1000-row batches, above the 500-row Arrow batch target.
+    conf = copy_and_update(arrow_udf_conf, {
+        'spark.rapids.sql.batchSizeBytes': '8000',
+        'spark.sql.execution.arrow.maxRecordsPerBatch': '500'})
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: spark.range(0, 4000, 1, 1).select(my_udf(f.lit(1).cast('long'))),
+        conf=conf)
+
+
 # Python UDFs support nondeterministic expressions from Spark 3.3.1.
 # See https://github.com/apache/spark/commit/1a01a492c051bb861c480f224a3c310e133e4d01
 @ignore_order(local=True)
@@ -587,3 +649,31 @@ def test_apply_in_pandas_iterator_basic():
         return df.groupby("id").applyInPandas(sum_udf, schema="v long")
 
     assert_gpu_and_cpu_are_equal_collect(test_func, conf=arrow_udf_conf_unsafe)
+
+
+# SPARK-56350 lets Spark 4.2 CPU ArrowEvalPythonExec consume columnar batches.
+# If the plugin leaves that CPU exec above a GPU scan, a host transition is
+# required so GpuColumnVector is not handed to Spark's CPU Arrow UDF path.
+@allow_non_gpu('ArrowEvalPythonExec', 'PythonUDF')
+def test_pandas_udf_cpu_arrow_eval_after_gpu_scan(spark_tmp_path):
+    data_path = spark_tmp_path + '/PARQUET_DATA'
+
+    def add_one(a):
+        return a + 1
+
+    my_udf = f.pandas_udf(add_one, returnType=IntegerType())
+    # Spark 4.x converts pandas UDF output with Arrow's safe checker by default.
+    # int_gen includes Integer.MAX_VALUE, and pandas a+1 becomes float64 2^31
+    # which cannot be cast back to int32. Keep values that stay in int32 after +1.
+    plus_one_int_gen = IntegerGen(min_val=-1000, max_val=1000, special_cases=[0, 1, -1])
+    with_cpu_session(
+        lambda spark: unary_op_df(spark, plus_one_int_gen, length=200).write.parquet(data_path))
+
+    conf = copy_and_update(arrow_udf_conf, {
+        'spark.rapids.sql.exec.ArrowEvalPythonExec': 'false',
+    })
+    assert_gpu_fallback_collect(
+        lambda spark: spark.read.parquet(data_path).select(
+            f.col('a'), my_udf(f.col('a')).alias('u')),
+        'ArrowEvalPythonExec',
+        conf=conf)

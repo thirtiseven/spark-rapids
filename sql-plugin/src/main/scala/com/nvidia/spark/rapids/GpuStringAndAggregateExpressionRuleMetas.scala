@@ -288,6 +288,10 @@ case class LikeRuleMeta(
     r: DataFromReplacementRule)
   extends BinaryExprMeta[Like](a, conf, p, r) {
   override def tagExprForGpu(): Unit = {
+    if (a.escapeChar > 0x7f) {
+      willNotWorkOnGpu("non-ASCII LIKE escape characters are not supported")
+      return
+    }
     a.right match {
       case Literal(v: UTF8String, _) =>
         val pattern = v.toString
@@ -603,7 +607,7 @@ case class PercentileRuleMeta(
         s"Invalid aggregation context: ${exprMeta.context}")
     }
     GpuPercentile(childExprs.head, childExprs(1).asInstanceOf[GpuLiteral], childExprs(2),
-      isReduction)
+      isReduction, c.reverse)
   }
   // Declare the data type of the internal buffer so it can be serialized and
   // deserialized correctly during shuffling.

@@ -55,6 +55,17 @@ class GpuProjectExecMeta(
     p: Option[RapidsMeta[_, _, _]],
     r: DataFromReplacementRule) extends SparkPlanMeta[ProjectExec](proj, conf, p, r)
     with Logging {
+  override protected lazy val outputTypeMetas: Option[Seq[DataTypeMeta]] =
+    Some(childExprs.map(_.typeMeta))
+
+  override def outputAttributes: Seq[Attribute] = {
+    if (canThisBeReplaced) {
+      super.outputAttributes
+    } else {
+      wrapped.output
+    }
+  }
+
   private def isTopLevelNullLiteral(expr: Expression): Boolean =
     GpuExpressionsUtils.extractGpuLit(expr).exists(_.value == null)
 
@@ -413,7 +424,6 @@ trait GpuProjectExecLike extends GpuPartitioningPreservingUnaryExecNode with Gpu
   override def doExecute(): RDD[InternalRow] =
     throw new IllegalStateException(s"Row-based execution should not occur for $this")
 
-  // The same as what feeds us
   override def outputBatching: CoalesceGoal = GpuExec.outputBatching(child)
 }
 
@@ -882,8 +892,6 @@ case class GpuProjectExec(
   override def output: Seq[Attribute] = projectList.map(_.toAttribute)
 
   override def outputBatching: CoalesceGoal = if (enablePreSplit) {
-    // Pre-split will make sure the size of each output batch will not be larger
-    // than the splitUntilSize.
     TargetSize(PreProjectSplitIterator.getSplitUntilSize)
   } else {
     super.outputBatching
@@ -1217,8 +1225,10 @@ object GpuFilter {
       numOutputRows: GpuMetric,
       numOutputBatches: GpuMetric,
       opTime: GpuMetric): Iterator[ColumnarBatch] = {
-    boundCondition.retryables.foreach(_.checkpoint())
     val ret = withRetry(input, splitSpillableInHalfByRows) { sb =>
+      // Checkpoint before each attempt, as the project's split-retry path does: a split that
+      // succeeded is committed, so a later split's retry must restore only its own attempt.
+      boundCondition.retryables.foreach(_.checkpoint())
       withResource(sb.getColumnarBatch()) { cb =>
         withRestoreOnRetry(boundCondition.retryables) {
           NvtxIdWithMetrics(NvtxRegistry.FILTER_BATCH, opTime) {

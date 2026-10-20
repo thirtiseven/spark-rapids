@@ -99,7 +99,8 @@ class RegularExpressionTranspilerSuite extends AnyFunSuite {
 
   test("choice with repetition - regexp_find") {
     val patterns = Seq("b?|a", "b*|^\t", "b+|^\t", "a|b+", "a+|b+", "a{2,3}|b+", "a*|b+",
-      "b*?|^\t", "b+?|^\t", "a|b+?", "a+?|b+?", "a{2,3}|b+?", "a*?|b+?", "[cat]{3}|dog")
+      "b*?|^\t", "b+?|^\t", "a|b+?", "a+?|b+?", "a{2,3}|b+?", "a*?|b+?", "(2|a*?)",
+      "(2|a{1,2}?)", "[cat]{3}|dog")
     assertCpuGpuMatchesRegexpFind(patterns, Seq("aaa", "bb", "a\tb", "aaaabbbb", "a\tb\ta\tb"))
   }
 
@@ -145,12 +146,70 @@ class RegularExpressionTranspilerSuite extends AnyFunSuite {
     )
   }
 
-  test("cuDF does not support possessive quantifier") {
-    val patterns = Seq("a*+", "a|(a?|a*+)")
+  test("hex- and octal-escaped line terminators before end anchors in replace mode") {
+    val patterns = Seq("\\x0A$", "\\x{A}$", "\\012$", "\\x0D\\Z")
     patterns.foreach(pattern =>
+      assertUnsupported(pattern, RegexReplaceMode,
+        "End of line/string anchor is not supported in this context"))
+  }
+
+  test("cuDF does not support possessive quantifier") {
+    val patterns = Seq(
+      "a*+" -> "*+",
+      "a++" -> "++",
+      "a?+" -> "?+",
+      "a{2}+" -> "{2}+",
+      "a{2,}+" -> "{2,}+",
+      "a{2,3}+" -> "{2,3}+",
+      "a|(a?|a*+)" -> "*+")
+    patterns.foreach { case (pattern, quantifier) =>
       assertUnsupported(pattern, RegexFindMode,
-        "Possessive quantifier *+ not supported")
-    )
+        s"Possessive quantifier $quantifier not supported")
+    }
+  }
+
+  test("cuDF repetition count limit") {
+    Seq("a{1000}", "a{1000}?", "a{1000,}?", "a{1,1000}?").foreach { pattern =>
+      assertUnsupported(pattern, RegexFindMode,
+        "cuDF does not support repetition counts greater than 999")
+    }
+
+    val reluctantError = intercept[RegexUnsupportedException] {
+      transpile("a{1000}?", RegexFindMode)
+    }
+    assert(reluctantError.getMessage.endsWith("near index 1"),
+      s"oversized reluctant quantifier reported the wrong position: $reluctantError")
+
+    assertCpuGpuMatchesRegexpFind(
+      Seq("a{999}?"),
+      Seq("", "a" * 998, "a" * 999, "a" * 1000))
+  }
+
+  test("stacked quantifiers are unsupported") {
+    Seq("a*{2,}", "a{2}{3}", "a{2}?{3}").foreach { pattern =>
+      assertUnsupported(pattern, RegexFindMode,
+        "Preceding token cannot be quantified")
+    }
+  }
+
+  test("issue-14738: bounded reluctant quantifiers") {
+    val issuePattern = "((aa|bb){0,3}?).*cc"
+    val transpiledExtract = transpile(issuePattern, groupIndex = 1)
+    assert(transpiledExtract.contains("{0,3}?"))
+
+    assertCpuGpuMatchesRegexpFind(
+      Seq("a{2}?", "a{2,}?", "a{2,3}?"),
+      Seq("", "a", "aa", "aaa", "baaa"))
+    assertCpuGpuMatchesRegexpReplace(
+      Seq("A{1,3}?"),
+      Seq("", "A", "AA", "AAAA", "BAAAB"))
+    doStringSplitTest(
+      Set("o{1,2}?"),
+      Seq("", "o", "oo", "boo:and:foo", "fooo"),
+      limit = -1)
+
+    assertUnsupported("o{0,2}?", RegexSplitMode,
+      "regexp_split on GPU does not support empty match repetition consistently with Spark")
   }
 
   test("cuDF does not support \\z") {
@@ -958,6 +1017,11 @@ class RegularExpressionTranspilerSuite extends AnyFunSuite {
     test(raw"[^a\n]", raw"(?:[\r]|[^a\n])")
     test(raw"[^a\r]", raw"[^a\r]")
     test(raw"[^a\r\n]", raw"[^a\r\n]")
+    test(raw"[^\x0D]", raw"[^\r]")
+    test(raw"[^\x{D}]", raw"[^\r]")
+    test(raw"[^\015]", raw"[^\r]")
+    test(raw"\S", "[^ \u000b\\n\\t\\r\\f]")
+    test(raw"\V", "[^\u000B\u0085\u2028\u2029\\n\\f\\r]")
   }
 
   test("compare CPU and GPU: regexp replace negated character class") {
@@ -970,7 +1034,8 @@ class RegularExpressionTranspilerSuite extends AnyFunSuite {
       "[a]", "[a\r]", "[a\n]", "[a\r\n]",
       "[^b]", "[^b\r]", "[^b\n]", "[^b\r\n]",
       "[^z]", "[^\r]", "[^\n]", "[^\r]",
-      "[^\r\n]", "[^b\r]", "[^bc\r\n]", "[^\\r\\n]", "[^\r\r]", "[^\r\n\r]", "[^\n\n\r\r]")
+      "[^\r\n]", "[^b\r]", "[^bc\r\n]", "[^\\r\\n]", "[^\r\r]", "[^\r\n\r]", "[^\n\n\r\r]",
+      "[^\\x0D]", "[^\\x{D}]", "[^\\015]")
     assertCpuGpuMatchesRegexpReplace(patterns, inputs)
   }
 
@@ -1662,34 +1727,23 @@ class FuzzRegExp(suggestedChars: String, skipKnownIssues: Boolean = true,
   }
 
   private def repetition(depth: Int) = {
-    val generators = Seq(
-      () =>
-        // greedy quantifier
-        RegexRepetition(generate(depth + 1), quantifier),
-      () =>
-        // reluctant quantifier
-        RegexRepetition(RegexRepetition(generate(depth + 1), quantifier),
-          SimpleQuantifier('?')),
-      () =>
-        // possessive quantifier
-        RegexRepetition(RegexRepetition(generate(depth + 1), quantifier),
-          SimpleQuantifier('+'))
-    )
-    generators(rr.nextInt(generators.length))()
+    import RegexQuantifier._
+    val modes = Seq(Greedy, Reluctant, Possessive)
+    val mode = modes(rr.nextInt(modes.length))
+    RegexRepetition(generate(depth + 1), RegexQuantifier(quantifierBase, mode))
   }
 
-  private def quantifier: RegexQuantifier = {
-    val generators = Seq[() => RegexQuantifier](
-      () => SimpleQuantifier('+'),
-      () => SimpleQuantifier('*'),
-      () => SimpleQuantifier('?'),
-      () => QuantifierFixedLength(rr.nextInt(3)),
-      () => QuantifierVariableLength(rr.nextInt(3), None),
+  private def quantifierBase: RegexQuantifier.Base = {
+    import RegexQuantifier._
+    val generators = Seq(
+      () => OneOrMore,
+      () => ZeroOrMore,
+      () => ZeroOrOne,
+      () => Fixed(rr.nextInt(3)),
+      () => Variable(rr.nextInt(3), None),
       () => {
-        // this intentionally generates some invalid quantifiers where the maxLength
-        // is less than the minLength, such as "{2,1}" which should be handled as a
-        // literal string match on "{2,1}" rather than as a valid quantifier.
-        QuantifierVariableLength(rr.nextInt(3), Some(rr.nextInt(3)))
+        val minLength = rr.nextInt(3)
+        Variable(minLength, Some(minLength + rr.nextInt(3)))
       }
     )
     generators(rr.nextInt(generators.length))()

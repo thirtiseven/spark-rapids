@@ -19,6 +19,7 @@ package com.nvidia.spark.rapids.sequencefile
 import java.io.{DataOutputStream, EOFException, IOException, OutputStream}
 import java.net.URI
 import java.util
+import java.util.concurrent.Future
 
 import scala.collection.mutable
 
@@ -29,9 +30,9 @@ import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
-import com.nvidia.spark.rapids.io.async.{AsyncMetrics, AsyncResult, DecayReleaseResult,
+import com.nvidia.spark.rapids.io.async.{AsyncMetrics, AsyncResult, AsyncRunner, FastReleaseResult,
   MemoryBoundedAsyncRunner}
-import com.nvidia.spark.rapids.jni.RmmSpark
+import com.nvidia.spark.rapids.jni.{RmmSpark, TaskPriority}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FSDataInputStream, FSInputStream, Path}
 import org.apache.hadoop.io.{DataOutputBuffer, SequenceFile}
@@ -46,6 +47,53 @@ import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.BinaryType
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector => SparkVector}
 import org.apache.spark.util.SerializableConfiguration
+
+private[rapids] final class SequenceFileReadAhead[T] {
+  private var armed = false
+  private var ready = false
+  private var hasNextChunk = false
+  private var taken = false
+  private var submit: () => Option[T] = null
+  private var continuation: Option[T] = None
+
+  def armSuccessor(submitSuccessor: () => Option[T]): Unit = synchronized {
+    require(!armed, "SequenceFile successor was already prepared")
+    armed = true
+    if (!ready || hasNextChunk) {
+      submit = submitSuccessor
+      submitIfReady()
+    }
+  }
+
+  def markReady(hasMore: Boolean): Unit = synchronized {
+    require(!ready, "SequenceFile chunk was already published")
+    ready = true
+    hasNextChunk = hasMore
+    if (hasMore) {
+      submitIfReady()
+    } else {
+      submit = null
+    }
+  }
+
+  def takeContinuation(): Option[T] = synchronized {
+    require(ready, "SequenceFile chunk has not been published")
+    require(!taken, "SequenceFile continuation was already consumed")
+    taken = true
+    val result = continuation
+    continuation = None
+    result
+  }
+
+  private def submitIfReady(): Unit = {
+    if (ready && hasNextChunk && submit != null) {
+      // Completion and consumer promotion can race; only one may submit the successor.
+      val submitSuccessor = submit
+      submit = null
+      continuation = submitSuccessor()
+    }
+  }
+}
 
 private object SequenceFileReaderLimits {
   val MAX_BATCH_OUTPUT_BYTES: Long = 256L * 1024 * 1024
@@ -154,16 +202,19 @@ private object BinaryRecordReader {
 
 private final class BatchCapacityExceeded extends IOException
 
-private final class BinaryHostColumnBuilder(
+private[rapids] final class BinaryHostColumnBuilder(
     maxDataCapacity: Long,
     maxRowCapacity: Int,
     initialDataCapacity: Long,
-    initialRowCapacity: Int) extends AutoCloseable {
+    initialRowCapacity: Int,
+    reallocations: GpuMetric = NoopMetric,
+    copiedBytes: GpuMetric = NoopMetric) extends AutoCloseable {
   private var data: HostMemoryBuffer = null
   private var offsets: HostMemoryBuffer = null
   private var hostOutput: HostMemoryOutputStream = null
   private var dataOutput: DataOutputStream = null
   private var rows = 0
+  private var writeLimit = maxDataCapacity
 
   private val growableOutput = new OutputStream {
     override def write(value: Int): Unit = {
@@ -195,8 +246,18 @@ private final class BinaryHostColumnBuilder(
       throw t
   }
 
+  private def recordGrowth(bytes: Long): Unit = {
+    // Several reader threads share the scan's non-atomic SQL metrics.
+    if (reallocations ne NoopMetric) {
+      reallocations.synchronized { reallocations += 1 }
+    }
+    if (copiedBytes ne NoopMetric) {
+      copiedBytes.synchronized { copiedBytes += bytes }
+    }
+  }
+
   private def growData(requiredCapacity: Long): Unit = {
-    if (requiredCapacity > maxDataCapacity) {
+    if (requiredCapacity > writeLimit) {
       throw new BatchCapacityExceeded
     }
     if (requiredCapacity > data.getLength) {
@@ -205,6 +266,7 @@ private final class BinaryHostColumnBuilder(
       val oldPosition = hostOutput.getPos
       closeOnExcept(HostAlloc.alloc(newCapacity, preferPinned = true)) { newData =>
         newData.copyFromHostBuffer(0, data, 0, oldPosition)
+        recordGrowth(oldPosition)
         val newHostOutput = new HostMemoryOutputStream(newData)
         newHostOutput.seek(oldPosition)
         hostOutput.safeClose(null)
@@ -223,20 +285,41 @@ private final class BinaryHostColumnBuilder(
       closeOnExcept(HostAlloc.alloc(
           (newRowCapacity + 1L) * DType.INT32.getSizeInBytes, preferPinned = true)) {
         newOffsets =>
-          newOffsets.copyFromHostBuffer(0, offsets, 0,
-            (rows.toLong + 1L) * DType.INT32.getSizeInBytes)
+          val bytes = (rows.toLong + 1L) * DType.INT32.getSizeInBytes
+          newOffsets.copyFromHostBuffer(0, offsets, 0, bytes)
+          recordGrowth(bytes)
           offsets.safeClose(null)
           offsets = newOffsets
       }
     }
   }
 
-  def append(write: DataOutputStream => Unit): Long = {
+  def mark(): Long = hostOutput.getPos
+
+  def nextInitialSize: (Long, Int) = {
+    // Round actual contents, not allocation slack or a rolled-back partial record.
+    // Small row-width changes should not force another full-buffer copy.
+    def rounded(size: Long, unit: Long, limit: Long): Long =
+      math.min(limit, math.max(1L, ((size + unit - 1L) / unit) * unit))
+
+    (rounded(hostOutput.getPos, SequenceFileReaderLimits.MIN_INITIAL_DATA_BYTES, maxDataCapacity),
+      rounded(rows, SequenceFileReaderLimits.MIN_INITIAL_ROWS, maxRowCapacity).toInt)
+  }
+
+  def rollback(rowCount: Int, position: Long): Unit = {
+    rows = rowCount
+    hostOutput.seek(position)
+  }
+
+  def append(write: DataOutputStream => Unit, maxBytes: Long = maxDataCapacity): Long = {
     require(rows < maxRowCapacity, "SequenceFile binary exceeds the row limit")
-    growOffsets(rows + 1)
+    require(maxBytes >= 0, "SequenceFile binary write budget must be nonnegative")
     val start = hostOutput.getPos
+    // A compressed value can write in several calls; reject overflow before growing either buffer.
+    writeLimit = start + math.min(maxBytes, maxDataCapacity - start)
     write(dataOutput)
     val written = hostOutput.getPos - start
+    growOffsets(rows + 1)
     rows += 1
     offsets.setInt(rows.toLong * DType.INT32.getSizeInBytes,
       Math.toIntExact(hostOutput.getPos))
@@ -326,18 +409,27 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
   private val keyIndex = if (keyFirst) 0 else 1
   private val valueIndex = 1 - keyIndex
   private val tracker = new ResultTracker
+  private val readStates = mutable.ArrayBuffer.empty[ReadState]
   private val outputBatchesMetric = execMetrics.getOrElse(NUM_OUTPUT_BATCHES, NoopMetric)
   private val copyMetric = execMetrics.getOrElse(COPY_BUFFER_TIME, NoopMetric)
+  private val reallocationsMetric =
+    execMetrics.getOrElse(GpuSequenceFileRDDReader.HOST_BUFFER_REALLOCATIONS, NoopMetric)
+  private val copiedBytesMetric =
+    execMetrics.getOrElse(GpuSequenceFileRDDReader.HOST_BUFFER_BYTES_COPIED, NoopMetric)
 
   private sealed trait SequenceFileBuffers extends HostMemoryBuffersWithMetaDataBase {
     def sourceBuffers: Array[SequenceFileHostBuffers]
   }
 
   private final class SequenceFileHostBuffers(
-      override val partitionedFile: PartitionedFile,
+      val state: ReadState,
+      val runner: ReadBatchRunner,
+      val atEnd: Boolean,
       override val memBuffersAndSizes: Array[SingleHMBAndMeta],
       override val bytesRead: Long) extends SequenceFileBuffers {
     require(memBuffersAndSizes.length == 1)
+
+    override val partitionedFile: PartitionedFile = state.file
 
     override lazy val sourceBuffers: Array[SequenceFileHostBuffers] = Array(this)
 
@@ -373,20 +465,13 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
     private val published = mutable.HashSet.empty[SequenceFileHostBuffers]
     private var closed = false
 
-    def publish(result: SequenceFileHostBuffers): SequenceFileHostBuffers = {
-      try {
-        val retain = synchronized {
-          if (closed) false else {
-            published += result
-            true
-          }
-        }
-        if (!retain) result.close()
-        result
-      } catch {
-        case t: Throwable =>
-          result.safeClose(t)
-          throw t
+    def publish(result: SequenceFileHostBuffers, release: () => Unit): Boolean = synchronized {
+      if (closed) {
+        false
+      } else {
+        result.addReleaseResourceCallback(release)
+        published += result
+        true
       }
     }
 
@@ -414,12 +499,34 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
     }
   }
 
-  private class ReadBatchRunner(
-      taskContext: TaskContext,
-      file: PartitionedFile,
-      config: Configuration) extends MemoryBoundedAsyncRunner[BufferInfo] {
+  private class ReadBatchRunner(state: ReadState)
+    extends MemoryBoundedAsyncRunner[BufferInfo] {
 
-    override def sparkTaskContext: Option[TaskContext] = Some(taskContext)
+    private val readAhead =
+      new SequenceFileReadAhead[(ReadBatchRunner, Future[RunnerResult])]
+
+    def prepareNextRunner(): Unit = {
+      val next = new ReadBatchRunner(state)
+      // Preparing on the consumer thread preserves its task context and metrics.
+      val prepared = prepareReadRunner(state.file, next)
+      readAhead.armSuccessor(() => state.submitIfOpen(prepared).map(next -> _))
+    }
+
+    def readContinuation(): Future[RunnerResult] = {
+      readAhead.takeContinuation() match {
+        case Some((next, future)) =>
+          // The consumed chunk has released its buffers, so another chunk may be prefetched.
+          if (state.canRead) next.prepareNextRunner()
+          future
+        case None =>
+          state.checkOpen()
+          throw new IllegalStateException("SequenceFile continuation was not submitted")
+      }
+    }
+
+    // The reader owns cancellation; retaining a task listener per chunk would grow with the split.
+    override def sparkTaskContext: Option[TaskContext] = None
+    override val priority: Long = state.priority
 
     override val requiredMemoryBytes: Long = requiredHostMemory
 
@@ -427,21 +534,35 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
         resultData: BufferInfo,
         metrics: AsyncMetrics): AsyncResult[BufferInfo] = {
       val releaseCallback = () => {
-        if (isHoldingResource) {
-          withStateLock { _ => releaseResourceCallback() }
+        withStateLock { _ =>
+          if (isHoldingResource) releaseResourceCallback()
         }
       }
-      new DecayReleaseResult(resultData, metrics, releaseCallback)
+      // Bind the reservation before publishing; task closure can leave the future unconsumed.
+      val buffers = resultData.asInstanceOf[SequenceFileHostBuffers]
+      if (tracker.publish(buffers, releaseCallback)) {
+        if (keepReadsInOrder) readAhead.markReady(!buffers.atEnd)
+        val resultMetrics = metrics
+        new AsyncResult[BufferInfo] {
+          override val data: BufferInfo = resultData
+          override val metrics: AsyncMetrics = resultMetrics
+        }
+      } else {
+        resultData.close()
+        new FastReleaseResult(resultData, metrics)
+      }
     }
 
     override protected def callImpl(): BufferInfo = {
+      state.checkOpen()
+      val taskContext = state.taskContext
       TrampolineUtil.setTaskContext(taskContext)
       RmmSpark.poolThreadWorkingOnTask(taskContext.taskAttemptId())
       val start = System.nanoTime()
       try {
-        val result = readFile(file, config)
+        val result = state.readNext(this)
         result.setExecutionTime(0L, System.nanoTime() - start)
-        tracker.publish(result)
+        result
       } finally {
         RmmSpark.poolThreadFinishedForTask(taskContext.taskAttemptId())
         TrampolineUtil.unsetTaskContext()
@@ -477,7 +598,9 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
     }
   }
 
-  private def newBuilders(file: PartitionedFile): Array[BinaryHostColumnBuilder] = {
+  private def newBuilders(
+      file: PartitionedFile,
+      previousSizes: Array[(Long, Int)]): Array[BinaryHostColumnBuilder] = {
     val builders = new Array[BinaryHostColumnBuilder](projectedColumns)
     try {
       val cappedFileLength = math.min(file.length, payloadCapacity)
@@ -490,8 +613,13 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
           file.length / SequenceFileReaderLimits.ESTIMATED_COMPRESSED_BYTES_PER_ROW)).toInt
       var index = 0
       while (index < builders.length) {
+        val (dataCapacity, rows) = if (previousSizes == null) {
+          (initialDataCapacity, initialRowCapacity)
+        } else {
+          previousSizes(index)
+        }
         builders(index) = new BinaryHostColumnBuilder(
-          payloadCapacity, rowCapacity, initialDataCapacity, initialRowCapacity)
+          payloadCapacity, rowCapacity, dataCapacity, rows, reallocationsMetric, copiedBytesMetric)
         index += 1
       }
       builders
@@ -502,58 +630,129 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
     }
   }
 
-  private def byteLimitExceeded(
-      file: PartitionedFile,
-      rowCount: Int): UnsupportedOperationException = {
-    val scope = if (rowCount == 0) "record" else "split"
+  private def byteLimitExceeded(file: PartitionedFile): UnsupportedOperationException = {
     new UnsupportedOperationException(
-      s"SequenceFile binary $scope exceeds the $payloadCapacity byte decompressed " +
+      s"SequenceFile binary record exceeds the $payloadCapacity byte decompressed " +
         s"single-batch limit: ${file.filePath}")
   }
 
-  private def readFile(
-      file: PartitionedFile,
-      config: Configuration): SequenceFileHostBuffers = {
-    val startingBytesRead = fileSystemBytesRead()
-    var builders: Array[BinaryHostColumnBuilder] = null
-    try {
-      builders = newBuilders(file)
-      val rows = withResource(BinaryRecordReader.open(new Configuration(config), file)) { reader =>
-        var rowCount = 0
-        var payloadBytes = 0L
-        while (reader.next()) {
-          if (rowCount == rowCapacity) {
-            throw new UnsupportedOperationException(
-              s"SequenceFile binary split exceeds the $rowCapacity row single-batch limit; " +
-                s"reduce the source RDD's input split size: ${file.filePath}")
-          }
-          val recordBytes = try {
-            val keyBytes = builders(keyIndex).append(reader.writeKey)
-            Math.addExact(keyBytes, builders(valueIndex).append(reader.writeValue))
-          } catch {
-            case _: BatchCapacityExceeded => throw byteLimitExceeded(file, rowCount)
-          }
-          if (recordBytes > payloadCapacity - payloadBytes) {
-            throw byteLimitExceeded(file, rowCount)
-          }
-          payloadBytes = Math.addExact(payloadBytes, recordBytes)
-          rowCount += 1
+  private final class ReadState(
+      val taskContext: TaskContext,
+      val file: PartitionedFile,
+      config: Configuration) extends AutoCloseable {
+    val priority: Long = TaskPriority.getTaskPriority(taskContext.taskAttemptId())
+    private var reader: BinaryRecordReader = null
+    private var pendingRecord = false
+    private var atEnd = false
+    private var running = false
+    private var previousSizes: Array[(Long, Int)] = null
+    @volatile private var closed = false
+
+    def canRead: Boolean = !closed && !taskContext.isInterrupted()
+
+    def checkOpen(): Unit = {
+      if (!canRead) {
+        throw new InterruptedException("SequenceFile reader was closed")
+      }
+    }
+
+    def submitIfOpen(runner: AsyncRunner[BufferInfo]): Option[Future[RunnerResult]] = synchronized {
+      if (canRead) Some(submitReadRunner(runner)) else None
+    }
+
+    def readNext(runner: ReadBatchRunner): SequenceFileHostBuffers = {
+      synchronized {
+        require(!running, "Concurrent reads of a SequenceFile split are not supported")
+        running = true
+      }
+      val startingBytesRead = fileSystemBytesRead()
+      var builders: Array[BinaryHostColumnBuilder] = null
+      var readFailure: Throwable = null
+      try {
+        checkOpen()
+        if (reader == null) {
+          reader = BinaryRecordReader.open(new Configuration(config), file)
         }
-        rowCount
+        // Reuse the writers so each record does not allocate two closures.
+        val writeKey = reader.writeKey _
+        val writeValue = reader.writeValue _
+        var rows = 0
+        var bytes = 0L
+        var keepReading = true
+        while (keepReading && rows < rowCapacity && !closed) {
+          if (!pendingRecord && !reader.next()) {
+            atEnd = true
+            keepReading = false
+          } else {
+            pendingRecord = true
+            if (builders == null) builders = newBuilders(file, previousSizes)
+            val keyMark = builders(keyIndex).mark()
+            val valueMark = builders(valueIndex).mark()
+            val written = try {
+              val remaining = payloadCapacity - bytes
+              val keyBytes = builders(keyIndex).append(writeKey, remaining)
+              val valueBytes = builders(valueIndex).append(writeValue, remaining - keyBytes)
+              Math.addExact(keyBytes, valueBytes)
+            } catch {
+              case _: BatchCapacityExceeded =>
+                // Both columns must roll back, including a partially written compressed value.
+                builders(keyIndex).rollback(rows, keyMark)
+                builders(valueIndex).rollback(rows, valueMark)
+                if (rows == 0) throw byteLimitExceeded(file)
+                keepReading = false
+                0L
+            }
+            if (keepReading) {
+              bytes = Math.addExact(bytes, written)
+              rows += 1
+              pendingRecord = false
+            }
+          }
+        }
+        checkOpen()
+        val bytesRead = Math.max(0L, fileSystemBytesRead() - startingBytesRead)
+        val info = if (builders == null) {
+          SingleHMBAndMeta.empty()
+        } else {
+          val nextSizes = if (atEnd) null else builders.map(_.nextInitialSize)
+          val result = finishBuilders(builders, rows)
+          previousSizes = nextSizes
+          result
+        }
+        closeOnExcept(info) { ownedInfo =>
+          if (builders != null) {
+            closeBuilders(builders, null)
+            builders = null
+          }
+          if (atEnd) closeReader()
+          new SequenceFileHostBuffers(this, runner, atEnd, Array(ownedInfo), bytesRead)
+        }
+      } catch {
+        case t: Throwable =>
+          closed = true
+          readFailure = t
+          throw t
+      } finally {
+        try {
+          if (builders != null) closeBuilders(builders, readFailure)
+        } finally {
+          synchronized {
+            running = false
+            if (closed || atEnd) closeReader(readFailure)
+          }
+        }
       }
-      val measuredBytesRead = Math.max(0L, fileSystemBytesRead() - startingBytesRead)
-      // A zero bytesRead makes the async executor release its budget before these buffers close.
-      val bytesRead = if (measuredBytesRead > 0) measuredBytesRead else math.max(1L, file.length)
-      val info = finishBuilders(builders, rows)
-      closeOnExcept(info) { ownedInfo =>
-        new SequenceFileHostBuffers(file, Array(ownedInfo), bytesRead)
-      }
-    } catch {
-      case t: Throwable =>
-        if (builders != null) closeBuilders(builders, t)
-        throw t
-    } finally {
-      if (builders != null) closeBuilders(builders, null)
+    }
+
+    private def closeReader(error: Throwable = null): Unit = {
+      val toClose = reader
+      reader = null
+      toClose.safeClose(error)
+    }
+
+    override def close(): Unit = synchronized {
+      closed = true
+      if (!running) closeReader()
     }
   }
 
@@ -635,7 +834,7 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
     }
     val batch = withRetryNoSplit(buffers) { current =>
       GpuSemaphore.acquireIfNecessary(TaskContext.get())
-      val infos = current.memBuffersAndSizes
+      val infos = current.memBuffersAndSizes.filter(_.numRows > 0)
       val rows = Math.toIntExact(infos.foldLeft(0L)((total, info) =>
         Math.addExact(total, info.numRows)))
       val columns = new Array[SparkVector](projectedColumns)
@@ -694,19 +893,52 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
       fileInfo: HostMemoryBuffersWithMetaDataBase): Int =
     fileInfo.asInstanceOf[SequenceFileBuffers].sourceBuffers.length
 
+  override protected def getNumCompletedFiles(fileInfo: BufferInfo): Int =
+    fileInfo.asInstanceOf[SequenceFileBuffers].sourceBuffers.count(_.atEnd)
+
+  override protected def getReadContinuations(
+      fileInfo: BufferInfo): Seq[Future[RunnerResult]] = {
+    fileInfo.asInstanceOf[SequenceFileBuffers].sourceBuffers.filterNot(_.atEnd).map { source =>
+      if (keepReadsInOrder) {
+        source.runner.readContinuation()
+      } else {
+        submitReadRunner(prepareReadRunner(
+          source.partitionedFile, new ReadBatchRunner(source.state)))
+      }
+    }.toSeq
+  }
+
+  override protected def canCombineAfter(fileInfo: BufferInfo): Boolean =
+    !keepReadsInOrder || fileInfo.asInstanceOf[SequenceFileBuffers].sourceBuffers.forall(_.atEnd)
+
   override def getBatchRunner(
       tc: TaskContext,
       file: PartitionedFile,
       config: Configuration,
       filters: Array[Filter]): MemoryBoundedAsyncRunner[BufferInfo] = {
-    new ReadBatchRunner(tc, file, config)
+    val state = new ReadState(tc, file, config)
+    readStates += state
+    val runner = new ReadBatchRunner(state)
+    if (keepReadsInOrder) runner.prepareNextRunner()
+    runner
   }
 
   override final def getFileFormatShortName: String = "SequenceFileBinary"
 
+  // Closed states reject pending reads. Let runners finish their pool accounting hooks;
+  // cancelling their futures can bypass those hooks after acquiring a reservation.
+  override protected def closeAsyncRead(task: Future[RunnerResult]): Option[BufferInfo] = None
+
   override def close(): Unit = {
-    tracker.close()
-    super.close()
+    try {
+      readStates.safeClose()
+    } finally {
+      try {
+        tracker.close()
+      } finally {
+        super.close()
+      }
+    }
   }
 }
 
@@ -754,6 +986,9 @@ private[rapids] case class GpuSequenceFilePartitionReaderFactory(
 }
 
 object GpuSequenceFileRDDReader {
+  val HOST_BUFFER_REALLOCATIONS = "hostBufferReallocations"
+  val HOST_BUFFER_BYTES_COPIED = "hostBufferBytesCopied"
+
   def createReaderFactory(
       sqlConf: SQLConf,
       broadcastedConf: Broadcast[SerializableConfiguration],

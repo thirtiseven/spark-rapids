@@ -570,17 +570,10 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
     }
   }
 
-  private def closeBuilders(
-      builders: Array[BinaryHostColumnBuilder],
-      error: Throwable): Unit = {
-    builders.filter(_ != null).safeClose(error)
-  }
-
   private def finishBuilders(
       builders: Array[BinaryHostColumnBuilder],
       rows: Int): SingleHMBAndMeta = {
-    val buffers = new Array[SpillableHostBuffer](builders.length * 2)
-    try {
+    closeOnExcept(new Array[SpillableHostBuffer](builders.length * 2)) { buffers =>
       var index = 0
       var bytes = 0L
       builders.foreach { builder =>
@@ -591,18 +584,13 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
         index += 2
       }
       SingleHMBAndMeta(buffers, bytes, rows, Seq.empty)
-    } catch {
-      case t: Throwable =>
-        buffers.safeClose(t)
-        throw t
     }
   }
 
   private def newBuilders(
       file: PartitionedFile,
       previousSizes: Array[(Long, Int)]): Array[BinaryHostColumnBuilder] = {
-    val builders = new Array[BinaryHostColumnBuilder](projectedColumns)
-    try {
+    closeOnExcept(new Array[BinaryHostColumnBuilder](projectedColumns)) { builders =>
       val cappedFileLength = math.min(file.length, payloadCapacity)
       val initialPayloadCapacity = math.min(payloadCapacity,
         math.max(SequenceFileReaderLimits.MIN_INITIAL_DATA_BYTES,
@@ -623,10 +611,6 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
         index += 1
       }
       builders
-    } catch {
-      case t: Throwable =>
-        closeBuilders(builders, t)
-        throw t
     }
   }
 
@@ -721,7 +705,7 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
         }
         closeOnExcept(info) { ownedInfo =>
           if (builders != null) {
-            closeBuilders(builders, null)
+            builders.safeClose()
             builders = null
           }
           if (atEnd) closeReader()
@@ -734,7 +718,7 @@ private[sequencefile] class GpuSequenceFilePartitionReader(
           throw t
       } finally {
         try {
-          if (builders != null) closeBuilders(builders, readFailure)
+          builders.safeClose(readFailure)
         } finally {
           synchronized {
             running = false

@@ -140,11 +140,12 @@ object SequenceFileRddReadProof {
 
   private def inspectRdd(
       rdd: RDD[_]): Either[String, (IndexedSeq[SourceColumn], NewHadoopRDD[Any, Any])] = {
-    val operations = ArrayBuffer[(String, AnyRef)]()
+    var columns: Option[IndexedSeq[SourceColumn]] = None
+    var depth = 0
     var current = rdd
     while (current != null && current.getClass == classOf[MapPartitionsRDD[_, _]]) {
       // Bound inspection work even when an application supplies an unusually long lineage.
-      if (operations.length >= 64) {
+      if (depth >= 64) {
         return Left("RDD lineage exceeds the proof limit")
       }
       val mapped = current.asInstanceOf[MapPartitionsRDD[_, _]]
@@ -154,8 +155,25 @@ object SequenceFileRddReadProof {
       }
       extractRddFunction(mapped) match {
         case Left(reason) => return Left(reason)
-        case Right(operation) => operations += operation
+        case Right(("map", function)) =>
+          if (columns.nonEmpty) {
+            return Left("additional RDD.map transformations are not supported")
+          }
+          loadLambdaMethod(function).flatMap(verifyLambda) match {
+            case Left(reason) => return Left(reason)
+            case Right(proven) => columns = Some(proven)
+          }
+        case Right(("filter", function)) =>
+          // Walking toward the source, filters above the copy see byte arrays;
+          // filters below it see Hadoop writables. Both have non-null values.
+          loadLambdaMethod(function, predicate = true)
+              .flatMap(method => verifyNullFilter(method, binaryInput = columns.isEmpty)) match {
+            case Left(reason) => return Left(reason)
+            case Right(_) =>
+          }
+        case Right((operation, _)) => return Left(s"unsupported RDD operation $operation")
       }
+      depth += 1
       current = mapped.prev
     }
     val source = current match {
@@ -170,34 +188,8 @@ object SequenceFileRddReadProof {
     for {
       _ <- requireUnmaterialized(source, "source RDD")
       _ <- requireBinaryInputFormat(source)
-      columns <- inspectOperations(operations.reverseIterator)
-    } yield (columns, source)
-  }
-
-  private def inspectOperations(
-      operations: Iterator[(String, AnyRef)]): Either[String, IndexedSeq[SourceColumn]] = {
-    var columns: Option[IndexedSeq[SourceColumn]] = None
-    while (operations.hasNext) {
-      val (operation, function) = operations.next()
-      if (operation == "map") {
-        if (columns.nonEmpty) {
-          return Left("additional RDD.map transformations are not supported")
-        }
-        loadLambdaMethod(function).flatMap(verifyLambda) match {
-          case Left(reason) => return Left(reason)
-          case Right(proven) => columns = Some(proven)
-        }
-      } else {
-        // The exact Hadoop reader and the proven binary copies both produce non-null values.
-        val proof = loadLambdaMethod(function, predicate = true)
-          .flatMap(method => verifyNullFilter(method, columns.nonEmpty))
-        proof match {
-          case Left(reason) => return Left(reason)
-          case Right(_) =>
-        }
-      }
-    }
-    columns.toRight("RDD lineage does not contain a proven binary copy")
+      provenColumns <- columns.toRight("RDD lineage does not contain a proven binary copy")
+    } yield (provenColumns, source)
   }
 
   private def requireUnmaterialized(rdd: RDD[_], name: String): Either[String, Unit] = {

@@ -784,80 +784,56 @@ abstract class MultiFileCloudPartitionReaderBase(
         }
         fut
       }
-      if (hmbFuture == null) {
-        if (combineConf.combineWaitTime > 0 && !tasks.isEmpty) {
-          // no more are ready, wait to see if any finish within wait time
-          GpuSemaphore.releaseIfNecessary(TaskContext.get())
-          val taskResult = if (keepReadsInOrder) {
-            val head = tasks.peekFirst()
-            try {
-              val result = head.get(combineConf.combineWaitTime, TimeUnit.MILLISECONDS)
-              tasks.pollFirst()
-              result
-            } catch {
-              case _: TimeoutException => null
-            }
-          } else {
-            val fut = fcs.poll(combineConf.combineWaitTime, TimeUnit.MILLISECONDS)
-            if (fut == null) {
-              null
-            } else {
-              tasks.remove(fut)
-              fut.get()
-            }
-          }
-          if (taskResult == null) {
-            // no more ready after waiting
-            takeMore = false
-          } else {
-            val hmbAndMeta = convertAsyncResult(taskResult)
-            results.append(hmbAndMeta)
-            currSize += hmbAndMeta.memBuffersAndSizes.map(_.bytes).sum
-            currNumRows += hmbAndMeta.memBuffersAndSizes.map(_.numRows).sum
-            filesToRead -= getNumCompletedFiles(hmbAndMeta)
-            takeMore = canCombineAfter(hmbAndMeta)
+      val taskResult = if (hmbFuture != null) {
+        hmbFuture.get()
+      } else if (combineConf.combineWaitTime > 0 && !tasks.isEmpty) {
+        GpuSemaphore.releaseIfNecessary(TaskContext.get())
+        if (keepReadsInOrder) {
+          val head = tasks.peekFirst()
+          try {
+            val result = head.get(combineConf.combineWaitTime, TimeUnit.MILLISECONDS)
+            tasks.pollFirst()
+            result
+          } catch {
+            case _: TimeoutException => null
           }
         } else {
-          takeMore = false
+          val future = fcs.poll(combineConf.combineWaitTime, TimeUnit.MILLISECONDS)
+          if (future == null) {
+            null
+          } else {
+            tasks.remove(future)
+            future.get()
+          }
         }
       } else {
-        val hmbWithMeta = convertAsyncResult(hmbFuture.get())
-        results.append(hmbWithMeta)
-        currSize += hmbWithMeta.memBuffersAndSizes.map(_.bytes).sum
-        currNumRows += hmbWithMeta.memBuffersAndSizes.map(_.numRows).sum
-        filesToRead -= getNumCompletedFiles(hmbWithMeta)
-        takeMore = canCombineAfter(hmbWithMeta)
+        null
+      }
+      if (taskResult == null) {
+        takeMore = false
+      } else {
+        val buffers = convertAsyncResult(taskResult)
+        results.append(buffers)
+        currSize += buffers.memBuffersAndSizes.map(_.bytes).sum
+        currNumRows += buffers.memBuffersAndSizes.map(_.numRows).sum
+        filesToRead -= getNumCompletedFiles(buffers)
+        takeMore = canCombineAfter(buffers)
       }
     }
   }
 
   private def getNextBuffersAndMetaAndCombine(): HostMemoryBuffersWithMetaDataBase = {
-    var sizeRead = 0L
-    var numRowsRead = 0L
     val results = ArrayBuffer[HostMemoryBuffersWithMetaDataBase]()
     readReadyFiles(0, 0, results)
     if (results.isEmpty) {
-      // none were ready yet so wait as long as need for first one
-      GpuSemaphore.releaseIfNecessary(TaskContext.get())
-      val hostBuffersWithMeta = if (keepReadsInOrder) {
-        val future = tasks.peekFirst()
-        val result = convertAsyncResult(future.get())
-        tasks.remove(future)
-        result
-      } else {
-        val bufMetaFut = fcs.take()
-        tasks.remove(bufMetaFut)
-        convertAsyncResult(bufMetaFut.get())
-      }
-      sizeRead += hostBuffersWithMeta.memBuffersAndSizes.map(_.bytes).sum
-      numRowsRead += hostBuffersWithMeta.memBuffersAndSizes.map(_.numRows).sum
-
-      filesToRead -= getNumCompletedFiles(hostBuffersWithMeta)
-      results.append(hostBuffersWithMeta)
-      // since we had to wait for one to be ready,
-      // check if more are ready as well
-      if (canCombineAfter(hostBuffersWithMeta)) {
-        readReadyFiles(sizeRead, numRowsRead, results)
+      // Wait for the first chunk, then combine any ready successors in source order.
+      val buffers = getNextBuffersAndMetaSingleFile()
+      results.append(buffers)
+      if (canCombineAfter(buffers)) {
+        readReadyFiles(
+          buffers.memBuffersAndSizes.map(_.bytes).sum,
+          buffers.memBuffersAndSizes.map(_.numRows).sum,
+          results)
       }
     }
     combineHMBs(results.toArray)

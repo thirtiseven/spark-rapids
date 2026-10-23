@@ -197,6 +197,11 @@ class RapidsTestSettings extends BackendTestSettings {
     .exclude("File source v2: support partition pruning", ADJUST_UT("Replaced by testRapids version that checks GpuBatchScanExec file filters and selected partitions."))
     .exclude("File source v2: support passing data filters to FileScan without partitionFilters", ADJUST_UT("Replaced by testRapids version that checks GpuBatchScanExec file filters and selected partitions."))
   enableSuite[RapidsCachedTableSuite]
+    .exclude("Ensure accumulators to be cleared after GC when uncacheTable",
+      ADJUST_UT("Replaced by testRapids version that checks both tables and retries GC after " +
+        "draining query listeners. https://github.com/NVIDIA/cudf-spark/issues/15928. " +
+        "The Spark 3.3.0 source test is pinned. Recovery trigger: adopt a corrected source " +
+        "test in a future Spark baseline; P2."))
     .exclude("InMemoryRelation statistics", ADJUST_UT("Replaced by testRapids version that checks cache statistics with RAPIDS cache serializer and GpuInMemoryTableScanExec."))
     .exclude("SPARK-19993 subquery with cached underlying relation", ADJUST_UT("Replaced by testRapids version that checks cached subquery reuse with recursive GpuInMemoryTableScanExec nodes."))
     .exclude("SPARK-36120: Support cache/uncache table with TimestampNTZ type", ADJUST_UT("Replaced by testRapids version that checks TimestampNTZ cache correctness with RAPIDS cache stats."))
@@ -359,19 +364,7 @@ class RapidsTestSettings extends BackendTestSettings {
   enableSuite[RapidsFileSourceSQLInsertTestSuite]
   enableSuite[RapidsDSV2SQLInsertTestSuite]
   enableSuite[RapidsMetadataCacheV1Suite]
-    .exclude("SPARK-16336,SPARK-27961 Suggest fixing FileNotFoundException",
-      KNOWN_ISSUE("https://github.com/NVIDIA/cudf-spark/issues/15511. " +
-        "Recovery trigger: GPU ORC V1 missing-file errors include Spark-equivalent recreate " +
-        "guidance; P1."))
-    .exclude("SPARK-16337 temporary view refresh",
-      KNOWN_ISSUE("https://github.com/NVIDIA/cudf-spark/issues/15511. " +
-        "Recovery trigger: GPU ORC V1 missing-file errors include Spark-equivalent REFRESH " +
-        "and recreate guidance; P1."))
   enableSuite[RapidsMetadataCacheV2Suite]
-    .exclude("SPARK-16336,SPARK-27961 Suggest fixing FileNotFoundException",
-      KNOWN_ISSUE("https://github.com/NVIDIA/cudf-spark/issues/15511. " +
-        "Recovery trigger: GPU ORC V2 missing-file errors include Spark-equivalent recreate " +
-        "guidance; P1."))
   enableSuite[RapidsFileSourceStrategySuite]
     .exclude("partitioned table - after scan filters", ADJUST_UT("Replaced by testRapids version that checks GpuFilterExec residual filters."))
   enableSuite[RapidsFileScanSuite]

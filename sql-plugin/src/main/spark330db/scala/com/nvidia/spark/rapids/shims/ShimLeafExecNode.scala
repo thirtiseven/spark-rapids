@@ -19,12 +19,12 @@
 {"spark": "332db"}
 {"spark": "350db143"}
 {"spark": "400db173"}
+{"spark": "410db183"}
 spark-rapids-shim-json-lines ***/
 package com.nvidia.spark.rapids.shims
 
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
 import org.apache.spark.sql.execution.LeafExecNode
-import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanExecBase
 
 trait ShimLeafExecNode extends LeafExecNode {
   // For AQE support in Databricks, all Exec nodes implement computeStats(). This is actually
@@ -38,14 +38,3 @@ trait ShimLeafExecNode extends LeafExecNode {
     )
   }
 }
-
-// DataSourceV2ScanExecBase actually extends LeafExecNode, so we extend that shim as well here.
-trait ShimDataSourceV2ScanExecBase extends DataSourceV2ScanExecBase {
-  override def computeStats(): Statistics = {
-    Statistics(
-      sizeInBytes = Long.MaxValue
-    )
-  }
-
-}
-

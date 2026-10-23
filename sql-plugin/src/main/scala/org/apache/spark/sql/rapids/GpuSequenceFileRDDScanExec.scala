@@ -56,6 +56,10 @@ case class GpuSequenceFileRDDScanExec(
     SCHEDULE_TIME_BUBBLE -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_SCHEDULE_TIME_BUBBLE),
     COPY_BUFFER_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_COPY_BUFFER_TIME),
     SCAN_TIME -> createNanoTimingMetric(ESSENTIAL_LEVEL, DESCRIPTION_SCAN_TIME),
+    GpuSequenceFileRDDReader.HOST_BUFFER_REALLOCATIONS ->
+      createMetric(DEBUG_LEVEL, "host buffer reallocations"),
+    GpuSequenceFileRDDReader.HOST_BUFFER_BYTES_COPIED ->
+      createMetric(DEBUG_LEVEL, "bytes copied during host buffer growth"),
     "numPartedFiles" -> createMetric(DEBUG_LEVEL, "number of PartitionedFiles"))
 
   private lazy val keyFirst = sourceColumns match {
@@ -111,7 +115,7 @@ case class GpuSequenceFileRDDScanExec(
   override protected def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val scanTime = gpuLongMetric(SCAN_TIME)
-    GpuDataSourceRDD(sparkContext, filePartitions, readerFactory)
+    GpuDataSourceRDD(sparkContext, filePartitions, readerFactory, includeRefreshHint = false)
       .asInstanceOf[RDD[ColumnarBatch]]
       .mapPartitionsInternal { batches =>
         new Iterator[ColumnarBatch] {

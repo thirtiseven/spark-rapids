@@ -21,8 +21,9 @@ import java.util.{Arrays, Random}
 
 import scala.concurrent.duration._
 
-import com.nvidia.spark.rapids.{GpuMetric, GpuRangeExec, RapidsConf, SparkQueryCompareTestSuite,
-  TestUtils}
+import com.nvidia.spark.rapids.{GpuMetric, GpuOverrides, GpuRangeExec, RapidsConf,
+  SparkQueryCompareTestSuite, TestUtils}
+import com.nvidia.spark.rapids.sequencefile.GpuSequenceFileRDDReader
 import com.nvidia.spark.rapids.shims.SparkShimImpl
 import com.nvidia.spark.rapids.spill.SpillFramework
 import org.apache.hadoop.conf.Configuration
@@ -191,6 +192,14 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
     }.toDF("key", "value")
   }
 
+  private def nullFilteredDataFrame(spark: SparkSession, file: File): DataFrame = {
+    import spark.implicits._
+    source(spark, file).filter { case (_, value) => value != null }.map { case (key, value) =>
+      (Arrays.copyOfRange(key.getBytes, 0, key.getLength),
+        Arrays.copyOfRange(value.getBytes, 0, value.getLength))
+    }.toDF("key", "value")
+  }
+
   private def readWithHadoop(
       spark: SparkSession,
       file: File,
@@ -350,9 +359,15 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
 
   private def assertGpuRead(
       df: DataFrame,
-      expected: Seq[(Seq[Byte], Seq[Byte])]): GpuSequenceFileRDDScanExec = {
+      expected: Seq[(Seq[Byte], Seq[Byte])],
+      ordered: Boolean = false): GpuSequenceFileRDDScanExec = {
     val scan = gpuScan(df)
-    assert(bag(collectPairs(df)) == bag(expected))
+    val actual = collectPairs(df)
+    if (ordered) {
+      assert(actual == expected)
+    } else {
+      assert(bag(actual) == bag(expected))
+    }
     scan
   }
 
@@ -381,7 +396,9 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
         val scan = assertGpuRead(df, readWithHadoop(spark, directory))
         assert(scan.sourceColumns ==
           Seq(SequenceFileRddReadProof.Key, SequenceFileRddReadProof.Value))
-      }, replacementConf(keepReadsInOrder = false))
+        assert(scan.allMetrics(GpuSequenceFileRDDReader.HOST_BUFFER_REALLOCATIONS).value == 0)
+        assert(scan.allMetrics(GpuSequenceFileRDDReader.HOST_BUFFER_BYTES_COPIED).value == 0)
+      }, replacementConf(keepReadsInOrder = false).set(RapidsConf.METRICS_LEVEL.key, "DEBUG"))
     }
   }
 
@@ -443,6 +460,25 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
   }
 
   compressionTypes.foreach { compression =>
+    test(s"replace a value null filter before copying $compression records") {
+      withTempPath { file =>
+        if (compression == CompressionType.RECORD) {
+          writeWritableFile(file, records, compression)
+        } else {
+          writeRawFile(file, records, compression)
+        }
+
+        withGpuSparkSession({ spark =>
+          val expected = readWithHadoop(spark, file)
+          assert(expected.length == records.length)
+          if (compression != CompressionType.RECORD) {
+            assert(expected.exists(_._2.isEmpty))
+          }
+          assertGpuRead(nullFilteredDataFrame(spark, file), expected)
+        }, replacementConf())
+      }
+    }
+
     test(s"replace RDD read preserves $compression key and value bytes") {
       withTempPath { file =>
         val fileRecords = Seq(
@@ -461,55 +497,82 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
   }
 
   compressionTypes.foreach { compression =>
-    test(s"replace RDD read preserves every record across $compression Hadoop splits") {
-      withTempPath { file =>
-        val fileRecords = (0 until 96).map { index =>
-          intBytes(index) -> randomPayload(0, index, 4096)
-        }
-        writeWritableFile(file, fileRecords, compression, syncEvery = 8)
+    Seq(true, false).foreach { keepReadsInOrder =>
+      test(s"continue $compression Hadoop splits with keepReadsInOrder=$keepReadsInOrder") {
+        withTempPath { file =>
+          val fileRecords = (0 until 96).map { index =>
+            intBytes(index) -> randomPayload(0, index, 4096)
+          }
+          writeWritableFile(file, fileRecords, compression, syncEvery = 8)
 
-        withGpuSparkSession({ spark =>
-          val splitMaxSize = Some(64 * 1024L)
-          val expected = readWithHadoop(spark, file, splitMaxSize)
-          val df = copiedDataFrame(spark, file, splitMaxSize)
-          assert(assertGpuRead(df, expected).sourceRdd.getNumPartitions > 1)
-        }, replacementConf())
+          val conf = replacementConf(batchSize = "16k", keepReadsInOrder = keepReadsInOrder)
+            .set(RapidsConf.MULTITHREAD_READ_MEMORY_LIMIT_SIZE.key, "64k")
+          withGpuSparkSession({ spark =>
+            val splitMaxSize = Some(64 * 1024L)
+            val expected = readWithHadoop(spark, file, splitMaxSize)
+            val df = copiedDataFrame(spark, file, splitMaxSize)
+            val scan = assertGpuRead(df, expected, ordered = keepReadsInOrder)
+            val sourcePartitions = scan.sourceRdd.getNumPartitions
+            assert(sourcePartitions > 1)
+            assert(scan.allMetrics(GpuMetric.NUM_OUTPUT_BATCHES).value > sourcePartitions)
+          }, conf)
+        }
       }
     }
   }
 
-  test("early termination closes the RDD reader") {
+  test("ordered continuations preserve file and record order with a sub-batch memory budget") {
     withTempPath { directory =>
       assert(directory.mkdirs())
       writeLzoPartFiles(directory, fileCount = 4, rowCount = 16, payloadSize = 2048)
 
+      val conf = replacementConf(batchSize = "8k")
+        .set(RapidsConf.MULTITHREAD_READ_MEMORY_LIMIT_SIZE.key, "1k")
       withGpuSparkSession({ spark =>
-        val initialHostHandles = SpillFramework.stores.hostStore.numHandles
-        val scan = gpuScan(copiedDataFrame(spark, directory))
-        val batchRows = scan.executeColumnar().mapPartitions { batches =>
-          if (batches.hasNext) {
-            val batch = batches.next()
-            val rows = try {
-              batch.numRows()
-            } finally {
-              batch.close()
-            }
-            Iterator.single(rows)
-          } else {
-            Iterator.empty
-          }
-        }.collect()
-        assert(batchRows.nonEmpty)
-        assert(scan.allMetrics(GpuMetric.NUM_OUTPUT_BATCHES).value > 0)
-        eventually(timeout(10.seconds)) {
-          assert(TestUtils.numRunningMultiFileReaderTasks == 0)
-          assert(SpillFramework.stores.hostStore.numHandles == initialHostHandles)
-        }
-      }, replacementConf(batchSize = "64k", keepReadsInOrder = false))
+        val expected = readWithHadoop(spark, directory)
+        val scan = assertGpuRead(copiedDataFrame(spark, directory), expected, ordered = true)
+        assert(scan.sourceRdd.getNumPartitions == 4)
+        assert(scan.outputPartitioning.numPartitions == 1)
+        assert(scan.allMetrics(GpuMetric.NUM_OUTPUT_BATCHES).value > 4)
+      }, conf)
     }
   }
 
-  test("replace RDD read fails closed for oversized records and splits") {
+  Seq(true, false).foreach { keepReadsInOrder =>
+    test(s"early termination closes the RDD reader, keepReadsInOrder=$keepReadsInOrder") {
+      withTempPath { directory =>
+        assert(directory.mkdirs())
+        writeLzoPartFiles(directory, fileCount = 4, rowCount = 16, payloadSize = 2048)
+
+        withGpuSparkSession({ spark =>
+          val initialHostHandles = SpillFramework.stores.hostStore.numHandles
+          val scan = gpuScan(copiedDataFrame(spark, directory))
+          val batchRows = scan.executeColumnar().mapPartitions { batches =>
+            if (batches.hasNext) {
+              val batch = batches.next()
+              val rows = try {
+                batch.numRows()
+              } finally {
+                batch.close()
+              }
+              Iterator.single(rows)
+            } else {
+              Iterator.empty
+            }
+          }.collect()
+          assert(batchRows.nonEmpty)
+          assert(batchRows.forall(_ < 16))
+          assert(scan.allMetrics(GpuMetric.NUM_OUTPUT_BATCHES).value > 0)
+          eventually(timeout(10.seconds)) {
+            assert(TestUtils.numRunningMultiFileReaderTasks == 0)
+            assert(SpillFramework.stores.hostStore.numHandles == initialHostHandles)
+          }
+        }, replacementConf(batchSize = "8k", keepReadsInOrder = keepReadsInOrder))
+      }
+    }
+  }
+
+  test("replace RDD read fails closed for an oversized record") {
     withTempPath { file =>
       writeWritableFile(file,
         Seq(intBytes(0) -> payload(0, 0, 128 * 1024)), CompressionType.RECORD)
@@ -521,33 +584,178 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
           exceptionContains(error, "decompressed single-batch limit"))
       }, replacementConf(batchSize = "64k"))
     }
+  }
 
+  test("replace RDD read rejects an oversized record after a smaller record") {
     withTempPath { file =>
-      writeRawFile(file, (0 until 5).map { index =>
-        intBytes(index) -> payload(0, index, 2048)
-      }, CompressionType.BLOCK)
+      writeWritableFile(file, Seq(
+        intBytes(0) -> payload(0, 0, 32),
+        intBytes(1) -> payload(0, 1, 128 * 1024)), CompressionType.RECORD)
 
       withGpuSparkSession({ spark =>
-        val df = copiedDataFrame(spark, file, splitMaxSize = Some(1024 * 1024L))
-        val scan = gpuScan(df)
-        assert(scan.sourceRdd.getNumPartitions == 1)
-        val error = intercept[Exception] {
-          df.collect()
-        }
-        assert(exceptionContains(error, "split exceeds") &&
+        val error = gpuReadFailure(copiedDataFrame(spark, file))
+        assert(exceptionContains(error, "record exceeds") &&
           exceptionContains(error, "decompressed single-batch limit"))
-      }, replacementConf(batchSize = "8k"))
+      }, replacementConf(batchSize = "64k"))
+    }
+  }
+
+  compressionTypes.foreach { compression =>
+    test(s"replace RDD read continues a $compression split across byte-bounded batches") {
+      withTempPath { file =>
+        writeWritableFile(file, (0 until 17).map { index =>
+          intBytes(index) -> payload(0, index, 2048)
+        }, compression)
+
+        withGpuSparkSession({ spark =>
+          val splitMaxSize = Some(1024 * 1024L)
+          val df = copiedDataFrame(spark, file, splitMaxSize)
+          val scan = assertGpuRead(df, readWithHadoop(spark, file, splitMaxSize))
+          assert(scan.sourceRdd.getNumPartitions == 1)
+          assert(scan.allMetrics(GpuMetric.NUM_OUTPUT_BATCHES).value >= 3)
+        }, replacementConf(batchSize = "8k"))
+      }
     }
 
+    test(s"roll back $compression columns at the shared byte limit without growing buffers") {
+      withTempPath { file =>
+        val fileRecords = (0 until 3).map { index =>
+          payload(0, index, 20 * 1024) -> payload(1, index, 20 * 1024)
+        }
+        writeWritableFile(file, fileRecords, compression)
+
+        val conf = replacementConf(batchSize = "64k")
+          .set(RapidsConf.METRICS_LEVEL.key, "DEBUG")
+        withGpuSparkSession({ spark =>
+          val scan = assertGpuRead(copiedDataFrame(spark, file),
+            readWithHadoop(spark, file), ordered = true)
+          assert(scan.sourceRdd.getNumPartitions == 1)
+          assert(scan.allMetrics(GpuMetric.NUM_OUTPUT_BATCHES).value == fileRecords.length)
+          assert(scan.allMetrics(GpuSequenceFileRDDReader.HOST_BUFFER_REALLOCATIONS).value == 0)
+          assert(scan.allMetrics(GpuSequenceFileRDDReader.HOST_BUFFER_BYTES_COPIED).value == 0)
+        }, conf)
+      }
+    }
+  }
+
+  test("replace RDD read retries a partially written RECORD value in the next batch") {
+    withTempPath { file =>
+      val fileRecords = (0 until 3).map { index =>
+        intBytes(index) -> payload(0, index, 12 * 1024)
+      }
+      writeWritableFile(file, fileRecords, CompressionType.RECORD)
+
+      withGpuSparkSession({ spark =>
+        val scan = assertGpuRead(copiedDataFrame(spark, file), readWithHadoop(spark, file))
+        assert(scan.sourceRdd.getNumPartitions == 1)
+        assert(scan.allMetrics(GpuMetric.NUM_OUTPUT_BATCHES).value == fileRecords.length)
+      }, replacementConf(batchSize = "32k"))
+    }
+  }
+
+  test("replace RDD read continues a split across row-bounded batches") {
     withTempPath { file =>
       writeRawFile(file, (0 until 3).map { index =>
         intBytes(index) -> payload(0, index, 32)
       }, CompressionType.BLOCK)
 
       withGpuSparkSession({ spark =>
-        val error = gpuReadFailure(copiedDataFrame(spark, file))
-        assert(exceptionContains(error, "split exceeds the 2 row single-batch limit"))
+        val scan = assertGpuRead(copiedDataFrame(spark, file), readWithHadoop(spark, file))
+        assert(scan.sourceRdd.getNumPartitions == 1)
+        assert(scan.allMetrics(GpuMetric.NUM_OUTPUT_BATCHES).value == 2)
       }, replacementConf(maxRows = Some(2)))
+    }
+  }
+
+  Seq(CompressionType.NONE, CompressionType.BLOCK).foreach { compression =>
+    test(s"continue zero-width $compression batches through a nonempty final record") {
+      withTempPath { file =>
+        val fileRecords = Seq.fill(5)(Array.emptyByteArray -> Array.emptyByteArray) :+
+          (Array[Byte](1) -> Array[Byte](2, 3))
+        writeRawFile(file, fileRecords, compression)
+
+        withGpuSparkSession({ spark =>
+          val expected = readWithHadoop(spark, file)
+          assert(expected == fileRecords.map { case (key, value) => key.toSeq -> value.toSeq })
+          assert(expected.length == 6)
+          val scan = assertGpuRead(copiedDataFrame(spark, file), expected, ordered = true)
+          assert(scan.sourceRdd.getNumPartitions == 1)
+          assert(scan.allMetrics(GpuMetric.NUM_OUTPUT_BATCHES).value == 3)
+        }, replacementConf(maxRows = Some(2)))
+      }
+    }
+  }
+
+  test("reuse host buffer sizes across row-bounded BLOCK-LZO chunks") {
+    withTempPath { file =>
+      val fileRecords = (0 until 64).map { index =>
+        intBytes(index) -> payload(0, index, 8192)
+      }
+      writeRawFile(file, fileRecords, CompressionType.BLOCK)
+      assert(file.length() < 32 * 1024L)
+
+      val conf = replacementConf(maxRows = Some(16))
+        .set(RapidsConf.METRICS_LEVEL.key, "DEBUG")
+      withGpuSparkSession({ spark =>
+        val scan = assertGpuRead(copiedDataFrame(spark, file),
+          readWithHadoop(spark, file), ordered = true)
+        assert(scan.sourceRdd.getNumPartitions == 1)
+        assert(scan.allMetrics(GpuMetric.NUM_OUTPUT_BATCHES).value == 4)
+        assert(scan.allMetrics(GpuSequenceFileRDDReader.HOST_BUFFER_REALLOCATIONS).value == 2)
+        assert(scan.allMetrics(GpuSequenceFileRDDReader.HOST_BUFFER_BYTES_COPIED).value ==
+          96 * 1024L)
+      }, conf)
+    }
+  }
+
+  Seq(true, false).foreach { swapped =>
+    test(s"continue BLOCK-LZO chunks with changing key/value widths, swapped=$swapped") {
+      withTempPath { file =>
+        val fileRecords = (0 until 69).map { index =>
+          index / 16 match {
+            case 0 => intBytes(index) -> payload(0, index, 8192)
+            case 1 => payload(0, index, 8192) -> intBytes(index)
+            case 2 => Array.emptyByteArray -> payload(0, index, 8192)
+            case 3 => payload(0, index, 8192) -> Array.emptyByteArray
+            case _ => intBytes(index) -> payload(0, index, 8)
+          }
+        }
+        writeRawFile(file, fileRecords, CompressionType.BLOCK)
+
+        withGpuSparkSession({ spark =>
+          val expected = readWithHadoop(spark, file)
+          val df = if (swapped) swappedDataFrame(spark, file) else copiedDataFrame(spark, file)
+          val scan = assertGpuRead(df, if (swapped) expected.map(_.swap) else expected,
+            ordered = true)
+          assert(scan.sourceRdd.getNumPartitions == 1)
+          assert(scan.allMetrics(GpuMetric.NUM_OUTPUT_BATCHES).value == 5)
+        }, replacementConf(batchSize = "512k", maxRows = Some(16)))
+      }
+    }
+  }
+
+  Seq(true, false).foreach { keepReadsInOrder =>
+    test(s"combine empty EOF continuations with data, keepReadsInOrder=$keepReadsInOrder") {
+      withTempPath { directory =>
+        assert(directory.mkdirs())
+        writeRawFile(new File(directory, "part-00000.seq"), (0 until 2).map { index =>
+          intBytes(index) -> payload(0, index, 1024)
+        }, CompressionType.NONE)
+        writeRawFile(new File(directory, "part-00001.seq"),
+          Seq(intBytes(2) -> payload(1, 2, 32)), CompressionType.NONE)
+        writeRawFile(new File(directory, "part-00002.seq"), Seq.empty, CompressionType.NONE)
+
+        val conf = replacementConf(maxRows = Some(2), keepReadsInOrder = keepReadsInOrder)
+          .set(RapidsConf.READER_MULTITHREADED_COMBINE_WAIT_TIME.key, "1000")
+        withGpuSparkSession({ spark =>
+          val expected = readWithHadoop(spark, directory)
+          assert(expected.length == 3)
+          val scan = assertGpuRead(copiedDataFrame(spark, directory), expected)
+          assert(scan.sourceRdd.getNumPartitions == 3)
+          assert(scan.outputPartitioning.numPartitions == 1)
+          assert(scan.allMetrics(GpuMetric.NUM_OUTPUT_BATCHES).value == 2)
+        }, conf)
+      }
     }
   }
 
@@ -561,10 +769,15 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
         truncate(file)
 
         withGpuSparkSession({ spark =>
+          val initialHostHandles = SpillFramework.stores.hostStore.numHandles
           val df = copiedDataFrame(spark, file)
           val error = gpuReadFailure(df)
           assert(exceptionContains(error, "Truncated SequenceFile"), error.toString)
-        }, replacementConf())
+          eventually(timeout(10.seconds)) {
+            assert(TestUtils.numRunningMultiFileReaderTasks == 0)
+            assert(SpillFramework.stores.hostStore.numHandles == initialHostHandles)
+          }
+        }, replacementConf(batchSize = "8k"))
       }
     }
   }
@@ -574,6 +787,27 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
         replacementConf(enabled = false, allowCpuPlan = true)) { (spark, file) =>
       val df = copiedDataFrame(spark, file)
       assertCpuRead(df, recordPairs)
+    }
+  }
+
+  Seq("ignoreMissingFiles", "ignoreCorruptFiles").foreach { flag =>
+    test(s"fallback explain identifies the enabled $flag source setting") {
+      val conf = replacementConf(allowCpuPlan = true).set(s"spark.files.$flag", "true")
+      withTempPath { file =>
+        writeRawFile(file, records, CompressionType.BLOCK)
+        // NewHadoopRDD reads these flags from SparkContext, not the session's SQLConf.
+        TestUtils.withGpuSparkSession(conf) { spark =>
+          val df = copiedDataFrame(spark, file)
+          val meta = GpuOverrides.wrapPlan(
+            df.queryExecution.sparkPlan, new RapidsConf(spark.conf.getAll), None)
+          meta.tagForGpu()
+          val explanation = meta.explain(false)
+          assert(explanation.contains("SequenceFile RDD replacement: source configuration"),
+            explanation)
+          assert(explanation.contains(s"$flag=true"), explanation)
+          assertCpuRead(df, recordPairs)
+        }
+      }
     }
   }
 
@@ -739,20 +973,39 @@ class SequenceFileRddScanSuite extends SparkQueryCompareTestSuite with Eventuall
     }
   }
 
-  test("input file name preserves provenance across multiple files with a GPU scan") {
+  test("value null filter and streamed batches retain a GPU scan below aggregation") {
     withTempPath { directory =>
       assert(directory.mkdirs())
       writeLzoPartFiles(directory, fileCount = 3, rowCount = 32, payloadSize = 512)
-      val conf = replacementConf(keepReadsInOrder = false)
+      val conf = replacementConf(batchSize = "8k")
+        .set(RapidsConf.TEST_ALLOWED_NONGPU.key, "ShuffleExchangeExec,HashPartitioning")
       val (cpu, gpu) = runOnCpuAndGpu(
-        spark => copiedDataFrame(spark, directory),
-        _.select(col("key"), col("value"), input_file_name().as("file")),
+        spark => nullFilteredDataFrame(spark, directory),
+        _.groupBy("key", "value").count(),
         conf = conf,
         repart = 0,
         existClasses = "GpuSequenceFileRDDScanExec",
         nonExistClasses = "ExternalRDDScanExec")
-      assert(cpu.map(_.getString(2)).toSet.size == 3)
       assert(binaryRowBag(cpu) == binaryRowBag(gpu))
+    }
+  }
+
+  Seq(true, false).foreach { keepReadsInOrder =>
+    test(s"input file name survives streamed batches, keepReadsInOrder=$keepReadsInOrder") {
+      withTempPath { directory =>
+        assert(directory.mkdirs())
+        writeLzoPartFiles(directory, fileCount = 3, rowCount = 32, payloadSize = 512)
+        val conf = replacementConf(batchSize = "8k", keepReadsInOrder = keepReadsInOrder)
+        val (cpu, gpu) = runOnCpuAndGpu(
+          spark => copiedDataFrame(spark, directory),
+          _.select(col("key"), col("value"), input_file_name().as("file")),
+          conf = conf,
+          repart = 0,
+          existClasses = "GpuSequenceFileRDDScanExec",
+          nonExistClasses = "ExternalRDDScanExec")
+        assert(cpu.map(_.getString(2)).toSet.size == 3)
+        assert(binaryRowBag(cpu) == binaryRowBag(gpu))
+      }
     }
   }
 

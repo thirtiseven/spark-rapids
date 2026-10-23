@@ -56,6 +56,8 @@ object SequenceFileRddReadProof {
   private final case class Length(source: SourceColumn) extends Symbol
   private final case class Binary(source: SourceColumn) extends Symbol
   private case object Zero extends Symbol
+  private case object One extends Symbol
+  private case object Null extends Symbol
   private final case class NewTuple(id: Int) extends Symbol
   private final case class OutputTuple(first: SourceColumn, second: SourceColumn) extends Symbol
 
@@ -76,6 +78,7 @@ object SequenceFileRddReadProof {
             if scan.getClass == classOf[ExternalRDDScanExec[_]] =>
           for {
             serializerColumns <- inspectSerializer(serialize.serializer)
+              .left.map(reason => s"serializer: $reason")
             rddProof <- inspectRdd(scan.rdd)
           } yield {
             val (closureColumns, source) = rddProof
@@ -83,17 +86,21 @@ object SequenceFileRddReadProof {
             Proven(columns, source)
           }
         case _: ExternalRDDScanExec[_] => Left("ExternalRDDScanExec subclasses are not supported")
-        case other => Left(s"expected ExternalRDDScanExec, found ${other.nodeName}")
+        case other => Left(s"plan: expected ExternalRDDScanExec under SerializeFromObjectExec, " +
+          s"found ${other.nodeName} (${other.getClass.getName})")
       }
     case _: SerializeFromObjectExec => Left("SerializeFromObjectExec subclasses are not supported")
-    case other => Left(s"expected SerializeFromObjectExec, found ${other.nodeName}")
+    case other => Left(s"plan: expected SerializeFromObjectExec, " +
+      s"found ${other.nodeName} (${other.getClass.getName})")
   }
 
   private def inspectSerializer(serializer: Seq[NamedExpression]): Either[String, Seq[Int]] = {
     if (serializer.length != 2) {
       Left(s"expected a two-column serializer, found ${serializer.length} columns")
     } else {
-      val columns = serializer.map(serializerOrdinal)
+      val columns = serializer.zipWithIndex.map { case (expression, ordinal) =>
+        serializerOrdinal(expression).left.map(reason => s"column $ordinal: $reason")
+      }
       columns.collectFirst { case Left(reason) => reason } match {
         case Some(reason) => Left(reason)
         case None => Right(columns.collect { case Right(ordinal) => ordinal })
@@ -137,27 +144,63 @@ object SequenceFileRddReadProof {
   }
 
   private def inspectRdd(
-      rdd: RDD[_]): Either[String, (IndexedSeq[SourceColumn], NewHadoopRDD[Any, Any])] = rdd match {
-    case mapped: MapPartitionsRDD[_, _]
-        if mapped.getClass == classOf[MapPartitionsRDD[_, _]] =>
-      for {
-        _ <- requireUnmaterialized(mapped, "mapped RDD")
-        source <- mapped.prev match {
-          case source: NewHadoopRDD[_, _]
-              if source.getClass == classOf[NewHadoopRDD[_, _]] =>
-            Right(source.asInstanceOf[NewHadoopRDD[Any, Any]])
-          case _: NewHadoopRDD[_, _] => Left("NewHadoopRDD subclasses are not supported")
-          case null => Left("RDD lineage was cleared")
-          case other => Left(s"expected NewHadoopRDD, found ${other.getClass.getSimpleName}")
-        }
-        _ <- requireUnmaterialized(source, "source RDD")
-        _ <- requireBinaryInputFormat(source)
-        function <- extractMapFunction(mapped)
-        method <- loadLambdaMethod(function)
-        columns <- verifyLambda(method)
-      } yield (columns, source)
-    case _: MapPartitionsRDD[_, _] => Left("MapPartitionsRDD subclasses are not supported")
-    case other => Left(s"expected MapPartitionsRDD, found ${other.getClass.getSimpleName}")
+      rdd: RDD[_]): Either[String, (IndexedSeq[SourceColumn], NewHadoopRDD[Any, Any])] = {
+    var columns: Option[IndexedSeq[SourceColumn]] = None
+    var depth = 0
+    var current = rdd
+    def rejected(reason: String, operation: String = ""): Left[String, Nothing] = {
+      val node = Option(current).map(_.getClass.getName).getOrElse("cleared RDD")
+      Left(s"RDD layer $depth from scan ($node$operation): $reason")
+    }
+    while (current != null && current.getClass == classOf[MapPartitionsRDD[_, _]]) {
+      // Bound inspection work even when an application supplies an unusually long lineage.
+      if (depth >= 64) {
+        return rejected("RDD lineage exceeds the proof limit")
+      }
+      val mapped = current.asInstanceOf[MapPartitionsRDD[_, _]]
+      requireUnmaterialized(mapped, "mapped RDD") match {
+        case Left(reason) => return rejected(reason)
+        case Right(_) =>
+      }
+      extractRddFunction(mapped) match {
+        case Left(reason) => return rejected(reason)
+        case Right(("map", function)) =>
+          if (columns.nonEmpty) {
+            return rejected("additional RDD.map transformations are not supported")
+          }
+          loadLambdaMethod(function).flatMap(verifyLambda) match {
+            case Left(reason) => return rejected(
+              s"expected full copies of key/value bytes; $reason", ".map")
+            case Right(proven) => columns = Some(proven)
+          }
+        case Right(("filter", function)) =>
+          // Walking toward the source, filters above the copy see byte arrays;
+          // filters below it see Hadoop writables. Both have non-null values.
+          loadLambdaMethod(function, predicate = true)
+              .flatMap(method => verifyNullFilter(method, binaryInput = columns.isEmpty)) match {
+            case Left(reason) => return rejected(s"expected value != null; $reason", ".filter")
+            case Right(_) =>
+          }
+        case Right((operation, _)) => return rejected(s"unsupported RDD operation $operation")
+      }
+      depth += 1
+      current = mapped.prev
+    }
+    val source = current match {
+      case source: NewHadoopRDD[_, _] if source.getClass == classOf[NewHadoopRDD[_, _]] =>
+        source.asInstanceOf[NewHadoopRDD[Any, Any]]
+      case _: NewHadoopRDD[_, _] => return rejected("NewHadoopRDD subclasses are not supported")
+      case _: MapPartitionsRDD[_, _] =>
+        return rejected("MapPartitionsRDD subclasses are not supported")
+      case null => return rejected("RDD lineage was cleared")
+      case other => return rejected(s"expected NewHadoopRDD, found ${other.getClass.getSimpleName}")
+    }
+    val proof = for {
+      _ <- requireUnmaterialized(source, "source RDD")
+      _ <- requireBinaryInputFormat(source)
+      provenColumns <- columns.toRight("RDD lineage does not contain a proven binary copy")
+    } yield (provenColumns, source)
+    proof.left.flatMap(reason => rejected(reason))
   }
 
   private def requireUnmaterialized(rdd: RDD[_], name: String): Either[String, Unit] = {
@@ -178,31 +221,37 @@ object SequenceFileRddReadProof {
     formatField match {
       case Some(field) =>
         field.setAccessible(true)
-        if (field.get(rdd) == classOf[SequenceFileAsBinaryInputFormat]) {
+        val format = field.get(rdd).asInstanceOf[Class[_]]
+        if (format == classOf[SequenceFileAsBinaryInputFormat]) {
           Right(())
         } else {
-          Left("NewHadoopRDD does not use SequenceFileAsBinaryInputFormat")
+          Left("expected SequenceFileAsBinaryInputFormat, found " +
+            Option(format).map(_.getName).getOrElse("null"))
         }
       case None => Left("cannot locate NewHadoopRDD inputFormatClass")
     }
   }
 
-  private def extractMapFunction(mapped: MapPartitionsRDD[_, _]): Either[String, AnyRef] = {
+  private def extractRddFunction(
+      mapped: MapPartitionsRDD[_, _]): Either[String, (String, AnyRef)] = {
     val field = classOf[MapPartitionsRDD[_, _]].getDeclaredField("f")
     field.setAccessible(true)
     val wrapper = field.get(mapped).asInstanceOf[AnyRef]
     serializedLambda(wrapper).flatMap { lambda =>
-      val descriptors = Map(
-        "$anonfun$map$2" -> (
-          "(Lscala/Function1;Lorg/apache/spark/TaskContext;ILscala/collection/Iterator;)" +
-            "Lscala/collection/Iterator;"),
-        "$anonfun$map$2$adapted" -> (
-          "(Lscala/Function1;Lorg/apache/spark/TaskContext;Ljava/lang/Object;" +
-            "Lscala/collection/Iterator;)Lscala/collection/Iterator;"))
-      val isSparkMap = lambda.getImplMethodKind == MethodHandleInfo.REF_invokeStatic &&
+      val operation = Seq("map", "filter").find { operation =>
+        val descriptors = Map(
+          s"$$anonfun$$$operation$$2" -> (
+            "(Lscala/Function1;Lorg/apache/spark/TaskContext;ILscala/collection/Iterator;)" +
+              "Lscala/collection/Iterator;"),
+          s"$$anonfun$$$operation$$2$$adapted" -> (
+            "(Lscala/Function1;Lorg/apache/spark/TaskContext;Ljava/lang/Object;" +
+              "Lscala/collection/Iterator;)Lscala/collection/Iterator;"))
+        descriptors.get(lambda.getImplMethodName).contains(lambda.getImplMethodSignature)
+      }
+      val isSparkWrapper = lambda.getImplMethodKind == MethodHandleInfo.REF_invokeStatic &&
         lambda.getImplClass == "org/apache/spark/rdd/RDD" &&
         lambda.getCapturingClass == lambda.getImplClass &&
-        descriptors.get(lambda.getImplMethodName).contains(lambda.getImplMethodSignature) &&
+        operation.nonEmpty &&
         lambda.getFunctionalInterfaceClass == "scala/Function3" &&
         lambda.getFunctionalInterfaceMethodName == "apply" &&
         lambda.getFunctionalInterfaceMethodSignature ==
@@ -210,18 +259,21 @@ object SequenceFileRddReadProof {
         lambda.getInstantiatedMethodType ==
           "(Lorg/apache/spark/TaskContext;Ljava/lang/Object;Lscala/collection/Iterator;)" +
             "Lscala/collection/Iterator;"
-      if (!isSparkMap || lambda.getCapturedArgCount != 1) {
-        Left("MapPartitionsRDD is not the Spark RDD.map wrapper")
+      if (!isSparkWrapper || lambda.getCapturedArgCount != 1) {
+        Left("MapPartitionsRDD is not a supported Spark RDD wrapper")
       } else {
         lambda.getCapturedArg(0) match {
-          case function: Function1[_, _] => Right(function.asInstanceOf[AnyRef])
-          case _ => Left("RDD.map wrapper does not capture one Function1")
+          case function: Function1[_, _] => Right(operation.get -> function.asInstanceOf[AnyRef])
+          case _ => Left("RDD wrapper does not capture one Function1")
         }
       }
     }
   }
 
-  private def loadLambdaMethod(function: AnyRef): Either[String, MethodNode] = {
+  private def loadLambdaMethod(
+      function: AnyRef,
+      predicate: Boolean = false): Either[String, MethodNode] = {
+    val returnType = if (predicate) "java/lang/Object" else "scala/Tuple2"
     serializedLambda(function).flatMap { lambda =>
       if (lambda.getImplMethodKind != MethodHandleInfo.REF_invokeStatic) {
         Left("user closure is not a static lambda body")
@@ -231,7 +283,7 @@ object SequenceFileRddReadProof {
           lambda.getFunctionalInterfaceMethodName != "apply" ||
           lambda.getFunctionalInterfaceMethodSignature !=
             "(Ljava/lang/Object;)Ljava/lang/Object;" ||
-          lambda.getInstantiatedMethodType != "(Lscala/Tuple2;)Lscala/Tuple2;") {
+          lambda.getInstantiatedMethodType != s"(Lscala/Tuple2;)L$returnType;") {
         Left("user closure is not a Scala Tuple2 function")
       } else if (lambda.getCapturedArgCount != 0) {
         Left("user closure captures state")
@@ -243,13 +295,43 @@ object SequenceFileRddReadProof {
             case method: MethodNode if method.name == lambda.getImplMethodName &&
                 method.desc == lambda.getImplMethodSignature => method
           }
-          if (methods.length == 1) {
+          if (methods.length == 1 && predicate) {
+            unwrapBooleanAdapter(classNode, methods.head)
+          } else if (methods.length == 1) {
             Right(methods.head)
           } else {
             Left("cannot uniquely locate the user closure bytecode")
           }
         }
       }
+    }
+  }
+
+  private def unwrapBooleanAdapter(
+      owner: ClassNode,
+      method: MethodNode): Either[String, MethodNode] = {
+    val instructions = method.instructions.toArray.filter(_.getOpcode >= 0)
+    val validBody = instructions match {
+      case Array(load: VarInsnNode, body: MethodInsnNode, box: MethodInsnNode, ret: InsnNode) =>
+        load.getOpcode == Opcodes.ALOAD && load.`var` == 0 &&
+          body.getOpcode == Opcodes.INVOKESTATIC && !body.itf && body.owner == owner.name &&
+          body.desc == "(Lscala/Tuple2;)Z" &&
+          box.getOpcode == Opcodes.INVOKESTATIC && !box.itf &&
+          box.owner == "scala/runtime/BoxesRunTime" && box.name == "boxToBoolean" &&
+          box.desc == "(Z)Ljava/lang/Boolean;" && ret.getOpcode == Opcodes.ARETURN
+      case _ => false
+    }
+    if (!isPlainStatic(method) || !method.tryCatchBlocks.isEmpty ||
+        method.desc != "(Lscala/Tuple2;)Ljava/lang/Object;" || !validBody) {
+      Left("predicate is not a plain Scala Boolean adapter")
+    } else {
+      val body = instructions(1).asInstanceOf[MethodInsnNode]
+      val methods = owner.methods.toArray.collect {
+        case candidate: MethodNode if candidate.name == body.name && candidate.desc == body.desc =>
+          candidate
+      }
+      if (methods.length == 1) Right(methods.head)
+      else Left("cannot uniquely locate predicate body")
     }
   }
 
@@ -281,6 +363,7 @@ object SequenceFileRddReadProof {
         classOf[Tuple2[_, _]],
         classOf[BytesWritable],
         classOf[java.util.Arrays],
+        classOf[scala.runtime.BoxesRunTime],
         classOf[MatchError])
       val usesCanonicalClasses = expectedClasses.forall { expected =>
         Class.forName(expected.getName, false, implClass.getClassLoader) eq expected
@@ -311,8 +394,7 @@ object SequenceFileRddReadProof {
 
   private def verifyLambda(method: MethodNode): Either[String, IndexedSeq[SourceColumn]] = {
     val argumentTypes = Type.getArgumentTypes(method.desc)
-    val forbiddenFlags = Opcodes.ACC_SYNCHRONIZED | Opcodes.ACC_NATIVE | Opcodes.ACC_ABSTRACT
-    if ((method.access & Opcodes.ACC_STATIC) == 0 || (method.access & forbiddenFlags) != 0) {
+    if (!isPlainStatic(method)) {
       Left("user closure method is not a plain static method")
     } else if (argumentTypes.length != 1 ||
         argumentTypes.head.getInternalName != "scala/Tuple2" ||
@@ -325,7 +407,27 @@ object SequenceFileRddReadProof {
     }
   }
 
-  private def interpret(method: MethodNode): Either[String, IndexedSeq[SourceColumn]] = {
+  private def isPlainStatic(method: MethodNode): Boolean = {
+    val forbiddenFlags = Opcodes.ACC_SYNCHRONIZED | Opcodes.ACC_NATIVE | Opcodes.ACC_ABSTRACT
+    (method.access & Opcodes.ACC_STATIC) != 0 && (method.access & forbiddenFlags) == 0
+  }
+
+  private def verifyNullFilter(method: MethodNode, binaryInput: Boolean): Either[String, Unit] = {
+    if (!isPlainStatic(method) || method.desc != "(Lscala/Tuple2;)Z" ||
+        !method.tryCatchBlocks.isEmpty) {
+      Left("predicate is not a plain Tuple2 => Boolean method")
+    } else {
+      interpret(method, nullFilter = true, binaryInput = binaryInput).map(_ => ())
+    }
+  }
+
+  private def interpret(method: MethodNode): Either[String, IndexedSeq[SourceColumn]] =
+    interpret(method, nullFilter = false, binaryInput = false)
+
+  private def interpret(
+      method: MethodNode,
+      nullFilter: Boolean,
+      binaryInput: Boolean): Either[String, IndexedSeq[SourceColumn]] = {
     val instructions = method.instructions.toArray
     val positions = instructions.zipWithIndex.toMap
     val locals = Array.fill[Option[Symbol]](method.maxLocals)(None)
@@ -334,6 +436,8 @@ object SequenceFileRddReadProof {
     locals(0) = Some(InputPair)
     var index = 0
     var nextTupleId = 0
+    var valueNullTarget: Option[Int] = None
+    var booleanResult = false
     var result: Either[String, IndexedSeq[SourceColumn]] =
       Left("user closure does not return a proven tuple")
     var done = false
@@ -368,6 +472,15 @@ object SequenceFileRddReadProof {
       }
     }
 
+    def isFilterValue(symbol: Symbol): Boolean = {
+      if (binaryInput) symbol == Binary(Value) else symbol == Writable(Value)
+    }
+
+    def checkValue(target: LabelNode): Unit = {
+      if (valueNullTarget.nonEmpty) fail("predicate contains multiple value null checks")
+      else valueNullTarget = Some(positions(target))
+    }
+
     while (index < instructions.length && !done) {
       instructions(index) match {
         case _: LabelNode | _: LineNumberNode | _: FrameNode =>
@@ -388,15 +501,25 @@ object SequenceFileRddReadProof {
 
         case instruction: InsnNode => instruction.getOpcode match {
           case Opcodes.ICONST_0 => stack += Zero
+          case Opcodes.ICONST_1 if nullFilter => stack += One
+          case Opcodes.ACONST_NULL if nullFilter => stack += Null
           case Opcodes.DUP =>
             if (stack.nonEmpty) stack += stack.last else fail("stack underflow at DUP")
-          case Opcodes.ARETURN =>
+          case Opcodes.ARETURN if !nullFilter =>
             pop() match {
               case Some(OutputTuple(first, second)) if stack.isEmpty =>
                 val trailing = verifyFailureTail(instructions, index + 1, positions, nullTargets)
                 result = trailing.map(_ => IndexedSeq(first, second))
                 done = true
               case _ => fail("closure return value is not a proven binary tuple")
+            }
+          case Opcodes.IRETURN if nullFilter =>
+            pop() match {
+              case Some(One) if stack.isEmpty && valueNullTarget.nonEmpty && booleanResult =>
+                result = verifyFailureTail(instructions, index + 1, positions, nullTargets)
+                  .map(_ => IndexedSeq(Key, Value))
+                done = true
+              case _ => fail("predicate does not return the proven value null check")
             }
           case opcode => fail(s"unsupported instruction opcode $opcode")
         }
@@ -409,7 +532,9 @@ object SequenceFileRddReadProof {
           case Opcodes.CHECKCAST if instruction.desc ==
               "org/apache/hadoop/io/BytesWritable" &&
               stack.lastOption.exists(_.isInstanceOf[Writable]) =>
-          case Opcodes.NEW if instruction.desc == "scala/Tuple2" =>
+          case Opcodes.CHECKCAST if nullFilter && binaryInput && instruction.desc == "[B" &&
+              stack.lastOption.contains(Binary(Value)) =>
+          case Opcodes.NEW if !nullFilter && instruction.desc == "scala/Tuple2" =>
             stack += NewTuple(nextTupleId)
             nextTupleId += 1
           case opcode => fail(s"unsupported type instruction $opcode ${instruction.desc}")
@@ -418,7 +543,46 @@ object SequenceFileRddReadProof {
         case instruction: JumpInsnNode if instruction.getOpcode == Opcodes.IFNULL =>
           pop() match {
             case Some(InputPair) => nullTargets += positions(instruction.label)
+            case Some(value) if nullFilter && isFilterValue(value) => checkValue(instruction.label)
             case _ => fail("null check is not on the input tuple")
+          }
+
+        case instruction: JumpInsnNode if nullFilter &&
+            instruction.getOpcode == Opcodes.IF_ACMPEQ =>
+          popArgs(2) match {
+            case Some(IndexedSeq(value, Null)) if isFilterValue(value) =>
+              checkValue(instruction.label)
+            case _ => fail("predicate does not compare the value with null")
+          }
+
+        case instruction: JumpInsnNode if nullFilter &&
+            instruction.getOpcode == Opcodes.GOTO =>
+          val target = positions(instruction.label)
+          val skipped = instructions.slice(index + 1, target).filter(_.getOpcode >= 0)
+          val falseBranch = valueNullTarget.filter { position =>
+            position > index && position < target
+          }
+          if (booleanResult || !stack.lastOption.contains(One) || target <= index ||
+              falseBranch.isEmpty || skipped.length != 1 ||
+              skipped.head.getOpcode != Opcodes.ICONST_0 ||
+              instructions.slice(index + 1, falseBranch.get).exists(_.getOpcode >= 0)) {
+            fail("predicate does not have a plain Boolean result")
+          } else {
+            booleanResult = true
+            index = target - 1
+          }
+
+        case instruction: MethodInsnNode if nullFilter =>
+          if (instruction.owner == "scala/Tuple2" && instruction.name == "_2" &&
+              instruction.desc == "()Ljava/lang/Object;" &&
+              instruction.getOpcode == Opcodes.INVOKEVIRTUAL && !instruction.itf) {
+            val value = if (binaryInput) Binary(Value) else Writable(Value)
+            unary(pop _, InputPair, value, stack) match {
+              case Left(reason) => fail(reason)
+              case Right(_) =>
+            }
+          } else {
+            fail(s"unsupported predicate method ${instruction.owner}.${instruction.name}")
           }
 
         case instruction: MethodInsnNode =>

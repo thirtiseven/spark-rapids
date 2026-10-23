@@ -16,6 +16,7 @@
 
 package com.nvidia.spark.rapids
 
+import java.io.FileNotFoundException
 import java.util.concurrent.{Callable, CompletableFuture, CountDownLatch, Executors, TimeUnit}
 
 import ai.rapids.cudf.HostMemoryBuffer
@@ -23,6 +24,7 @@ import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.io.async.AsyncRunner
 import com.nvidia.spark.rapids.shims.PartitionedFileUtilsShim
 import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.Path
 import org.scalatest.funsuite.AnyFunSuite
 
 import org.apache.spark.TaskContext
@@ -32,6 +34,23 @@ import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 class GpuMultiFileReaderSuite extends AnyFunSuite with RmmSparkRetrySuiteBase {
+
+  test("coalescing async missing-file failure preserves the Hadoop file URI") {
+    val path = new Path("file:///tmp/missing ORC.orc")
+    val expectedPath = "file:///tmp/missing%20ORC.orc"
+    assert(path.toUri.toString === expectedPath)
+    val missingFile = new FileNotFoundException("missing ORC file")
+    val runner = AsyncRunner.newUnboundedTask[Unit](() => throw missingFile)
+    MultiFileReaderUtils.attachFilePathToMissingFile(runner, path)
+
+    val transformed = intercept[FileNotFoundException](runner.call())
+    transformed match {
+      case GpuFileNotFoundException(path, originalException) =>
+        assert(path === expectedPath)
+        assert(originalException eq missingFile)
+      case _ => fail(s"Missing-file failure did not carry its file path: $transformed")
+    }
+  }
 
   test("avoid infinite loop when host buffers empty") {
     val conf = new Configuration(false)

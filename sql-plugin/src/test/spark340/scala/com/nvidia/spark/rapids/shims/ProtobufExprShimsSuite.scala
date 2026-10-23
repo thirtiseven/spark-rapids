@@ -121,13 +121,16 @@ class ProtobufExprShimsSuite extends AnyFunSuite {
       extends FakeBaseProtobufExpr(child) {
     def messageName: String = "test.Message"
     def descFilePath: Option[String] = Some("/tmp/test.desc")
+    def binaryFileDescriptorSet: Option[Array[Byte]] =
+      Some("/tmp/test.desc".getBytes("UTF-8"))
     def options: scala.collection.Map[String, String] = Map("mode" -> "FAILFAST")
   }
 
   private case class FakeBytesProtobufExpr(override val child: Expression)
       extends FakeBaseProtobufExpr(child) {
     def messageName: String = "test.Message"
-    def binaryDescriptorSet: Array[Byte] = Array[Byte](1, 2, 3)
+    def descFilePath: Option[String] = Some("/tmp/bytes.desc")
+    def binaryFileDescriptorSet: Option[Array[Byte]] = Some(Array[Byte](1, 2, 3))
     def options: scala.collection.Map[String, String] =
       Map("mode" -> "PERMISSIVE", "enums.as.ints" -> "true")
   }
@@ -136,12 +139,16 @@ class ProtobufExprShimsSuite extends AnyFunSuite {
       extends FakeBaseProtobufExpr(child) {
     def messageName: String = "test.Message"
     def descFilePath: Option[String] = Some("/tmp/test.desc")
+    def binaryFileDescriptorSet: Option[Array[Byte]] =
+      Some("/tmp/test.desc".getBytes("UTF-8"))
   }
 
   private case class FakeDifferentMessageExpr(override val child: Expression)
       extends FakeBaseProtobufExpr(child) {
     def messageName: String = "test.OtherMessage"
     def descFilePath: Option[String] = Some("/tmp/test.desc")
+    def binaryFileDescriptorSet: Option[Array[Byte]] =
+      Some("/tmp/test.desc".getBytes("UTF-8"))
     def options: scala.collection.Map[String, String] = Map("mode" -> "FAILFAST")
   }
 
@@ -149,6 +156,8 @@ class ProtobufExprShimsSuite extends AnyFunSuite {
       extends FakeBaseProtobufExpr(child) {
     def messageName: String = "test.Message"
     def descFilePath: Option[String] = Some("/tmp/other.desc")
+    def binaryFileDescriptorSet: Option[Array[Byte]] =
+      Some("/tmp/other.desc".getBytes("UTF-8"))
     def options: scala.collection.Map[String, String] = Map("mode" -> "FAILFAST")
   }
 
@@ -156,6 +165,8 @@ class ProtobufExprShimsSuite extends AnyFunSuite {
       extends FakeBaseProtobufExpr(child) {
     def messageName: String = "test.Message"
     def descFilePath: Option[String] = Some("/tmp/test.desc")
+    def binaryFileDescriptorSet: Option[Array[Byte]] =
+      Some("/tmp/test.desc".getBytes("UTF-8"))
     def options: scala.collection.Map[String, String] = Map("mode" -> "PERMISSIVE")
   }
 
@@ -170,28 +181,6 @@ class ProtobufExprShimsSuite extends AnyFunSuite {
       newChild)
   }
 
-  private object FakeSpark34ProtobufUtils {
-    def buildDescriptor(messageName: String, descFilePath: Option[String]): String =
-      s"$messageName:${descFilePath.getOrElse("none")}"
-  }
-
-  private object FakeSpark35ProtobufUtils {
-    def buildDescriptor(messageName: String, binaryFileDescriptorSet: Option[Array[Byte]]): String =
-      s"$messageName:${binaryFileDescriptorSet.map(_.mkString(",")).getOrElse("none")}"
-  }
-
-  private object FakeSpark35RetryFailureProtobufUtils {
-    def buildDescriptor(
-        messageName: String,
-        binaryFileDescriptorSet: Option[Array[Byte]]): String = {
-      val bytes = binaryFileDescriptorSet.getOrElse(Array.emptyByteArray)
-      if (bytes.sameElements(Array[Byte](1, 2, 3))) {
-        throw new IllegalArgumentException(s"Unknown message $messageName")
-      }
-      s"$messageName:${bytes.mkString(",")}"
-    }
-  }
-
   private final class FakeFileDescriptorProto(syntax: String) {
     def getSyntax: String = syntax
   }
@@ -203,8 +192,6 @@ class ProtobufExprShimsSuite extends AnyFunSuite {
   private final class FakeModernDescriptor(syntax: String) {
     def getFile: FakeModernFileDescriptor = new FakeModernFileDescriptor(syntax)
   }
-
-  private final class FakeDescriptorWithExtensions(val descriptor: AnyRef)
 
   private final class FakeLegacyFileDescriptor(syntax: String) {
     def getSyntax: String = syntax
@@ -241,35 +228,16 @@ class ProtobufExprShimsSuite extends AnyFunSuite {
       enumMetadata: Option[ProtobufEnumMetadata] = None,
       messageDescriptor: Option[ProtobufMessageDescriptor] = None,
       referencedTypeSyntax: Option[String] = None) extends ProtobufFieldDescriptor {
-    override lazy val defaultValueResult: Either[String, Option[ProtobufDefaultValue]] =
+    override lazy val explicitDefaultValue: Either[String, Option[ProtobufDefaultValue]] =
       defaultValueError match {
         case Some(reason) => Left(reason)
         case None => Right(defaultValue)
       }
   }
 
-  test("compat extracts descriptor path and options from legacy expression") {
-    val exprInfo = SparkProtobufCompat.extractExprInfo(FakePathProtobufExpr(FakeExprChild()))
-    assert(exprInfo.isRight)
-    val info = exprInfo.toOption.get
-    assert(info.messageName == "test.Message")
-    assert(info.options == Map("mode" -> "FAILFAST"))
-    assert(info.descriptorSource ==
-      ProtobufDescriptorSource.DescriptorPath("/tmp/test.desc"))
-  }
-
-  test("compat extracts binary descriptor source and planner options") {
-    val exprInfo = SparkProtobufCompat.extractExprInfo(FakeBytesProtobufExpr(FakeExprChild()))
-    assert(exprInfo.isRight)
-    val info = exprInfo.toOption.get
-    info.descriptorSource match {
-      case ProtobufDescriptorSource.DescriptorBytes(bytes) =>
-        assert(bytes.sameElements(Array[Byte](1, 2, 3)))
-      case other =>
-        fail(s"Unexpected descriptor source: $other")
-    }
-    val plannerOptions = SparkProtobufCompat.parsePlannerOptions(info.options)
-    assert(plannerOptions ==
+  test("compat parses permissive enum planner options") {
+    assert(SparkProtobufCompat.parsePlannerOptions(
+      Map("mode" -> "PERMISSIVE", "enums.as.ints" -> "true")) ==
       Right(ProtobufPlannerOptions(enumsAsInts = true, failOnErrors = false)))
   }
 
@@ -284,73 +252,6 @@ class ProtobufExprShimsSuite extends AnyFunSuite {
     val result = SparkProtobufCompat.parsePlannerOptions(Map("mode" -> "unknown"))
 
     assert(result == Right(ProtobufPlannerOptions(enumsAsInts = false, failOnErrors = false)))
-  }
-
-  test("compat invokes Spark 3.4 descriptor builder with descriptor path") {
-    val buildMethod = FakeSpark34ProtobufUtils.getClass.getMethod(
-      "buildDescriptor", classOf[String], classOf[scala.Option[_]])
-
-    val result = SparkProtobufCompat.invokeBuildDescriptor(
-      buildMethod,
-      FakeSpark34ProtobufUtils,
-      "test.Message",
-      ProtobufDescriptorSource.DescriptorPath("/tmp/test.desc"),
-      _ => fail("path-to-bytes fallback should not be needed for Spark 3.4"))
-
-    assert(result == "test.Message:/tmp/test.desc")
-  }
-
-  test("compat retries descriptor path as bytes for Spark 3.5 descriptor builder") {
-    val buildMethod = FakeSpark35ProtobufUtils.getClass.getMethod(
-      "buildDescriptor", classOf[String], classOf[scala.Option[_]])
-    var readCalls = 0
-
-    val result = SparkProtobufCompat.invokeBuildDescriptor(
-      buildMethod,
-      FakeSpark35ProtobufUtils,
-      "test.Message",
-      ProtobufDescriptorSource.DescriptorPath("/tmp/test.desc"),
-      _ => {
-        readCalls += 1
-        Array[Byte](1, 2, 3)
-      })
-
-    assert(readCalls == 1)
-    assert(result == "test.Message:1,2,3")
-  }
-
-  test("compat passes bytes directly to Spark 3.5 descriptor builder") {
-    val buildMethod = FakeSpark35ProtobufUtils.getClass.getMethod(
-      "buildDescriptor", classOf[String], classOf[scala.Option[_]])
-
-    val result = SparkProtobufCompat.invokeBuildDescriptor(
-      buildMethod,
-      FakeSpark35ProtobufUtils,
-      "test.Message",
-      ProtobufDescriptorSource.DescriptorBytes(Array[Byte](4, 5, 6)),
-      _ => fail("binary descriptor source should not read a file"))
-
-    assert(result == "test.Message:4,5,6")
-  }
-
-  test("compat preserves retry context when descriptor bytes fallback also fails") {
-    val buildMethod = FakeSpark35RetryFailureProtobufUtils.getClass.getMethod(
-      "buildDescriptor", classOf[String], classOf[scala.Option[_]])
-
-    val ex = intercept[RuntimeException] {
-      SparkProtobufCompat.invokeBuildDescriptor(
-        buildMethod,
-        FakeSpark35RetryFailureProtobufUtils,
-        "test.Message",
-        ProtobufDescriptorSource.DescriptorPath("/tmp/test.desc"),
-        _ => Array[Byte](1, 2, 3))
-    }
-
-    assert(ex.getMessage.contains("descriptor bytes retry failed"))
-    assert(ex.getMessage.contains("ClassCastException"))
-    assert(ex.getMessage.contains("Unknown message test.Message"))
-    assert(ex.getCause.isInstanceOf[IllegalArgumentException])
-    assert(ex.getSuppressed.exists(_.isInstanceOf[java.lang.reflect.InvocationTargetException]))
   }
 
   test("compat distinguishes decode semantics across message descriptor and options") {
@@ -399,14 +300,6 @@ class ProtobufExprShimsSuite extends AnyFunSuite {
       new FakeDescriptorWithoutFile) == "")
   }
 
-  test("compat unwraps Spark 4.2 descriptor with extensions") {
-    val descriptor = new FakeModernDescriptor("proto2")
-
-    assert(SparkProtobufCompat.unwrapMessageDescriptor(
-      new FakeDescriptorWithExtensions(descriptor)) eq descriptor)
-    assert(SparkProtobufCompat.unwrapMessageDescriptor(descriptor) eq descriptor)
-  }
-
   test("compat rejects imported proto3 message and enum types") {
     val childSchema = StructType(Seq(StructField("value", IntegerType, nullable = true)))
     val proto3Child = FakeMessageDescriptor(
@@ -452,16 +345,7 @@ class ProtobufExprShimsSuite extends AnyFunSuite {
   }
 
   test("compat returns Left for unsupported default value types") {
-    val method = SparkProtobufCompat.getClass.getDeclaredMethods
-      .find(_.getName.endsWith("toDefaultValue"))
-      .getOrElse(fail("toDefaultValue method not found"))
-    method.setAccessible(true)
-
-    val result = method.invoke(
-      SparkProtobufCompat,
-      "opaque-default",
-      "MESSAGE",
-      scala.None).asInstanceOf[Either[String, ProtobufDefaultValue]]
+    val result = SparkProtobufCompat.toDefaultValue("opaque-default", "MESSAGE", None)
 
     assert(result.left.toOption.exists(_.contains("Unsupported protobuf default value type")))
   }
@@ -612,6 +496,38 @@ class ProtobufExprShimsSuite extends AnyFunSuite {
     assert(floatFromDouble.toOption.get.unsupportedReason.contains(
       "Spark FloatType mapped to Protobuf DOUBLE is not yet supported on GPU; " +
         "use DoubleType or fall back to CPU"))
+  }
+
+  test("validator preserves integer default semantics when widening uint32") {
+    for {
+      protoType <- Seq("UINT32", "INT32", "SINT32")
+      (rawDefault, unsignedDefault) <- Seq(
+        (0, 0L), (Int.MaxValue, Int.MaxValue.toLong),
+        (Int.MinValue, 1L << 31), (-1, (1L << 32) - 1))
+      sparkType <- Seq(IntegerType, LongType)
+    } {
+      withClue(s"$protoType raw default=$rawDefault output=$sparkType: ") {
+        val defaultValue = SparkProtobufCompat.toDefaultValue(
+          java.lang.Integer.valueOf(rawDefault), protoType, None)
+          .fold(fail(_), identity)
+        val field = StructField("value", sparkType)
+        val info = ProtobufSchemaExtractor.extractFieldInfo(field,
+          FakeFieldDescriptor("value", 1, protoType, defaultValue = Some(defaultValue)),
+          enumsAsInts = false).fold(fail(_), identity)
+        assert(info.isSupported)
+        val outputType = if (sparkType == LongType) DType.INT64 else DType.INT32
+        val flat = ProtobufSchemaValidator.toFlattenedFieldDescriptor(
+          "value", field, info, -1, 0, outputType.getTypeId.getNativeId, isOutput = true)
+          .fold(fail(_), identity)
+        val expected = if (protoType == "UINT32" && sparkType == LongType) {
+          unsignedDefault
+        } else {
+          rawDefault.toLong
+        }
+        assert(flat.hasDefaultValue)
+        assert(flat.defaultInt == expected)
+      }
+    }
   }
 
   test("validator encodes enum-string defaults into both numeric and string payloads") {
@@ -929,9 +845,10 @@ class ProtobufExprShimsSuite extends AnyFunSuite {
       defaultInts = Array(0L, 0L),
       defaultFloats = Array(0.0, 0.0),
       defaultBools = Array(false, false),
-      defaultStrings = Array(Array.emptyByteArray, Array.emptyByteArray),
-      enumValidValues = Array(Array.emptyIntArray, Array.emptyIntArray),
-      enumNames = Array(emptyEnumNames, emptyEnumNames),
+      defaultStrings = Array(Array[Byte](1, 2), Array[Byte](3)),
+      enumValidValues = Array(Array(0, 1), Array.emptyIntArray),
+      enumNames = Array(Array("UNKNOWN".getBytes("UTF-8"), "EN".getBytes("UTF-8")),
+        emptyEnumNames),
       failOnErrors = true,
       child = FakeExprChild())
 
@@ -950,12 +867,16 @@ class ProtobufExprShimsSuite extends AnyFunSuite {
       defaultInts = Array(0L, 0L),
       defaultFloats = Array(0.0, 0.0),
       defaultBools = Array(false, false),
-      defaultStrings = Array(Array.emptyByteArray, Array.emptyByteArray),
-      enumValidValues = Array(Array.emptyIntArray, Array.emptyIntArray),
-      enumNames = Array(emptyEnumNames.map(identity), emptyEnumNames.map(identity)),
+      defaultStrings = Array(Array[Byte](1, 2), Array[Byte](3)),
+      enumValidValues = Array(Array(0, 1), Array.emptyIntArray),
+      enumNames = Array(Array("UNKNOWN".getBytes("UTF-8"), "EN".getBytes("UTF-8")),
+        emptyEnumNames),
       failOnErrors = true,
       child = FakeExprChild())
 
+    assert(expr1 == expr2)
+    assert(expr1.hashCode() == expr2.hashCode())
+    assert(scala.collection.immutable.HashSet(expr1).contains(expr2))
     assert(expr1.semanticEquals(expr2))
     assert(expr1.semanticHash() == expr2.semanticHash())
   }

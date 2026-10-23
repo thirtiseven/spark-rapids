@@ -25,99 +25,6 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, UnaryEx
 import org.apache.spark.sql.types._
 
 /**
- * The level of support that the plugin has for a given type.  Used for documentation generation.
- */
-sealed abstract class SupportLevel {
-  def htmlTag: String
-  def text: String
-}
-
-/**
- * N/A neither spark nor the plugin supports this.
- */
-object NotApplicable extends SupportLevel {
-  override def htmlTag: String = "<td> </td>"
-  override def text: String = "NA"
-}
-
-/**
- * Spark supports this but the plugin does not.
- */
-object NotSupported extends SupportLevel {
-  override def htmlTag: String = s"<td><b>$text</b></td>"
-  override def text: String = "NS"
-}
-
-/**
- * Both Spark and the plugin support this.
- */
-class Supported() extends SupportLevel {
-  override def htmlTag: String = s"<td>$text</td>"
-  override def text: String = "S"
-}
-
-/**
- * The plugin partially supports this type.
- * @param missingChildTypes child types that are not supported
- * @param needsLitWarning true if we need to warn that we only support a literal value when Spark
- *                        does not.
- * @param note any other notes we want to include about not complete support.
- */
-class PartiallySupported(
-    val missingChildTypes: TypeEnum.ValueSet = TypeEnum.ValueSet(),
-    val needsLitWarning: Boolean = false,
-    val note: Option[String] = None) extends SupportLevel {
-  override def htmlTag: String = {
-    val typeStr = if (missingChildTypes.isEmpty) {
-      None
-    } else {
-      Some("unsupported child types " + missingChildTypes.mkString(", "))
-    }
-    val litOnly = if (needsLitWarning) {
-      Some("Literal value only")
-    } else {
-      None
-    }
-    val extraInfo = (note.toSeq ++ litOnly.toSeq ++ typeStr.toSeq).mkString(";<br/>")
-    val allText = s"$text<br/>$extraInfo"
-    s"<td><em>$allText</em></td>"
-  }
-
-  // don't include the extra info in the supported text field for now
-  // as the qualification tool doesn't use it
-  override def text: String = "PS"
-}
-
-/**
- * The Supported Types. The TypeSig API should be preferred for this, except in a few cases when
- * TypeSig asks for a TypeEnum.
- */
-object TypeEnum extends Enumeration {
-  type TypeEnum = Value
-
-  val BOOLEAN: Value = Value
-  val BYTE: Value = Value
-  val SHORT: Value = Value
-  val INT: Value = Value
-  val LONG: Value = Value
-  val FLOAT: Value = Value
-  val DOUBLE: Value = Value
-  val DATE: Value = Value
-  val TIMESTAMP: Value = Value
-  val STRING: Value = Value
-  val DECIMAL: Value = Value
-  val NULL: Value = Value
-  val BINARY: Value = Value
-  val CALENDAR: Value = Value
-  val ARRAY: Value = Value
-  val MAP: Value = Value
-  val STRUCT: Value = Value
-  val UDT: Value = Value
-  val DAYTIME: Value = Value
-  val YEARMONTH: Value = Value
-}
-
-/**
  * A type signature. This is a bit limited in what it supports right now, but can express
  * a set of base types and a separate set of types that can be nested under the base types
  * (child types). It can also express if a particular base type has to be a literal or not.
@@ -301,6 +208,7 @@ final class TypeSig private(
     case _: StructType => litOnlyTypes.contains(TypeEnum.STRUCT)
     case _: DayTimeIntervalType => litOnlyTypes.contains(TypeEnum.DAYTIME)
     case _: YearMonthIntervalType => litOnlyTypes.contains(TypeEnum.YEARMONTH)
+    case dt if GpuColumnVector.isVariantType(dt) => litOnlyTypes.contains(TypeEnum.VARIANT)
     case _ => false
   }
 
@@ -338,6 +246,7 @@ final class TypeSig private(
         }
       case _: DayTimeIntervalType => check.contains(TypeEnum.DAYTIME)
       case _: YearMonthIntervalType => check.contains(TypeEnum.YEARMONTH)
+      case dt if GpuColumnVector.isVariantType(dt) => check.contains(TypeEnum.VARIANT)
       case _ => false
     }
 
@@ -426,6 +335,8 @@ final class TypeSig private(
         basicNotSupportedMessage(dataType, TypeEnum.DAYTIME, check, isChild)
       case _: YearMonthIntervalType =>
         basicNotSupportedMessage(dataType, TypeEnum.YEARMONTH, check, isChild)
+      case dt if GpuColumnVector.isVariantType(dt) =>
+        basicNotSupportedMessage(dataType, TypeEnum.VARIANT, check, isChild)
       case _ => Seq(withChild(isChild, s"$dataType is not supported"))
     }
 
@@ -548,7 +459,11 @@ object TypeSig {
    * All types nested and not nested
    */
   val all: TypeSig = {
-    val allSupportedTypes: TypeEnum.ValueSet = TypeEnum.values
+    val allSupportedTypes = if (GpuTypeShims.supportsVariantType) {
+      TypeEnum.values
+    } else {
+      TypeEnum.values - TypeEnum.VARIANT
+    }
     new TypeSig(allSupportedTypes, DecimalType.MAX_PRECISION, allSupportedTypes)
   }
 
@@ -607,6 +522,11 @@ object TypeSig {
    * YearMonthIntervalType of Spark 3.2.0+ support
    */
   val YEARMONTH: TypeSig = new TypeSig(TypeEnum.ValueSet(TypeEnum.YEARMONTH))
+
+  /**
+   * Spark VariantType support. It is physically backed by a cudf struct column.
+   */
+  val VARIANT: TypeSig = new TypeSig(TypeEnum.ValueSet(TypeEnum.VARIANT))
 
   /**
    * A signature for types that are generally supported by the plugin/CUDF. Please make sure to
@@ -1303,40 +1223,40 @@ class CastChecks extends ExprChecks {
 
   def booleanChecks: TypeSig = integral + fp + BOOLEAN + STRING + DECIMAL_128 +
     CastCheckShims.additionalTypesBooleanCanCastTo
-  def sparkBooleanSig: TypeSig = cpuNumeric + BOOLEAN + STRING +
+  def sparkBooleanSig: TypeSig = cpuNumeric + BOOLEAN + STRING + VARIANT +
     CastCheckShims.additionalTypesBooleanCanCastTo
 
   val integralChecks: TypeSig = gpuNumeric + BOOLEAN + TIMESTAMP + STRING +
       BINARY + CastCheckShims.additionalTypesIntegralCanCastTo
   val sparkIntegralSig: TypeSig = cpuNumeric + BOOLEAN + TIMESTAMP + STRING +
-      BINARY + CastCheckShims.additionalTypesIntegralCanCastTo
+      BINARY + VARIANT + CastCheckShims.additionalTypesIntegralCanCastTo
 
   val fpToStringPsNote: String = s"Conversion may produce different results and requires " +
       s"${RapidsConf.ENABLE_CAST_FLOAT_TO_STRING} to be true."
   val fpChecks: TypeSig = (gpuNumeric + BOOLEAN + TIMESTAMP + STRING)
       .withPsNote(TypeEnum.STRING, fpToStringPsNote)
-  val sparkFpSig: TypeSig = cpuNumeric + BOOLEAN + TIMESTAMP + STRING
+  val sparkFpSig: TypeSig = cpuNumeric + BOOLEAN + TIMESTAMP + STRING + VARIANT
 
   def dateChecks: TypeSig = TIMESTAMP + DATE + STRING +
     CastCheckShims.additionalTypesDateCanCastTo
-  def sparkDateSig: TypeSig = DECIMAL_128 + TIMESTAMP + DATE + STRING +
+  def sparkDateSig: TypeSig = DECIMAL_128 + TIMESTAMP + DATE + STRING + VARIANT +
     CastCheckShims.additionalTypesDateCanCastTo
 
   def timestampChecks: TypeSig = integral + fp + TIMESTAMP + DATE + STRING +
     CastCheckShims.additionalTypesTimestampCanCastTo
-  def sparkTimestampSig: TypeSig = cpuNumeric + TIMESTAMP + DATE + STRING +
+  def sparkTimestampSig: TypeSig = cpuNumeric + TIMESTAMP + DATE + STRING + VARIANT +
     CastCheckShims.additionalTypesTimestampCanCastTo
 
   val stringChecks: TypeSig = gpuNumeric + BOOLEAN + TIMESTAMP + DATE + STRING +
       BINARY + CastCheckShims.additionalTypesStringCanCastTo
   val sparkStringSig: TypeSig = cpuNumeric + BOOLEAN + TIMESTAMP + DATE + CALENDAR + STRING +
-      BINARY + CastCheckShims.additionalTypesStringCanCastTo
+      BINARY + VARIANT + CastCheckShims.additionalTypesStringCanCastTo
 
   val binaryChecks: TypeSig = STRING + BINARY
-  val sparkBinarySig: TypeSig = STRING + BINARY
+  val sparkBinarySig: TypeSig = STRING + BINARY + VARIANT
 
   val decimalChecks: TypeSig = gpuNumeric + STRING
-  val sparkDecimalSig: TypeSig = cpuNumeric + BOOLEAN + TIMESTAMP + STRING
+  val sparkDecimalSig: TypeSig = cpuNumeric + BOOLEAN + TIMESTAMP + STRING + VARIANT
 
   val calendarChecks: TypeSig = none
   val sparkCalendarSig: TypeSig = CALENDAR + STRING
@@ -1347,7 +1267,7 @@ class CastChecks extends ExprChecks {
     psNote(TypeEnum.ARRAY, "The array's child type must also support being cast to the " +
       "desired child type(s)")
 
-  val sparkArraySig: TypeSig = STRING + ARRAY.nested(all)
+  val sparkArraySig: TypeSig = STRING + VARIANT + ARRAY.nested(all)
 
   val mapChecks: TypeSig = MAP.nested(commonCudfTypes + DECIMAL_128 + NULL + ARRAY + BINARY +
       STRUCT + MAP + GpuTypeShims.additionalCommonOperatorSupportedTypes) +
@@ -1363,6 +1283,10 @@ class CastChecks extends ExprChecks {
       psNote(TypeEnum.STRUCT, "the struct's children must also support being cast to the " +
           "desired child type(s)")
   val sparkStructSig: TypeSig = STRING + STRUCT.nested(all)
+
+  val variantChecks: TypeSig = VARIANT
+  val sparkVariantSig: TypeSig = cpuNumeric + BOOLEAN + TIMESTAMP + DATE + STRING + BINARY +
+      DECIMAL_128 + VARIANT + ARRAY.nested(all) + MAP.nested(all) + STRUCT.nested(all)
 
   val udtChecks: TypeSig = none
   val sparkUdtSig: TypeSig = STRING + UDT
@@ -1389,6 +1313,7 @@ class CastChecks extends ExprChecks {
     case _: StructType => (structChecks, sparkStructSig)
     case _: DayTimeIntervalType => getChecksAndSigs(TypeEnum.DAYTIME)
     case _: YearMonthIntervalType => getChecksAndSigs(TypeEnum.YEARMONTH)
+    case dt if GpuColumnVector.isVariantType(dt) => (variantChecks, sparkVariantSig)
     case _ => getChecksAndSigs(TypeEnum.UDT) // default to UDT
   }
 
@@ -1410,6 +1335,7 @@ class CastChecks extends ExprChecks {
     case TypeEnum.UDT => (udtChecks, sparkUdtSig)
     case TypeEnum.DAYTIME => (daytimeChecks, sparkDaytimeChecks)
     case TypeEnum.YEARMONTH => (yearmonthChecks, sparkYearmonthChecks)
+    case TypeEnum.VARIANT => (variantChecks, sparkVariantSig)
   }
 
   override def tagAst(meta: BaseExprMeta[_]): Unit = {
@@ -1744,7 +1670,8 @@ object ExprChecks {
  * Used for generating the support docs.
  */
 object SupportedOpsDocs {
-  private lazy val allSupportedTypes: TypeEnum.ValueSet = TypeEnum.values
+  private lazy val allSupportedTypes: TypeEnum.ValueSet =
+    if (GpuTypeShims.supportsVariantType) TypeEnum.values else TypeEnum.values - TypeEnum.VARIANT
 
   private def execChecksHeaderLine(): Unit = {
     ConsoleOutput.writeLine("<tr>")
@@ -2236,7 +2163,8 @@ object SupportedOpsDocs {
 
 object SupportedOpsForTools {
 
-  private lazy val allSupportedTypes: TypeEnum.ValueSet = TypeEnum.values
+  private lazy val allSupportedTypes: TypeEnum.ValueSet =
+    if (GpuTypeShims.supportsVariantType) TypeEnum.values else TypeEnum.values - TypeEnum.VARIANT
 
   // if a string contains what we are going to use for a delimiter, replace
   // it with something else

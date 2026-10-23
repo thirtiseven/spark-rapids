@@ -69,14 +69,16 @@ private[rapids] final class GpuSequenceFileSerializeFromObjectExecMeta(
           willNotWorkOnGpu("SequenceFile RDD replacement requires key and value exactly once")
         } else {
           sourceIgnoreFlags(proven.sourceRdd) match {
-            case Right(false) => provenRead = Some(proven)
-            case Right(true) => willNotWorkOnGpu(
-              "SequenceFile RDD replacement does not support ignoring missing or corrupt files")
-            case Left(reason) => willNotWorkOnGpu(reason)
+            case Right(flags) if flags.isEmpty => provenRead = Some(proven)
+            case Right(flags) => willNotWorkOnGpu(
+              "SequenceFile RDD replacement: source configuration does not support " +
+                s"ignoring missing or corrupt files (${flags.mkString(", ")})")
+            case Left(reason) => willNotWorkOnGpu(
+              s"SequenceFile RDD replacement: source configuration: $reason")
           }
         }
       case SequenceFileRddReadProof.Rejected(reason) =>
-        willNotWorkOnGpu(reason)
+        willNotWorkOnGpu(s"SequenceFile RDD replacement: $reason")
     }
   }
 
@@ -95,7 +97,7 @@ private[rapids] final class GpuSequenceFileSerializeFromObjectExecMeta(
   }
 
   private def sourceIgnoreFlags(
-      source: NewHadoopRDD[Any, Any]): Either[String, Boolean] = {
+      source: NewHadoopRDD[Any, Any]): Either[String, Seq[String]] = {
     try {
       val sourceClass = classOf[NewHadoopRDD[_, _]]
       val methods = sourceClass.getDeclaredMethods
@@ -111,11 +113,11 @@ private[rapids] final class GpuSequenceFileSerializeFromObjectExecMeta(
             field.getType == java.lang.Boolean.TYPE).map { field =>
           field.setAccessible(true)
           field.getBoolean(source)
-        }).toRight(s"cannot inspect NewHadoopRDD $suffix")
+        }).toRight(s"cannot inspect NewHadoopRDD $suffix").map(value => suffix -> value)
       }
       flags.collectFirst { case Left(reason) => reason } match {
         case Some(reason) => Left(reason)
-        case None => Right(flags.collect { case Right(value) => value }.exists(identity))
+        case None => Right(flags.collect { case Right((name, true)) => s"$name=true" })
       }
     } catch {
       case NonFatal(e) =>

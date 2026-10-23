@@ -16,90 +16,16 @@
 
 package org.apache.spark.sql.rapids.protobuf
 
-import java.util.Arrays
+import java.util.{Arrays, Objects}
 
 import org.apache.spark.sql.types.DataType
 
-sealed trait ProtobufDescriptorSource
-
-object ProtobufDescriptorSource {
-  final case class DescriptorPath(path: String) extends ProtobufDescriptorSource
-  final case class DescriptorBytes(bytes: Array[Byte]) extends ProtobufDescriptorSource {
-    override def equals(other: Any): Boolean = other match {
-      case DescriptorBytes(otherBytes) => Arrays.equals(bytes, otherBytes)
-      case _ => false
-    }
-
-    override def hashCode(): Int = Arrays.hashCode(bytes)
-  }
-}
-
-final case class ProtobufExprInfo(
-    messageName: String,
-    descriptorSource: ProtobufDescriptorSource,
-    options: Map[String, String])
-
+/** Planning flags for enum representation and malformed-message handling. */
 final case class ProtobufPlannerOptions(
     enumsAsInts: Boolean,
     failOnErrors: Boolean)
 
-sealed trait ProtobufDefaultValue
-
-object ProtobufDefaultValue {
-  final case class BoolValue(value: Boolean) extends ProtobufDefaultValue
-  final case class IntValue(value: Long) extends ProtobufDefaultValue
-  final case class FloatValue(value: Float) extends ProtobufDefaultValue
-  final case class DoubleValue(value: Double) extends ProtobufDefaultValue
-  final case class StringValue(value: String) extends ProtobufDefaultValue
-  final case class BinaryValue(value: Array[Byte]) extends ProtobufDefaultValue {
-    override def equals(other: Any): Boolean = other match {
-      case BinaryValue(otherBytes) => Arrays.equals(value, otherBytes)
-      case _ => false
-    }
-
-    override def hashCode(): Int = Arrays.hashCode(value)
-  }
-  final case class EnumValue(number: Int, name: String) extends ProtobufDefaultValue
-}
-
-final case class ProtobufEnumValue(number: Int, name: String)
-
-final case class ProtobufEnumMetadata(values: Seq[ProtobufEnumValue]) {
-  private lazy val valuesByNumber = values.sortBy(_.number)
-
-  lazy val hasAliases: Boolean = valuesByNumber
-    .sliding(2)
-    .exists(pair => pair.length == 2 && pair.head.number == pair.last.number)
-  lazy val validValues: Array[Int] = valuesByNumber.map(_.number).toArray
-  lazy val orderedNames: Array[Array[Byte]] =
-    valuesByNumber.map(_.name.getBytes("UTF-8")).toArray
-  lazy val namesByNumber: Map[Int, String] = valuesByNumber.map(v => v.number -> v.name).toMap
-
-  def enumDefault(number: Int): ProtobufDefaultValue.EnumValue = {
-    val name = namesByNumber.getOrElse(number, number.toString)
-    ProtobufDefaultValue.EnumValue(number, name)
-  }
-}
-
-trait ProtobufMessageDescriptor {
-  def syntax: String
-  def javaStringCheckUtf8: Boolean = false
-  def findField(name: String): Option[ProtobufFieldDescriptor]
-}
-
-trait ProtobufFieldDescriptor {
-  def name: String
-  def fieldNumber: Int
-  def protoTypeName: String
-  def isRepeated: Boolean
-  def isRequired: Boolean
-  def isInOneof: Boolean
-  def defaultValueResult: Either[String, Option[ProtobufDefaultValue]]
-  def enumMetadata: Option[ProtobufEnumMetadata]
-  def messageDescriptor: Option[ProtobufMessageDescriptor]
-  def referencedTypeSyntax: Option[String]
-}
-
+/** Extracted facts for one Spark field; unsupported fields retain a fallback reason. */
 final case class ProtobufFieldInfo(
     fieldNumber: Int,
     protoTypeName: String,
@@ -111,9 +37,14 @@ final case class ProtobufFieldInfo(
     defaultValue: Option[ProtobufDefaultValue],
     enumMetadata: Option[ProtobufEnumMetadata],
     isRepeated: Boolean = false) {
+  /** Whether an explicit default value is available for JNI schema preparation. */
   def hasDefaultValue: Boolean = defaultValue.isDefined
 }
 
+/**
+ * One JNI schema entry; parentIdx indexes the flattened sequence (-1 for a top-level field).
+ * Array payloads are mutable and are compared by content.
+ */
 final case class FlattenedFieldDescriptor(
     fieldNumber: Int,
     parentIdx: Int,
@@ -154,27 +85,18 @@ final case class FlattenedFieldDescriptor(
     case _ => false
   }
 
-  override def hashCode(): Int = {
-    var result = fieldNumber
-    result = 31 * result + parentIdx
-    result = 31 * result + depth
-    result = 31 * result + wireType
-    result = 31 * result + outputTypeId
-    result = 31 * result + encoding
-    result = 31 * result + isRepeated.hashCode()
-    result = 31 * result + isRequired.hashCode()
-    result = 31 * result + hasDefaultValue.hashCode()
-    result = 31 * result + isOutput.hashCode()
-    result = 31 * result + defaultInt.hashCode()
-    result = 31 * result + defaultFloat.hashCode()
-    result = 31 * result + defaultBool.hashCode()
-    result = 31 * result + Arrays.hashCode(defaultString)
-    result = 31 * result + Arrays.hashCode(enumValidValues)
-    result = 31 * result + Arrays.deepHashCode(enumNames.asInstanceOf[Array[Object]])
-    result
-  }
+  override def hashCode(): Int = Objects.hash(
+    Int.box(fieldNumber), Int.box(parentIdx), Int.box(depth),
+    Int.box(wireType), Int.box(outputTypeId), Int.box(encoding),
+    Boolean.box(isRepeated), Boolean.box(isRequired),
+    Boolean.box(hasDefaultValue), Boolean.box(isOutput),
+    Long.box(defaultInt), Double.box(defaultFloat), Boolean.box(defaultBool),
+    Int.box(Arrays.hashCode(defaultString)),
+    Int.box(Arrays.hashCode(enumValidValues)),
+    Int.box(Arrays.deepHashCode(enumNames.asInstanceOf[Array[Object]])))
 }
 
+/** Mutable parallel JNI arguments indexed in flattened-field order, with content-based equality. */
 final case class FlattenedSchemaArrays(
     fieldNumbers: Array[Int],
     parentIndices: Array[Int],
@@ -219,23 +141,21 @@ final case class FlattenedSchemaArrays(
     case _ => false
   }
 
-  override def hashCode(): Int = {
-    var result = Arrays.hashCode(fieldNumbers)
-    result = 31 * result + Arrays.hashCode(parentIndices)
-    result = 31 * result + Arrays.hashCode(depthLevels)
-    result = 31 * result + Arrays.hashCode(wireTypes)
-    result = 31 * result + Arrays.hashCode(outputTypeIds)
-    result = 31 * result + Arrays.hashCode(encodings)
-    result = 31 * result + Arrays.hashCode(isRepeated)
-    result = 31 * result + Arrays.hashCode(isRequired)
-    result = 31 * result + Arrays.hashCode(hasDefaultValue)
-    result = 31 * result + Arrays.hashCode(isOutput)
-    result = 31 * result + Arrays.hashCode(defaultInts)
-    result = 31 * result + Arrays.hashCode(defaultFloats)
-    result = 31 * result + Arrays.hashCode(defaultBools)
-    result = 31 * result + Arrays.deepHashCode(defaultStrings.asInstanceOf[Array[Object]])
-    result = 31 * result + Arrays.deepHashCode(enumValidValues.asInstanceOf[Array[Object]])
-    result = 31 * result + Arrays.deepHashCode(enumNames.asInstanceOf[Array[Object]])
-    result
-  }
+  override def hashCode(): Int = Objects.hash(
+    Int.box(Arrays.hashCode(fieldNumbers)),
+    Int.box(Arrays.hashCode(parentIndices)),
+    Int.box(Arrays.hashCode(depthLevels)),
+    Int.box(Arrays.hashCode(wireTypes)),
+    Int.box(Arrays.hashCode(outputTypeIds)),
+    Int.box(Arrays.hashCode(encodings)),
+    Int.box(Arrays.hashCode(isRepeated)),
+    Int.box(Arrays.hashCode(isRequired)),
+    Int.box(Arrays.hashCode(hasDefaultValue)),
+    Int.box(Arrays.hashCode(isOutput)),
+    Int.box(Arrays.hashCode(defaultInts)),
+    Int.box(Arrays.hashCode(defaultFloats)),
+    Int.box(Arrays.hashCode(defaultBools)),
+    Int.box(Arrays.deepHashCode(defaultStrings.asInstanceOf[Array[Object]])),
+    Int.box(Arrays.deepHashCode(enumValidValues.asInstanceOf[Array[Object]])),
+    Int.box(Arrays.deepHashCode(enumNames.asInstanceOf[Array[Object]])))
 }

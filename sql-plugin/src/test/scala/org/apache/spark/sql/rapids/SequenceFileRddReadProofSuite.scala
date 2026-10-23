@@ -87,8 +87,9 @@ class SequenceFileRddReadProofSuite extends AnyFunSuite with BeforeAndAfterAll {
     }
   }
 
-  private def assertRejected(df: DataFrame, expectedReason: String = ""): Unit = inspect(df) match {
-    case SequenceFileRddReadProof.Rejected(reason) => assert(reason.contains(expectedReason))
+  private def assertRejected(df: DataFrame, expectedReasons: String*): Unit = inspect(df) match {
+    case SequenceFileRddReadProof.Rejected(reason) =>
+      expectedReasons.foreach(expected => assert(reason.contains(expected), reason))
     case proof => fail(s"expected rejection, found $proof")
   }
 
@@ -113,12 +114,147 @@ class SequenceFileRddReadProofSuite extends AnyFunSuite with BeforeAndAfterAll {
     assertProven(copies)
   }
 
+  test("rejection identifies the serializer shape") {
+    val session = spark
+    import session.implicits._
+    val df = source().map { pair =>
+      (pair._1.copyBytes(), pair._2.copyBytes(), pair._2.copyBytes())
+    }.toDF("key", "value", "extra")
+
+    assertRejected(df, "serializer: expected a two-column serializer, found 3 columns")
+  }
+
+  test("rejection identifies the source RDD and actual input format") {
+    val local = spark.sparkContext.parallelize(
+      Seq((new BytesWritable(), new BytesWritable()))).map { pair =>
+      (pair._1.copyBytes(), pair._2.copyBytes())
+    }
+    assertRejected(binaryDataFrame(local), "RDD layer 1 from scan", "ParallelCollectionRDD",
+      "expected NewHadoopRDD")
+
+    val otherFormat = new NewHadoopRDD[BytesWritable, BytesWritable](
+      spark.sparkContext,
+      classOf[org.apache.hadoop.mapreduce.lib.input.SequenceFileInputFormat[
+        BytesWritable, BytesWritable]],
+      classOf[BytesWritable], classOf[BytesWritable],
+      new Configuration(spark.sparkContext.hadoopConfiguration))
+    val copied = otherFormat.map(pair => (pair._1.copyBytes(), pair._2.copyBytes()))
+    assertRejected(binaryDataFrame(copied), "RDD layer 1 from scan", "NewHadoopRDD",
+      "expected SequenceFileAsBinaryInputFormat, found " +
+        "org.apache.hadoop.mapreduce.lib.input.SequenceFileInputFormat")
+  }
+
   test("track key and value provenance") {
     val df = binaryDataFrame(source().map { pair =>
       (pair._2.copyBytes(), pair._1.copyBytes())
     }, "first" -> "second")
 
     assertProven(df, Seq(SequenceFileRddReadProof.Value, SequenceFileRddReadProof.Key))
+  }
+
+  test("prove a value null filter before the binary copy") {
+    val df = binaryDataFrame(source().filter { case (_, value) => value != null }.map { pair =>
+      (pair._1.copyBytes(), pair._2.copyBytes())
+    })
+
+    assertProven(df)
+  }
+
+  test("prove a value null filter after the binary copy") {
+    val df = binaryDataFrame(source().map { pair =>
+      (pair._1.copyBytes(), pair._2.copyBytes())
+    }.filter { case (_, value) => value != null })
+
+    assertProven(df)
+  }
+
+  test("track provenance through value null filters") {
+    val df = binaryDataFrame(source()
+      .filter(_._2 != null)
+      .filter { case (_, value) => value != null }
+      .map(pair => (pair._2.copyBytes(), pair._1.copyBytes()))
+      .filter { case (_, value) => value != null }
+      .filter(_._2 != null))
+
+    assertProven(df, Seq(SequenceFileRddReadProof.Value, SequenceFileRddReadProof.Key))
+  }
+
+  test("reject predicates beyond a value null check") {
+    val copied = source().map(pair => (pair._1.copyBytes(), pair._2.copyBytes()))
+    val predicates = Seq[((Array[Byte], Array[Byte])) => Boolean](
+      { case (_, value) => value == null },
+      { case (_, value) => value != null && value.length > 0 },
+      { case (key, _) => key != null },
+      _ => true)
+
+    predicates.foreach(predicate => assertRejected(binaryDataFrame(copied.filter(predicate))))
+  }
+
+  test("reject filter side effects without executing the predicate") {
+    val counter = new AtomicInteger()
+    val df = binaryDataFrame(source().filter { pair =>
+      counter.incrementAndGet()
+      pair._2 != null
+    }.map(pair => (pair._1.copyBytes(), pair._2.copyBytes())))
+
+    assertRejected(df)
+    assert(counter.get() == 0)
+  }
+
+  test("reject a predicate with a non-capturing method call") {
+    val df = binaryDataFrame(source().filter { pair =>
+      System.nanoTime()
+      pair._2 != null
+    }.map(pair => (pair._1.copyBytes(), pair._2.copyBytes())))
+
+    assertRejected(df)
+  }
+
+  test("bound inspection of repeated value null filters") {
+    var filtered = source()
+    var index = 0
+    while (index < 64) {
+      filtered = filtered.filter(_._2 != null)
+      index += 1
+    }
+    val df = binaryDataFrame(filtered.map(pair => (pair._1.copyBytes(), pair._2.copyBytes())))
+
+    assertRejected(df)
+  }
+
+  test("reject a different map surrounded by value null filters") {
+    val df = binaryDataFrame(source().filter(_._2 != null)
+      .map(pair => (pair._1.copyBytes(), pair._2.copyBytes()))
+      .map(identity)
+      .filter(_._2 != null))
+
+    assertRejected(df)
+  }
+
+  test("reject persisted and checkpointed filters") {
+    val checkpointDir = Files.createTempDirectory("sequence-file-filter-checkpoint").toFile
+    val persisted = source().filter(_._2 != null).cache()
+    try {
+      assertRejected(binaryDataFrame(persisted.map { pair =>
+        (pair._1.copyBytes(), pair._2.copyBytes())
+      }), "is persisted")
+      spark.sparkContext.setCheckpointDir(checkpointDir.getAbsolutePath)
+      val checkpointed = source().map(pair => (pair._1.copyBytes(), pair._2.copyBytes()))
+        .filter(_._2 != null)
+      checkpointed.checkpoint()
+      assertRejected(binaryDataFrame(checkpointed), "has checkpoint state")
+    } finally {
+      persisted.unpersist()
+      Utils.deleteRecursively(checkpointDir)
+    }
+  }
+
+  test("reject a filter resource profile") {
+    val profile = ResourceProfile.getOrCreateDefaultProfile(spark.sparkContext.getConf)
+    val filtered = source().filter(_._2 != null).withResources(profile)
+    val df = binaryDataFrame(filtered.map(pair => (pair._1.copyBytes(), pair._2.copyBytes())))
+
+    assertRejected(df, "has a resource profile")
   }
 
   test("reject partial and mismatched copies") {
@@ -145,7 +281,8 @@ class SequenceFileRddReadProofSuite extends AnyFunSuite with BeforeAndAfterAll {
     })
 
     assertRejected(raw, "Tuple2 is not constructed from two proven binary values")
-    assertRejected(captured, "user closure captures state")
+    assertRejected(captured, "RDD layer 0 from scan", "MapPartitionsRDD.map",
+      "expected full copies of key/value bytes", "user closure captures state")
   }
 
   test("reject casts that change closure failure behavior") {
@@ -193,7 +330,8 @@ class SequenceFileRddReadProofSuite extends AnyFunSuite with BeforeAndAfterAll {
       (pair._1.copyBytes(), pair._2.copyBytes())
     })
 
-    assertRejected(df, "expected NewHadoopRDD")
+    assertRejected(df, "RDD layer 1 from scan", "MapPartitionsRDD.filter",
+      "expected value != null", "unsupported predicate method scala/Tuple2._1")
   }
 
   test("reject NewHadoopRDD subclasses") {
@@ -219,7 +357,7 @@ class SequenceFileRddReadProofSuite extends AnyFunSuite with BeforeAndAfterAll {
       }
       mapped.checkpoint()
 
-      assertRejected(binaryDataFrame(mapped), "has checkpoint state")
+      assertRejected(binaryDataFrame(mapped), "RDD layer 0 from scan", "has checkpoint state")
     } finally {
       Utils.deleteRecursively(checkpointDir)
     }
@@ -234,7 +372,8 @@ class SequenceFileRddReadProofSuite extends AnyFunSuite with BeforeAndAfterAll {
       (pair._1.copyBytes(), pair._2.copyBytes())
     }.withResources(profile)
 
-    assertRejected(binaryDataFrame(sourceProfile), "source RDD has a resource profile")
+    assertRejected(binaryDataFrame(sourceProfile), "RDD layer 1 from scan", "NewHadoopRDD",
+      "source RDD has a resource profile")
     assertRejected(binaryDataFrame(mappedProfile), "mapped RDD has a resource profile")
   }
 
@@ -245,7 +384,7 @@ class SequenceFileRddReadProofSuite extends AnyFunSuite with BeforeAndAfterAll {
       }
     })
 
-    assertRejected(df, "not the Spark RDD.map wrapper")
+    assertRejected(df, "not a supported Spark RDD wrapper")
   }
 
   test("reject a non-binary tuple serializer") {

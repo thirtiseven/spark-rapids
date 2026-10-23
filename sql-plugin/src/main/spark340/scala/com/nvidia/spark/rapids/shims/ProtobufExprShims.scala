@@ -75,6 +75,7 @@ object ProtobufExprShims extends org.apache.spark.internal.Logging {
   private[this] val protobufDataToCatalystClassName =
     "org.apache.spark.sql.protobuf.ProtobufDataToCatalyst"
 
+  /** GPU expression rules, or an empty map when the optional spark-protobuf APIs cannot load. */
   def exprs: Map[Class[_ <: Expression], ExprRule[_ <: Expression]] = {
     try {
       val clazz = ShimReflectionUtils.loadClass(protobufDataToCatalystClassName)
@@ -305,7 +306,7 @@ object ProtobufExprShims extends org.apache.spark.internal.Logging {
                 return
               }, flatFields += _)
 
-              // For nested struct types (including repeated message = ArrayType(StructType)), 
+              // For nested struct types (including repeated message = ArrayType(StructType)),
               // add child fields
               sf.dataType match {
                 case st: StructType if containingMsgDesc != null =>
@@ -313,15 +314,15 @@ object ProtobufExprShims extends org.apache.spark.internal.Logging {
                   // expansion path; the flat parent entry's isRepeated flag distinguishes them.
                   addChildFieldsFromStruct(
                     st, containingMsgDesc, sf.name, currentIdx, depth, isOutput, pathPrefix)
-                  
+
                 case ArrayType(st: StructType, _) if containingMsgDesc != null =>
                   addChildFieldsFromStruct(
                     st, containingMsgDesc, sf.name, currentIdx, depth, isOutput, pathPrefix)
-                  
+
                 case _ => // Not a struct, no children to add
               }
             }
-            
+
             // Helper to add child fields from a struct type.
             // Applies nested schema pruning at arbitrary depth using path-based
             // lookup into nestedFieldRequirements.
@@ -493,7 +494,7 @@ object ProtobufExprShims extends org.apache.spark.internal.Logging {
                   collectStructFieldReferences(
                     _, fieldReqs, holder, allowSemanticReferenceMatch))
                 advanceToParent()
-              case _: org.apache.spark.sql.execution.window.WindowExec =>
+              case window: SparkPlan if SparkShimImpl.isWindowFunctionExec(window) =>
                 planMeta match {
                   case windowMeta: GpuBaseWindowExecMeta[_] =>
                     windowMeta.getInputWindowExpressions.foreach(

@@ -17,6 +17,7 @@
 package com.nvidia.spark.rapids
 
 import java.io.File
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 
 import scala.collection.JavaConverters._
@@ -24,8 +25,11 @@ import scala.collection.JavaConverters._
 import ai.rapids.cudf.{ColumnVector, ContiguousTable, Cuda, HostColumnVector, Table}
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.format.CodecType
-import org.apache.arrow.memory.RootAllocator
-import org.apache.arrow.vector.IntVector
+import org.apache.arrow.memory.{BufferAllocator, RootAllocator}
+import org.apache.arrow.vector.{BaseFixedWidthVector, BaseLargeVariableWidthVector,
+  BaseVariableWidthVector, BigIntVector, BitVector, DateDayVector, FieldVector, Float4Vector,
+  Float8Vector, IntVector, LargeVarCharVector, SmallIntVector, TimeStampMicroTZVector,
+  TinyIntVector, VarBinaryVector, VarCharVector}
 import org.apache.arrow.vector.complex.ListVector
 import org.apache.arrow.vector.complex.MapVector
 import org.apache.arrow.vector.types.{DateUnit, FloatingPointPrecision, TimeUnit}
@@ -347,7 +351,203 @@ class GpuCoalesceBatchesSuite extends SparkQueryCompareTestSuite {
       isInstanceOf[GpuColumnVector.GpuColumnarBatchBuilder])
   }
 
-  test("test GpuArrowColumnarBatchBuilder retains reference of ArrowBuf") {
+  private def setArrowValue(vector: FieldVector, i: Int, value: Any): Unit = (vector, value) match {
+    case (v: BaseFixedWidthVector, null) => v.setNull(i)
+    case (v: BaseVariableWidthVector, null) => v.setNull(i)
+    case (v: BaseLargeVariableWidthVector, null) => v.setNull(i)
+    case (v: BitVector, b: Boolean) => v.setSafe(i, if (b) 1 else 0)
+    case (v: TinyIntVector, b: Byte) => v.setSafe(i, b)
+    case (v: SmallIntVector, s: Short) => v.setSafe(i, s)
+    case (v: IntVector, n: Int) => v.setSafe(i, n)
+    case (v: DateDayVector, n: Int) => v.setSafe(i, n)
+    case (v: BigIntVector, n: Long) => v.setSafe(i, n)
+    case (v: TimeStampMicroTZVector, n: Long) => v.setSafe(i, n)
+    case (v: Float4Vector, f: Float) => v.setSafe(i, f)
+    case (v: Float8Vector, d: Double) => v.setSafe(i, d)
+    case (v: VarCharVector, s: String) => v.setSafe(i, s.getBytes(StandardCharsets.UTF_8))
+    case (v: LargeVarCharVector, s: String) => v.setSafe(i, s.getBytes(StandardCharsets.UTF_8))
+    case (v: VarBinaryVector, b: Array[Byte]) => v.setSafe(i, b)
+  }
+
+  private def arrowVector(
+      allocator: BufferAllocator,
+      field: StructField,
+      values: Seq[Any]): ArrowColumnVector = {
+    val vector = toArrowField(field.name, field.dataType, field.nullable, "UTC")
+      .createVector(allocator)
+    vector.allocateNew()
+    values.zipWithIndex.foreach { case (value, i) => setArrowValue(vector, i, value) }
+    vector.setValueCount(values.length)
+    new ArrowColumnVector(vector)
+  }
+
+  private def arrowBatch(
+      allocator: BufferAllocator,
+      schema: StructType,
+      columns: Seq[Seq[Any]]): ColumnarBatch = {
+    val vectors = schema.fields.toSeq.zip(columns).map { case (field, values) =>
+      arrowVector(allocator, field, values)
+    }
+    new ColumnarBatch(vectors.toArray, columns.head.length)
+  }
+
+  private def hostValue(cv: RapidsHostColumnVector, dataType: DataType, i: Int): Any = {
+    if (cv.isNullAt(i)) {
+      null
+    } else {
+      dataType match {
+        case BooleanType => cv.getBoolean(i)
+        case ByteType => cv.getByte(i)
+        case ShortType => cv.getShort(i)
+        case IntegerType | DateType => cv.getInt(i)
+        case LongType | TimestampType => cv.getLong(i)
+        case FloatType => cv.getFloat(i)
+        case DoubleType => cv.getDouble(i)
+        case StringType => cv.getUTF8String(i).toString
+        case BinaryType => cv.getBinary(i).toSeq
+      }
+    }
+  }
+
+  /** Checks each column of a GPU batch against the expected values of its rows. */
+  private def assertColumns(
+      schema: StructType,
+      expected: Seq[Seq[Any]],
+      gpuBatch: ColumnarBatch): Unit = {
+    assertResult(expected.head.length)(gpuBatch.numRows())
+    schema.fields.zip(expected).zipWithIndex.foreach { case ((field, values), c) =>
+      withResource(gpuBatch.column(c).asInstanceOf[GpuColumnVector].copyToHost()) { host =>
+        val normalized = values.map {
+          case b: Array[Byte] => b.toSeq
+          case v => v
+        }
+        assertResult(normalized, field.name)(values.indices.map(hostValue(host, field.dataType, _)))
+      }
+    }
+  }
+
+  private def arrowCoalesce(
+      batches: Iterator[ColumnarBatch],
+      schema: StructType): HostToGpuCoalesceIterator = {
+    new HostToGpuCoalesceIterator(batches, TargetSize(1024 * 1024), schema,
+      NoopMetric, NoopMetric, NoopMetric, NoopMetric, NoopMetric, NoopMetric, NoopMetric,
+      NoopMetric, "testcoalesce", useArrowCopyOpt = true)
+  }
+
+  test("HostToGpuCoalesceIterator copies Arrow vectors with the Arrow builder") {
+    val schema = StructType(Seq(
+      StructField("bool", BooleanType), StructField("byte", ByteType),
+      StructField("short", ShortType), StructField("int", IntegerType),
+      StructField("long", LongType), StructField("float", FloatType),
+      StructField("double", DoubleType), StructField("date", DateType),
+      StructField("ts", TimestampType), StructField("str", StringType),
+      StructField("bin", BinaryType)))
+    def rows(n: Int, seed: Int): Seq[Seq[Any]] = {
+      // Every column has a null, in a different row for each, except in the last batch.
+      def column(c: Int)(value: Int => Any): Seq[Any] =
+        (0 until n).map(i => if (seed < 3 && (i + c) % n == 0) null else value(i))
+      Seq(
+        column(0)(i => (i + seed) % 2 == 0),
+        column(1)(i => (i + seed).toByte),
+        column(2)(i => (i * seed).toShort),
+        column(3)(i => i * seed - 7),
+        column(4)(i => i.toLong << 33 | seed),
+        column(5)(i => i * 0.5f + seed),
+        column(6)(i => i * 1.25 - seed),
+        column(7)(i => 18000 + i + seed),
+        column(8)(i => 1700000000000000L + i * 1000L + seed),
+        column(9)(i => "s" * (i % 3) + seed),
+        column(10)(i => Array.tabulate[Byte](i % 4)(j => (j + seed).toByte)))
+    }
+    // Sizes that do not divide into whole validity bytes.
+    val inputRows = Seq(rows(3, 1), rows(13, 2), rows(4, 3))
+    val allocator = new RootAllocator(Long.MaxValue)
+    val input = inputRows.map(arrowBatch(allocator, schema, _))
+
+    val iter = arrowCoalesce(input.iterator, schema)
+    iter.initNewBatch(input.head)
+    assert(iter.batchBuilder.isInstanceOf[GpuColumnVector.GpuArrowColumnarBatchBuilder])
+    iter.cleanupConcatIsDone()
+
+    withResource(arrowCoalesce(input.iterator, schema).next()) { gpuBatch =>
+      input.foreach(_.close())
+      // The builder copied the Arrow data, so closing the input freed it.
+      assertResult(0L)(allocator.getAllocatedMemory)
+      val expected = schema.indices.map(c => inputRows.flatMap(_(c)))
+      assertColumns(schema, expected, gpuBatch)
+    }
+    allocator.close()
+  }
+
+  test("HostToGpuCoalesceIterator lets an Arrow producer close its allocator at end of input") {
+    // Like a CPU ArrowEvalPythonExec, the producer frees each batch when asked for the next one
+    // and closes its allocator in the hasNext call that finds no more input.
+    val schema = StructType(Seq(StructField("int", IntegerType), StructField("str", StringType)))
+    val inputRows = (1 to 3).map(n => Seq(Seq(n, null, -n), Seq("a" * n, "b", null)))
+    val allocator = new RootAllocator(Long.MaxValue)
+    val input = new Iterator[ColumnarBatch] {
+      private val pending = inputRows.iterator
+      private var current: Option[ColumnarBatch] = None
+
+      override def hasNext: Boolean = {
+        current.foreach(_.close())
+        current = None
+        if (!pending.hasNext) {
+          allocator.close()
+        }
+        pending.hasNext
+      }
+
+      override def next(): ColumnarBatch = {
+        current = Some(arrowBatch(allocator, schema, pending.next()))
+        current.get
+      }
+    }
+    withResource(arrowCoalesce(input, schema).next()) { gpuBatch =>
+      val expected = schema.indices.map(c => inputRows.flatMap(_(c)))
+      assertColumns(schema, expected, gpuBatch)
+    }
+  }
+
+  test("HostToGpuCoalesceIterator copies Arrow strings by row when their nulls hold data") {
+    val schema = StructType(Seq(StructField("str", StringType)))
+    withResource(new RootAllocator(Long.MaxValue)) { allocator =>
+      val vector = new VarCharVector("str", allocator)
+      vector.allocateNew()
+      Seq("abc", "de", "f").zipWithIndex.foreach { case (value, i) =>
+        vector.setSafe(i, value.getBytes(StandardCharsets.UTF_8))
+      }
+      // The null row keeps its two bytes.
+      vector.setNull(1)
+      vector.setValueCount(3)
+      withResource(new ColumnarBatch(Array(new ArrowColumnVector(vector)), 3)) { batch =>
+        withResource(arrowCoalesce(Iterator.single(batch), schema).next()) { gpuBatch =>
+          assertColumns(schema, Seq(Seq("abc", null, "f")), gpuBatch)
+          assert(!gpuBatch.column(0).asInstanceOf[GpuColumnVector].getBase.hasNonEmptyNulls)
+        }
+      }
+    }
+  }
+
+  test("HostToGpuCoalesceIterator copies Arrow vectors with 64-bit offsets by row") {
+    val schema = StructType(Seq(StructField("str", StringType), StructField("int", IntegerType)))
+    val values = Seq(Seq("abc", null, "", "xyz"), Seq(1, 2, null, 4))
+    withResource(new RootAllocator(Long.MaxValue)) { allocator =>
+      val strings = new LargeVarCharVector("str", allocator)
+      strings.allocateNew()
+      values.head.zipWithIndex.foreach { case (value, i) => setArrowValue(strings, i, value) }
+      strings.setValueCount(values.head.length)
+      val ints = arrowVector(allocator, schema.fields(1), values(1))
+      withResource(new ColumnarBatch(Array(new ArrowColumnVector(strings), ints),
+          values.head.length)) { batch =>
+        withResource(arrowCoalesce(Iterator.single(batch), schema).next()) { gpuBatch =>
+          assertColumns(schema, values, gpuBatch)
+        }
+      }
+    }
+  }
+
+  test("test GpuArrowColumnarBatchBuilder does not keep the Arrow buffers it copied") {
     val rootAllocator = new RootAllocator(Long.MaxValue)
     val allocator = rootAllocator.newChildAllocator("int", 0, Long.MaxValue)
     val vector1 = toArrowField("int", IntegerType, nullable = true, null)
@@ -360,6 +560,8 @@ class GpuCoalesceBatchesSuite extends SparkQueryCompareTestSuite {
       vector1.setSafe(i, i)
       vector2.setSafe(i, i)
     }
+    vector1.setValueCount(10)
+    vector2.setValueCount(10)
     val schema = StructType(Seq(StructField("int", IntegerType)))
     val batches = Seq(
       new ColumnarBatch(Array(new ArrowColumnVector(vector1)), vector1.getValueCount),
@@ -379,7 +581,6 @@ class GpuCoalesceBatchesSuite extends SparkQueryCompareTestSuite {
       "testcoalesce",
       useArrowCopyOpt = true)
 
-    val allocatedMemory = allocator.getAllocatedMemory
     hostToGpuCoalesceIterator.initNewBatch(batches.head)
     hostToGpuCoalesceIterator.addBatchToConcat(batches.head)
     hostToGpuCoalesceIterator.addBatchToConcat(batches(1))
@@ -387,12 +588,13 @@ class GpuCoalesceBatchesSuite extends SparkQueryCompareTestSuite {
     // Close columnar batches
     batches.foreach(cb => cb.close())
 
-    // Verify that buffers are not deallocated
-    assertResult(allocatedMemory)(allocator.getAllocatedMemory)
-
-    // Verify that buffers are deallocated after concat is done
-    hostToGpuCoalesceIterator.cleanupConcatIsDone()
+    // Verify that the buffers were deallocated with the batches
     assertResult(0L)(allocator.getAllocatedMemory)
+
+    withResource(hostToGpuCoalesceIterator.concatAllAndPutOnGPU()) { gpuBatch =>
+      assertColumns(schema, Seq((0 until 10) ++ (0 until 10)), gpuBatch)
+    }
+    hostToGpuCoalesceIterator.cleanupConcatIsDone()
   }
 
   test("test HostToGpuCoalesceIterator with arrow config off") {

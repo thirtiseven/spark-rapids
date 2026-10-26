@@ -25,6 +25,8 @@ import ai.rapids.cudf.HostMemoryBuffer;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -439,19 +441,23 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
    * incrementing the row counts. Please call this method before appending any value or null.
    */
   private void growListBuffersAndRows() {
-    if (offsets == null || rows + 1 > rowCapacity) {
-      checkOffsetRows();
+    growListBuffersAndRows(1);
+  }
+
+  private void growListBuffersAndRows(int numRows) {
+    if (offsets == null || rows + numRows > rowCapacity) {
+      checkOffsetRows(numRows);
     }
-    assert rows + 2 <= Integer.MAX_VALUE : "Row count cannot go over Integer.MAX_VALUE";
-    rows++;
+    assert rows + numRows + 1 <= Integer.MAX_VALUE : "Row count cannot go over Integer.MAX_VALUE";
+    rows += numRows;
 
     if (offsets == null) {
-      long initialRows = Math.min(estimatedRows, limits.maxOffsetRows);
+      long initialRows = Math.max(rows, Math.min(estimatedRows, limits.maxOffsetRows));
       offsets = HostMemoryBuffer.allocate((initialRows + 1) << bitShiftByOffset);
       offsets.setInt(0, 0);
       rowCapacity = initialRows;
     } else if (rows > rowCapacity) {
-      long newCap = Math.min(rowCapacity * 2, limits.maxOffsetRows);
+      long newCap = Math.min(Math.max(rows, rowCapacity * 2), limits.maxOffsetRows);
       offsets = copyBuffer(HostMemoryBuffer.allocate((newCap + 1) << bitShiftByOffset), offsets);
       rowCapacity = newCap;
     }
@@ -464,21 +470,29 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
    * @param stringLength number of bytes required by the next row
    */
   private void growStringBuffersAndRows(int stringLength) {
-    long currentLength = (long) currentStringByteIndex + stringLength;
-    if (offsets == null || rows + 1 > rowCapacity || currentLength > data.getLength()) {
-      checkOffsetRows();
+    growStringBuffersAndRows(1, stringLength);
+  }
+
+  /**
+   * Grows the offsets and data buffers of a string column for {@code numRows} more rows that
+   * hold {@code numBytes} bytes, along with incrementing the row count.
+   */
+  private void growStringBuffersAndRows(int numRows, long numBytes) {
+    long currentLength = currentStringByteIndex + numBytes;
+    if (offsets == null || rows + numRows > rowCapacity || currentLength > data.getLength()) {
+      checkOffsetRows(numRows);
       if (currentLength > limits.maxStringBytes) {
         throw limitExceeded("The string data size in bytes", currentLength,
             limits.maxStringBytes);
       }
     }
-    assert rows + 2 <= Integer.MAX_VALUE : "Row count cannot go over Integer.MAX_VALUE";
-    rows++;
+    assert rows + numRows + 1 <= Integer.MAX_VALUE : "Row count cannot go over Integer.MAX_VALUE";
+    rows += numRows;
 
     if (offsets == null) {
       // Initialize data buffer with at least 1 byte in case the first appended value is null.
-      data = HostMemoryBuffer.allocate(Math.max(1, stringLength));
-      long initialRows = Math.min(estimatedRows, limits.maxOffsetRows);
+      data = HostMemoryBuffer.allocate(Math.max(1, numBytes));
+      long initialRows = Math.max(rows, Math.min(estimatedRows, limits.maxOffsetRows));
       offsets = HostMemoryBuffer.allocate((initialRows + 1) << bitShiftByOffset);
       offsets.setInt(0, 0);
       rowCapacity = initialRows;
@@ -486,7 +500,7 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
     }
 
     if (rows > rowCapacity) {
-      long newCap = Math.min(rowCapacity * 2, limits.maxOffsetRows);
+      long newCap = Math.min(Math.max(rows, rowCapacity * 2), limits.maxOffsetRows);
       offsets = copyBuffer(HostMemoryBuffer.allocate((newCap + 1) << bitShiftByOffset), offsets);
       rowCapacity = newCap;
     }
@@ -501,9 +515,9 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
     }
   }
 
-  private void checkOffsetRows() {
-    if (rows + 1 > limits.maxOffsetRows) {
-      throw limitExceeded("The number of rows", rows + 1, limits.maxOffsetRows);
+  private void checkOffsetRows(int numRows) {
+    if (rows + numRows > limits.maxOffsetRows) {
+      throw limitExceeded("The number of rows", rows + numRows, limits.maxOffsetRows);
     }
   }
 
@@ -869,6 +883,154 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
     assert type.equals(DType.LIST) : " type " + type + " is not LIST";
     getChild(0).append(value, srcOffset, length);
     return endList();
+  }
+
+  // The bulk appends below take buffers laid out as in Arrow, which cuDF shares for these types:
+  // values back to back, 32-bit offsets for variable-width rows, and a validity bitmap with bit i
+  // for row i. nulls must be the number of null rows, and validity may be null when it is 0.
+
+  /**
+   * Appends {@code numRows} fixed-width values.
+   *
+   * @return the number of bytes appended
+   */
+  public long appendFixedWidth(ByteBuffer values, ByteBuffer validity, int numRows, long nulls) {
+    assert !type.isNestedType() && !type.equals(DType.STRING) && !type.equals(DType.BOOL8);
+    long firstRow = currentIndex;
+    long bytes = (long) numRows << bitShiftBySize;
+    if (numRows > 0) {
+      growFixedWidthBuffersAndRows(numRows);
+      copyFrom(values, 0, data, firstRow << bitShiftBySize, bytes);
+      currentIndex += numRows;
+      appendNulls(validity, firstRow, numRows, nulls);
+    }
+    return bytes;
+  }
+
+  /**
+   * Appends {@code numRows} booleans packed one bit per row.
+   *
+   * @return the number of bytes appended
+   */
+  public long appendBooleanBits(ByteBuffer bits, ByteBuffer validity, int numRows, long nulls) {
+    assert type.equals(DType.BOOL8);
+    long firstRow = currentIndex;
+    if (numRows > 0) {
+      growFixedWidthBuffersAndRows(numRows);
+      for (int i = 0; i < numRows; i++) {
+        data.setByte(firstRow + i, (byte) ((bits.get(i >> 3) >> (i & 7)) & 1));
+      }
+      currentIndex += numRows;
+      appendNulls(validity, firstRow, numRows, nulls);
+    }
+    return numRows;
+  }
+
+  /**
+   * Appends {@code numRows} strings stored in {@code chars} at the given {@code offsets}.
+   * Null rows must be empty.
+   *
+   * @return the number of bytes appended
+   */
+  public long appendStrings(ByteBuffer offsets, ByteBuffer chars, ByteBuffer validity,
+      int numRows, long nulls) {
+    assert type.equals(DType.STRING) : " type " + type + " is not String";
+    if (numRows == 0) {
+      return 0;
+    }
+    ByteBuffer srcOffsets = offsets.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+    int first = srcOffsets.getInt(0);
+    int length = srcOffsets.getInt(numRows << bitShiftByOffset) - first;
+    long firstRow = currentIndex;
+    int firstByte = currentStringByteIndex;
+    growStringBuffersAndRows(numRows, length);
+    copyFrom(chars, first, data, firstByte, length);
+    copyOffsets(srcOffsets, first, firstByte, firstRow, numRows);
+    currentStringByteIndex += length;
+    currentIndex += numRows;
+    appendNulls(validity, firstRow, numRows, nulls);
+    return length;
+  }
+
+  /**
+   * Appends {@code numRows} byte lists stored in {@code bytes} at the given {@code offsets}, to
+   * a LIST of INT8/UINT8. Null rows must be empty.
+   *
+   * @return the number of bytes appended, including the offsets
+   */
+  public long appendByteLists(ByteBuffer offsets, ByteBuffer bytes, ByteBuffer validity,
+      int numRows, long nulls) {
+    assert type.equals(DType.LIST) : " type " + type + " is not LIST";
+    if (numRows == 0) {
+      return 0;
+    }
+    // Rejects too many rows before the child changes.
+    checkOffsetRows(numRows);
+    ByteBuffer srcOffsets = offsets.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+    int first = srcOffsets.getInt(0);
+    int length = srcOffsets.getInt(numRows << bitShiftByOffset) - first;
+    RapidsHostColumnBuilder child = getChild(0);
+    assert child.type.isBackedByByte();
+    long firstRow = currentIndex;
+    int firstChild = child.getCurrentIndex();
+    if (length > 0) {
+      child.growFixedWidthBuffersAndRows(length);
+      copyFrom(bytes, first, child.data, firstChild, length);
+      child.currentIndex += length;
+    }
+    growListBuffersAndRows(numRows);
+    copyOffsets(srcOffsets, first, firstChild, firstRow, numRows);
+    currentIndex += numRows;
+    appendNulls(validity, firstRow, numRows, nulls);
+    return length + ((long) numRows << bitShiftByOffset);
+  }
+
+  private static void copyFrom(ByteBuffer src, int srcOffset, HostMemoryBuffer dst,
+      long dstOffset, long length) {
+    if (length > 0) {
+      ByteBuffer from = src.duplicate();
+      from.limit(Math.toIntExact(srcOffset + length)).position(srcOffset);
+      dst.asByteBuffer(dstOffset, Math.toIntExact(length)).put(from);
+    }
+  }
+
+  // Rebases the offsets of rows 1..numRows from the source data start to this column's.
+  private void copyOffsets(ByteBuffer srcOffsets, int srcFirst, long dstFirst, long firstRow,
+      int numRows) {
+    long delta = dstFirst - srcFirst;
+    if (delta == 0) {
+      copyFrom(srcOffsets, Integer.BYTES, offsets, (firstRow + 1) << bitShiftByOffset,
+          (long) numRows << bitShiftByOffset);
+      return;
+    }
+    for (int i = 1; i <= numRows; i++) {
+      offsets.setInt((firstRow + i) << bitShiftByOffset,
+          Math.toIntExact(srcOffsets.getInt(i << bitShiftByOffset) + delta));
+    }
+  }
+
+  private void appendNulls(ByteBuffer validity, long firstRow, int numRows, long nulls) {
+    if (nulls > 0) {
+      growValidBuffer();
+      if ((firstRow & 7) == 0) {
+        long firstByte = firstRow >> 3;
+        int fullBytes = numRows >> 3;
+        copyFrom(validity, 0, valid, firstByte, fullBytes);
+        int tailRows = numRows & 7;
+        if (tailRows > 0) {
+          // The bits past the last row stay set for rows appended later.
+          byte last = (byte) (validity.get(fullBytes) | (0xFF << tailRows));
+          valid.setByte(firstByte + fullBytes, last);
+        }
+        nullCount += nulls;
+        return;
+      }
+      for (int i = 0; i < numRows; i++) {
+        if (((validity.get(i >> 3) >> (i & 7)) & 1) == 0) {
+          nullCount += setNullAt(valid, firstRow + i);
+        }
+      }
+    }
   }
 
   /**

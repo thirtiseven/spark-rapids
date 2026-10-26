@@ -19,10 +19,10 @@ package com.nvidia.spark.rapids;
 import ai.rapids.cudf.*;
 import com.nvidia.spark.rapids.shims.GpuTypeShims;
 import com.nvidia.spark.rapids.shims.VariantTypeShims;
-import org.apache.arrow.memory.ReferenceManager;
 
 import org.apache.spark.sql.catalyst.expressions.Attribute;
 import org.apache.spark.sql.types.*;
+import org.apache.spark.sql.vectorized.ArrowColumnVector;
 import org.apache.spark.sql.vectorized.ColumnVector;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 
@@ -31,8 +31,6 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.function.Function;
-
-import scala.Tuple2;
 
 /**
  * A GPU accelerated version of the Spark ColumnVector.
@@ -192,10 +190,13 @@ public class GpuColumnVector extends GpuColumnVectorBase {
     }
   }
 
+  /**
+   * Builds a batch from Arrow input. Each input batch is copied right away into host columns of
+   * its own, in bulk where Arrow and cuDF share the layout, so the producer's memory is not held
+   * and no host buffer is regrown. The pieces are concatenated on the GPU.
+   */
   public static final class GpuArrowColumnarBatchBuilder extends GpuColumnarBatchBuilderBase {
-    private final ai.rapids.cudf.ArrowColumnBuilder[] builders;
-
-    private final ArrowBufReferenceHolder[] referenceHolders;
+    private final List<List<HostColumnVector>> pieces;
 
     /**
      * A collection of builders for building up columnar data from Arrow data.
@@ -203,60 +204,75 @@ public class GpuColumnVector extends GpuColumnVectorBase {
      */
     public GpuArrowColumnarBatchBuilder(StructType schema) {
       fields = schema.fields();
-      int len = fields.length;
-      builders = new ai.rapids.cudf.ArrowColumnBuilder[len];
-      referenceHolders = new ArrowBufReferenceHolder[len];
-      boolean success = false;
+      pieces = new ArrayList<>(fields.length);
+      for (int i = 0; i < fields.length; i++) {
+        pieces.add(new ArrayList<>());
+      }
+    }
 
+    private ai.rapids.cudf.ColumnVector buildOnDevice(int builderIndex) {
+      List<HostColumnVector> columnPieces = pieces.get(builderIndex);
+      if (columnPieces.size() == 1) {
+        return columnPieces.get(0).copyToDevice();
+      }
+      ai.rapids.cudf.ColumnVector[] onDevice = new ai.rapids.cudf.ColumnVector[columnPieces.size()];
       try {
-        for (int i = 0; i < len; i++) {
-          StructField field = fields[i];
-          builders[i] = new ArrowColumnBuilder(convertFrom(field.dataType(), field.nullable()));
-          referenceHolders[i] = new ArrowBufReferenceHolder();
+        for (int i = 0; i < onDevice.length; i++) {
+          onDevice[i] = columnPieces.get(i).copyToDevice();
         }
-        success = true;
+        return ai.rapids.cudf.ColumnVector.concatenate(onDevice);
       } finally {
-        if (!success) {
-          close();
+        for (ai.rapids.cudf.ColumnVector piece : onDevice) {
+          if (piece != null) {
+            piece.close();
+          }
         }
       }
     }
 
     @Override
     protected ai.rapids.cudf.ColumnVector buildAndPutOnDevice(int builderIndex) {
-      ai.rapids.cudf.ColumnVector cv = builders[builderIndex].buildAndPutOnDevice();
-      referenceHolders[builderIndex].releaseReferences();
-      builders[builderIndex] = null;
+      ai.rapids.cudf.ColumnVector cv = buildOnDevice(builderIndex);
+      closePieces(builderIndex);
       return cv;
     }
 
     @Override
     public long copyColumnar(ColumnVector cv, int colNum, int rows) {
-      Tuple2<List<ReferenceManager>, Long> copyResult =
-          HostColumnarToGpu.arrowColumnarCopy(cv, builder(colNum), rows);
-      referenceHolders[colNum].addReferences(copyResult._1);
-      return copyResult._2;
+      StructField field = fields[colNum];
+      try (RapidsHostColumnBuilder builder =
+               new RapidsHostColumnBuilder(convertFrom(field.dataType(), field.nullable()), rows)) {
+        long copied = -1;
+        if (cv instanceof ArrowColumnVector) {
+          copied = HostColumnarToGpu.arrowBulkCopy((ArrowColumnVector) cv, builder,
+              field.dataType(), rows);
+        }
+        if (copied < 0) {
+          copied = HostColumnarToGpu.columnarCopy(cv, builder, field.dataType(), rows);
+        }
+        pieces.get(colNum).add(builder.build());
+        return copied;
+      }
     }
 
-    public ai.rapids.cudf.ArrowColumnBuilder builder(int i) {
-      return builders[i];
+    private void closePieces(int builderIndex) {
+      List<HostColumnVector> columnPieces = pieces.get(builderIndex);
+      for (HostColumnVector piece : columnPieces) {
+        piece.close();
+      }
+      columnPieces.clear();
     }
 
     @Override
     public ColumnarBatch tryBuild(int rows) {
-      // Arrow data should not be released until close is called.
-      return build(rows, i -> builders[i].buildAndPutOnDevice());
+      // The host pieces are kept until close, so a failed build can be retried.
+      return build(rows, this::buildOnDevice);
     }
 
     @Override
     public void close() {
-      for (ai.rapids.cudf.ArrowColumnBuilder b: builders) {
-        if (b != null) {
-          b.close();
-        }
-      }
-      for (ArrowBufReferenceHolder holder: referenceHolders) {
-        holder.releaseReferences();
+      for (int i = 0; i < pieces.size(); i++) {
+        closePieces(i);
       }
     }
   }
@@ -421,25 +437,6 @@ public class GpuColumnVector extends GpuColumnVectorBase {
           }
         }
       }
-    }
-  }
-
-  private static final class ArrowBufReferenceHolder {
-    private final List<ReferenceManager> references = new ArrayList<>();
-
-    public void addReferences(List<ReferenceManager> refs) {
-      references.addAll(refs);
-      refs.forEach(ReferenceManager::retain);
-    }
-
-    public void releaseReferences() {
-      if (references.isEmpty()) {
-        return;
-      }
-      for (ReferenceManager ref: references) {
-        ref.release();
-      }
-      references.clear();
     }
   }
 

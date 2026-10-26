@@ -7,9 +7,9 @@ nav_order: 5
 # NVIDIA cuDF plugin for Apache Spark Compatibility with Apache Spark
 
 The SQL plugin tries to produce results that are bit for bit identical with Apache Spark.  There are
-a number of cases where there are some differences. In most cases operators that produce different
+a number of cases where there are some differences. In some cases operators that produce different
 results are off by default, and you can look at the [configs](configs.md) for more information on
-how to enable them.  In some cases we felt that enabling the incompatibility by default was worth
+how to enable them.  In many cases we felt that enabling the incompatibility by default was worth
 the performance gain. All of those operators can be disabled through configs if it becomes a
 problem. Please also look at the current list of
 [bugs](https://github.com/NVIDIA/cudf-spark/issues?q=is%3Aopen+is%3Aissue+label%3Abug) which are

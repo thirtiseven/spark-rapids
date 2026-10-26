@@ -591,6 +591,25 @@ class RapidsHostColumnBuilderSuite extends AnyFunSuite {
     }
   }
 
+  test("a data size estimate sizes the string bytes or list children up front") {
+    withResource(new RapidsHostColumnBuilder(stringType, 4, 64)) { b =>
+      b.appendUTF8String(letters(10))
+      b.appendUTF8String(letters(30))
+      withResource(b.build()) { v =>
+        assertResult(64L)(v.getData.getLength)
+        assertResult(letters(30).toSeq)(v.getJavaString(1).getBytes(StandardCharsets.UTF_8).toSeq)
+      }
+    }
+    withResource(new RapidsHostColumnBuilder(binaryType, 4, 64)) { b =>
+      b.appendByteList(letters(10))
+      b.appendByteList(letters(30))
+      withResource(b.build()) { v =>
+        assertResult(64L)(v.getChildColumnView(0).getData.getLength)
+        assert(v.getBytesFromList(1).sameElements(letters(30)))
+      }
+    }
+  }
+
   // Chunks of 8, 5, 6 and 3 rows start at aligned and unaligned rows of the validity mask. The
   // third one has no nulls.
   private def chunksOf[T](value: (Int, Int) => T): Seq[Seq[Option[T]]] =

@@ -27,6 +27,7 @@ import java.math.BigInteger;
 import java.math.RoundingMode;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.IntBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -110,6 +111,7 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
   private boolean nullable;
   private long rows;
   private long estimatedRows;
+  private long estimatedDataSize;
   private long rowCapacity = 0L;
   private long validCapacity = 0L;
   private List<RapidsHostColumnBuilder> childBuilders = new ArrayList<>();
@@ -129,24 +131,37 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
   private static final int bitShiftByOffset = (int) (Math.log(OFFSET_SIZE) / Math.log(2));
 
   public RapidsHostColumnBuilder(HostColumnVector.DataType dataType, long estimatedRows) {
-    this(dataType, estimatedRows, currentLimits());
+    this(dataType, estimatedRows, 0L, currentLimits());
+  }
+
+  /**
+   * Creates a builder whose first allocations hold {@code estimatedRows} rows and
+   * {@code estimatedDataSize} bytes of a STRING column or child rows of a LIST column.
+   */
+  public RapidsHostColumnBuilder(HostColumnVector.DataType dataType, long estimatedRows,
+      long estimatedDataSize) {
+    this(dataType, estimatedRows, estimatedDataSize, currentLimits());
   }
 
   private RapidsHostColumnBuilder(HostColumnVector.DataType dataType, long estimatedRows,
-      Limits limits) {
+      long estimatedDataSize, Limits limits) {
     this.limits = limits;
     this.dataType = dataType;
     this.type = dataType.getType();
     this.nullable = dataType.isNullable();
     this.rows = 0;
     this.estimatedRows = Math.max(estimatedRows, 1L);
+    this.estimatedDataSize = estimatedDataSize;
     this.bitShiftBySize = (int) (Math.log(this.type.getSizeInBytes()) / Math.log(2));
 
     // initialize the null handler according to the data type
     this.setupNullHandler();
 
+    long childRows = type.equals(DType.LIST) && estimatedDataSize > 0
+        ? estimatedDataSize : estimatedRows;
     for (int i = 0; i < dataType.getNumChildren(); i++) {
-      childBuilders.add(new RapidsHostColumnBuilder(dataType.getChild(i), estimatedRows, limits));
+      childBuilders.add(
+          new RapidsHostColumnBuilder(dataType.getChild(i), childRows, 0L, limits));
     }
   }
 
@@ -491,7 +506,8 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
 
     if (offsets == null) {
       // Initialize data buffer with at least 1 byte in case the first appended value is null.
-      data = HostMemoryBuffer.allocate(Math.max(1, numBytes));
+      data = HostMemoryBuffer.allocate(Math.max(1,
+          Math.max(numBytes, Math.min(estimatedDataSize, limits.maxStringBytes))));
       long initialRows = Math.max(rows, Math.min(estimatedRows, limits.maxOffsetRows));
       offsets = HostMemoryBuffer.allocate((initialRows + 1) << bitShiftByOffset);
       offsets.setInt(0, 0);
@@ -1003,9 +1019,13 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
           (long) numRows << bitShiftByOffset);
       return;
     }
-    for (int i = 1; i <= numRows; i++) {
-      offsets.setInt((firstRow + i) << bitShiftByOffset,
-          Math.toIntExact(srcOffsets.getInt(i << bitShiftByOffset) + delta));
+    // The limits keep the data length, and so every offset, within an int.
+    int shift = Math.toIntExact(delta);
+    IntBuffer src = srcOffsets.duplicate().order(ByteOrder.LITTLE_ENDIAN).asIntBuffer();
+    IntBuffer dst = offsets.asByteBuffer((firstRow + 1) << bitShiftByOffset,
+        numRows << bitShiftByOffset).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer();
+    for (int i = 0; i < numRows; i++) {
+      dst.put(i, src.get(i + 1) + shift);
     }
   }
 
@@ -1025,11 +1045,24 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
         nullCount += nulls;
         return;
       }
-      for (int i = 0; i < numRows; i++) {
-        if (((validity.get(i >> 3) >> (i & 7)) & 1) == 0) {
-          nullCount += setNullAt(valid, firstRow + i);
+      // Clears the bits of the null rows a source byte at a time: the bits of rows not appended
+      // yet are all set.
+      int shift = (int) (firstRow & 7);
+      long firstByte = firstRow >> 3;
+      int srcBytes = (numRows + 7) >> 3;
+      for (int b = 0; b < srcBytes; b++) {
+        int bits = validity.get(b) & 0xFF;
+        if (b == srcBytes - 1 && (numRows & 7) != 0) {
+          bits |= (0xFF << (numRows & 7)) & 0xFF;
+        }
+        long low = firstByte + b;
+        valid.setByte(low, (byte) (valid.getByte(low) & ((bits << shift) | ((1 << shift) - 1))));
+        if ((b << 3) + 8 - shift < numRows) {
+          valid.setByte(low + 1,
+              (byte) (valid.getByte(low + 1) & ((bits >>> (8 - shift)) | (0xFF << shift))));
         }
       }
+      nullCount += nulls;
     }
   }
 

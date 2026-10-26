@@ -191,12 +191,36 @@ public class GpuColumnVector extends GpuColumnVectorBase {
   }
 
   /**
-   * Builds a batch from Arrow input. Each input batch is copied right away into host columns of
-   * its own, in bulk where Arrow and cuDF share the layout, so the producer's memory is not held
-   * and no host buffer is regrown. The pieces are concatenated on the GPU.
+   * Builds a batch from Arrow input. Each input batch is copied right away into host columns,
+   * in bulk where Arrow and cuDF share the layout, so the producer's memory is not held. The
+   * host columns are concatenated on the GPU.
    */
   public static final class GpuArrowColumnarBatchBuilder extends GpuColumnarBatchBuilderBase {
+    // Consecutive input batches share a host column of up to 16 MiB, as allocating pinned
+    // memory costs more than copying a small batch. Wide schemas get smaller chunks, so partly
+    // filled ones do not hold much memory.
+    private static final long MAX_CHUNK_BYTES = 16L << 20;
+    private static final long MIN_CHUNK_BYTES = 1L << 20;
+    private static final long MAX_BATCH_CHUNK_BYTES = 128L << 20;
+
+    private static final class Chunk {
+      final RapidsHostColumnBuilder builder;
+      final long rowCapacity;
+      final long dataCapacity;
+      long rows;
+      long dataBytes;
+
+      Chunk(RapidsHostColumnBuilder builder, long rowCapacity, long dataCapacity) {
+        this.builder = builder;
+        this.rowCapacity = rowCapacity;
+        this.dataCapacity = dataCapacity;
+      }
+    }
+
     private final List<List<HostColumnVector>> pieces;
+    private final Chunk[] chunks;
+    private final long[] lastChunkBytes;
+    private final long chunkLimit;
 
     /**
      * A collection of builders for building up columnar data from Arrow data.
@@ -208,9 +232,54 @@ public class GpuColumnVector extends GpuColumnVectorBase {
       for (int i = 0; i < fields.length; i++) {
         pieces.add(new ArrayList<>());
       }
+      chunks = new Chunk[fields.length];
+      lastChunkBytes = new long[fields.length];
+      chunkLimit = Math.max(MIN_CHUNK_BYTES,
+          Math.min(MAX_CHUNK_BYTES, MAX_BATCH_CHUNK_BYTES / Math.max(1, fields.length)));
+    }
+
+    private void finishChunk(int builderIndex) {
+      Chunk chunk = chunks[builderIndex];
+      if (chunk != null) {
+        chunks[builderIndex] = null;
+        try (RapidsHostColumnBuilder builder = chunk.builder) {
+          pieces.get(builderIndex).add(builder.build());
+        }
+      }
+    }
+
+    /**
+     * Returns a host column with room for {@code rows} more rows whose values, or the data of
+     * variable-width values, take {@code dataBytes} bytes.
+     */
+    private RapidsHostColumnBuilder chunkFor(int colNum, int rows, long dataBytes) {
+      Chunk chunk = chunks[colNum];
+      if (chunk != null && (chunk.rows + rows > chunk.rowCapacity ||
+          chunk.dataBytes + dataBytes > chunk.dataCapacity)) {
+        finishChunk(colNum);
+        chunk = null;
+      }
+      if (chunk == null) {
+        StructField field = fields[colNum];
+        boolean variableWidth =
+            field.dataType() instanceof StringType || field.dataType() instanceof BinaryType;
+        long bytes = variableWidth ? dataBytes + ((long) rows << 2) : dataBytes;
+        // Chunks double up to the limit, so a short input does not take much memory.
+        long capacity = Math.max(bytes, Math.min(chunkLimit, 2 * lastChunkBytes[colNum]));
+        long scale = Math.max(1, capacity / Math.max(1, bytes));
+        chunk = new Chunk(new RapidsHostColumnBuilder(
+            convertFrom(field.dataType(), field.nullable()), rows * scale, dataBytes * scale),
+            rows * scale, dataBytes * scale);
+        chunks[colNum] = chunk;
+        lastChunkBytes[colNum] = capacity;
+      }
+      chunk.rows += rows;
+      chunk.dataBytes += dataBytes;
+      return chunk.builder;
     }
 
     private ai.rapids.cudf.ColumnVector buildOnDevice(int builderIndex) {
+      finishChunk(builderIndex);
       List<HostColumnVector> columnPieces = pieces.get(builderIndex);
       if (columnPieces.size() == 1) {
         return columnPieces.get(0).copyToDevice();
@@ -239,17 +308,19 @@ public class GpuColumnVector extends GpuColumnVectorBase {
 
     @Override
     public long copyColumnar(ColumnVector cv, int colNum, int rows) {
+      if (cv instanceof ArrowColumnVector) {
+        long copied = HostColumnarToGpu.arrowBulkCopy((ArrowColumnVector) cv,
+            fields[colNum].dataType(), rows, bytes -> chunkFor(colNum, rows, bytes));
+        if (copied >= 0) {
+          return copied;
+        }
+      }
+      // Pieces are concatenated in order, so the open chunk ends before this piece.
+      finishChunk(colNum);
       StructField field = fields[colNum];
       try (RapidsHostColumnBuilder builder =
                new RapidsHostColumnBuilder(convertFrom(field.dataType(), field.nullable()), rows)) {
-        long copied = -1;
-        if (cv instanceof ArrowColumnVector) {
-          copied = HostColumnarToGpu.arrowBulkCopy((ArrowColumnVector) cv, builder,
-              field.dataType(), rows);
-        }
-        if (copied < 0) {
-          copied = HostColumnarToGpu.columnarCopy(cv, builder, field.dataType(), rows);
-        }
+        long copied = HostColumnarToGpu.columnarCopy(cv, builder, field.dataType(), rows);
         pieces.get(colNum).add(builder.build());
         return copied;
       }
@@ -272,6 +343,10 @@ public class GpuColumnVector extends GpuColumnVectorBase {
     @Override
     public void close() {
       for (int i = 0; i < pieces.size(); i++) {
+        if (chunks[i] != null) {
+          chunks[i].builder.close();
+          chunks[i] = null;
+        }
         closePieces(i);
       }
     }

@@ -547,6 +547,46 @@ class GpuCoalesceBatchesSuite extends SparkQueryCompareTestSuite {
     }
   }
 
+  test("HostToGpuCoalesceIterator copies many small Arrow batches into shared host columns") {
+    val schema = StructType(Seq(StructField("long", LongType), StructField("str", StringType),
+      StructField("bin", BinaryType)))
+    // Sizes and value lengths vary, so chunks fill up on rows in some batches and on bytes in
+    // others.
+    val inputRows = (0 until 60).map { b =>
+      val n = 1 + (b * 7) % 11
+      val longs = (0 until n).map(i => if ((b + i) % 5 == 0) null else (b * 100 + i).toLong)
+      val strs = (0 until n).map(i => if ((b + i) % 4 == 0) null else "x" * ((b * i) % 37))
+      val bins = (0 until n).map(i => Array.fill[Byte]((b + i) % 23)(b.toByte))
+      Seq(longs, strs, bins)
+    }
+    val allocator = new RootAllocator(Long.MaxValue)
+    val input = inputRows.map(arrowBatch(allocator, schema, _))
+    withResource(arrowCoalesce(input.iterator, schema).next()) { gpuBatch =>
+      input.foreach(_.close())
+      val expected = schema.indices.map(c => inputRows.flatMap(_(c)))
+      assertColumns(schema, expected, gpuBatch)
+    }
+    allocator.close()
+  }
+
+  test("HostToGpuCoalesceIterator keeps row order across bulk and row-by-row Arrow batches") {
+    val schema = StructType(Seq(StructField("str", StringType)))
+    val values = Seq(Seq("a", null, "bc"), Seq("large", null, ""), Seq("d", "ef", null))
+    withResource(new RootAllocator(Long.MaxValue)) { allocator =>
+      val large = new LargeVarCharVector("str", allocator)
+      large.allocateNew()
+      values(1).zipWithIndex.foreach { case (value, i) => setArrowValue(large, i, value) }
+      large.setValueCount(values(1).length)
+      val input = Seq(arrowBatch(allocator, schema, Seq(values.head)),
+        new ColumnarBatch(Array(new ArrowColumnVector(large)), values(1).length),
+        arrowBatch(allocator, schema, Seq(values(2))))
+      withResource(arrowCoalesce(input.iterator, schema).next()) { gpuBatch =>
+        assertColumns(schema, Seq(values.flatten), gpuBatch)
+      }
+      input.foreach(_.close())
+    }
+  }
+
   test("test GpuArrowColumnarBatchBuilder does not keep the Arrow buffers it copied") {
     val rootAllocator = new RootAllocator(Long.MaxValue)
     val allocator = rootAllocator.newChildAllocator("int", 0, Long.MaxValue)

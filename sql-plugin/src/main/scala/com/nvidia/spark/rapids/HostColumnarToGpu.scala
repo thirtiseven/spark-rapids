@@ -16,7 +16,8 @@
 
 package com.nvidia.spark.rapids
 
-import java.nio.ByteBuffer
+import java.nio.{ByteBuffer, ByteOrder}
+import java.util.function.LongFunction
 
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.shims.{GpuTypeShims, ShimUnaryExecNode}
@@ -64,14 +65,15 @@ object HostColumnarToGpu extends Logging {
   }
 
   /**
-   * Copies an Arrow vector in bulk when cuDF shares its layout for the given type, or returns -1
-   * without copying anything so the caller can copy it row by row.
+   * Copies an Arrow vector in bulk when cuDF shares its layout for the given type, into the
+   * builder that `builderFor` returns for the bytes of the values or of their variable-width
+   * data. Returns -1 without asking for a builder when the vector cannot be copied in bulk.
    */
   def arrowBulkCopy(
       cv: ArrowColumnVector,
-      b: RapidsHostColumnBuilder,
       dataType: DataType,
-      rows: Int): Long = {
+      rows: Int,
+      builderFor: LongFunction[RapidsHostColumnBuilder]): Long = {
     val vector = try {
       getArrowValueVector(cv)
     } catch {
@@ -80,7 +82,7 @@ object HostColumnarToGpu extends Logging {
           "access its Arrow ValueVector", e)
     }
     val nulls = vector.getNullCount.toLong
-    def validity: ByteBuffer = if (nulls == 0) {
+    lazy val validity: ByteBuffer = if (nulls == 0) {
       null
     } else {
       vector.getValidityBuffer.nioBuffer(0, (rows + 7) >>> 3)
@@ -93,8 +95,8 @@ object HostColumnarToGpu extends Logging {
     } else {
       (dataType, vector) match {
         case (BooleanType, v: BitVector) =>
-          b.appendBooleanBits(v.getDataBuffer.nioBuffer(0, (rows + 7) >>> 3), validity, rows,
-            nulls)
+          val bits = v.getDataBuffer.nioBuffer(0, (rows + 7) >>> 3)
+          builderFor.apply(rows).appendBooleanBits(bits, validity, rows, nulls)
         case (ByteType, _: TinyIntVector) | (ShortType, _: SmallIntVector) |
              (IntegerType, _: IntVector) | (DateType, _: DateDayVector) |
              (LongType, _: BigIntVector) | (TimestampType, _: TimeStampMicroTZVector) |
@@ -103,33 +105,59 @@ object HostColumnarToGpu extends Logging {
           if (bytes > Int.MaxValue) {
             -1L
           } else {
-            b.appendFixedWidth(vector.getDataBuffer.nioBuffer(0, bytes.toInt), validity, rows,
-              nulls)
+            val values = vector.getDataBuffer.nioBuffer(0, bytes.toInt)
+            builderFor.apply(bytes).appendFixedWidth(values, validity, rows, nulls)
           }
-        case (StringType, v: VarCharVector) if hasEmptyNulls(v, rows, nulls) =>
-          b.appendStrings(offsetsOf(v, rows), dataOf(v, rows), validity, rows, nulls)
-        case (BinaryType, v: VarBinaryVector) if hasEmptyNulls(v, rows, nulls) =>
-          b.appendByteLists(offsetsOf(v, rows), dataOf(v, rows), validity, rows, nulls)
+        case (StringType, v: VarCharVector) =>
+          variableWidthCopy(v, validity, rows, nulls, builderFor, strings = true)
+        case (BinaryType, v: VarBinaryVector) =>
+          variableWidthCopy(v, validity, rows, nulls, builderFor, strings = false)
         case _ =>
           -1L
       }
     }
   }
 
-  // cuDF expects null rows of variable-width columns to be empty, while Arrow does not. The
-  // offsets are compared because getValueLength reports 0 for any null row.
-  private def hasEmptyNulls(v: BaseVariableWidthVector, rows: Int, nulls: Long): Boolean = {
-    nulls == 0 || (0 until rows).forall { i =>
-      !v.isNull(i) || v.getStartOffset(i) == v.getStartOffset(i + 1)
+  private def variableWidthCopy(
+      v: BaseVariableWidthVector,
+      validity: ByteBuffer,
+      rows: Int,
+      nulls: Long,
+      builderFor: LongFunction[RapidsHostColumnBuilder],
+      strings: Boolean): Long = {
+    val offsets = v.getOffsetBuffer.nioBuffer(0, (rows + 1) * BaseVariableWidthVector.OFFSET_WIDTH)
+    if (nulls > 0 && !nullsAreEmpty(validity, offsets, rows)) {
+      -1L
+    } else {
+      val start = v.getStartOffset(0)
+      val end = v.getStartOffset(rows)
+      val data = v.getDataBuffer.nioBuffer(0, end)
+      val b = builderFor.apply(end.toLong - start)
+      if (strings) {
+        b.appendStrings(offsets, data, validity, rows, nulls)
+      } else {
+        b.appendByteLists(offsets, data, validity, rows, nulls)
+      }
     }
   }
 
-  private def offsetsOf(v: BaseVariableWidthVector, rows: Int): ByteBuffer = {
-    v.getOffsetBuffer.nioBuffer(0, (rows + 1) * BaseVariableWidthVector.OFFSET_WIDTH)
-  }
-
-  private def dataOf(v: BaseVariableWidthVector, rows: Int): ByteBuffer = {
-    v.getDataBuffer.nioBuffer(0, v.getStartOffset(rows))
+  // cuDF expects null rows of variable-width columns to be empty, while Arrow does not.
+  private def nullsAreEmpty(validity: ByteBuffer, offsets: ByteBuffer, rows: Int): Boolean = {
+    val ends = offsets.duplicate().order(ByteOrder.LITTLE_ENDIAN).asIntBuffer()
+    var empty = true
+    var i = 0
+    while (empty && i < rows) {
+      val bits = validity.get(i >> 3)
+      if (bits == -1 && (i & 7) == 0) {
+        i += 8
+      } else {
+        if ((bits & (1 << (i & 7))) == 0) {
+          empty = ends.get(i) == ends.get(i + 1)
+        }
+        i += 1
+      }
+    }
+    empty
   }
 
   // Data type is passed explicitly to allow overriding the reported type from the column vector.

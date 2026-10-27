@@ -589,7 +589,8 @@ class GpuCoalesceBatchesSuite extends SparkQueryCompareTestSuite {
 
   test("HostToGpuCoalesceIterator keeps row order across bulk and row-by-row Arrow batches") {
     val schema = StructType(Seq(StructField("str", StringType)))
-    // Vectors with 64-bit offsets are copied row by row, and so is every batch after them.
+    // Vectors with 64-bit offsets are copied row by row, into a host column that the batches
+    // after them append to, in bulk where they can.
     val values = Seq(Seq("a", null, "bc"), Seq("g"), Seq("large", null, ""), Seq("d", "ef", null),
       Seq(null, "large2"))
     val isLarge = Seq(false, false, true, false, true)

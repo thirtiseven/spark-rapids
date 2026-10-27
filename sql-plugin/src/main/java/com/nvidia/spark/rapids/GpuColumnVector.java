@@ -219,10 +219,10 @@ public class GpuColumnVector extends GpuColumnVectorBase {
 
     private final List<List<HostColumnVector>> pieces;
     private final Chunk[] chunks;
-    // A column copied row by row goes on that way into one growing host column until the batch
-    // is built: going back to bulk copies would end a host column, and start a small one, for
-    // every batch.
-    private final RapidsHostColumnBuilder[] rowBuilders;
+    // Once a column needs a row-by-row copy, its later batches go into one growing host column
+    // until the batch is built, in bulk where they can: going back to chunks would end a host
+    // column, and start a small one, at every switch.
+    private final RapidsHostColumnBuilder[] growingBuilders;
     private final long[] lastChunkBytes;
     private final long chunkLimit;
 
@@ -237,7 +237,7 @@ public class GpuColumnVector extends GpuColumnVectorBase {
         pieces.add(new ArrayList<>());
       }
       chunks = new Chunk[fields.length];
-      rowBuilders = new RapidsHostColumnBuilder[fields.length];
+      growingBuilders = new RapidsHostColumnBuilder[fields.length];
       lastChunkBytes = new long[fields.length];
       chunkLimit = Math.max(MIN_CHUNK_BYTES,
           Math.min(MAX_CHUNK_BYTES, MAX_BATCH_CHUNK_BYTES / Math.max(1, fields.length)));
@@ -283,18 +283,18 @@ public class GpuColumnVector extends GpuColumnVectorBase {
       return chunk.builder;
     }
 
-    private void finishRowBuilder(int builderIndex) {
-      RapidsHostColumnBuilder builder = rowBuilders[builderIndex];
+    private void finishGrowingBuilder(int builderIndex) {
+      RapidsHostColumnBuilder builder = growingBuilders[builderIndex];
       if (builder != null) {
         pieces.get(builderIndex).add(builder.build());
-        rowBuilders[builderIndex] = null;
+        growingBuilders[builderIndex] = null;
         builder.close();
       }
     }
 
     private ai.rapids.cudf.ColumnVector buildOnDevice(int builderIndex) {
       finishChunk(builderIndex);
-      finishRowBuilder(builderIndex);
+      finishGrowingBuilder(builderIndex);
       return HostColumnarToGpu.concatenateOnDevice(pieces.get(builderIndex));
     }
 
@@ -307,21 +307,23 @@ public class GpuColumnVector extends GpuColumnVectorBase {
 
     @Override
     public long copyColumnar(ColumnVector cv, int colNum, int rows) {
-      if (rowBuilders[colNum] == null && cv instanceof ArrowColumnVector) {
+      RapidsHostColumnBuilder growing = growingBuilders[colNum];
+      if (cv instanceof ArrowColumnVector) {
         long copied = HostColumnarToGpu.arrowBulkCopy((ArrowColumnVector) cv,
-            fields[colNum].dataType(), rows, bytes -> chunkFor(colNum, rows, bytes));
+            fields[colNum].dataType(), rows,
+            bytes -> growing != null ? growing : chunkFor(colNum, rows, bytes));
         if (copied >= 0) {
           return copied;
         }
       }
       StructField field = fields[colNum];
-      if (rowBuilders[colNum] == null) {
+      if (growing == null) {
         // Pieces are concatenated in order, so the open chunk ends before these rows.
         finishChunk(colNum);
-        rowBuilders[colNum] =
+        growingBuilders[colNum] =
             new RapidsHostColumnBuilder(convertFrom(field.dataType(), field.nullable()), rows);
       }
-      return HostColumnarToGpu.columnarCopy(cv, rowBuilders[colNum], field.dataType(), rows);
+      return HostColumnarToGpu.columnarCopy(cv, growingBuilders[colNum], field.dataType(), rows);
     }
 
     private void closePieces(int builderIndex) {
@@ -345,9 +347,9 @@ public class GpuColumnVector extends GpuColumnVectorBase {
           chunks[i].builder.close();
           chunks[i] = null;
         }
-        if (rowBuilders[i] != null) {
-          rowBuilders[i].close();
-          rowBuilders[i] = null;
+        if (growingBuilders[i] != null) {
+          growingBuilders[i].close();
+          growingBuilders[i] = null;
         }
         closePieces(i);
       }

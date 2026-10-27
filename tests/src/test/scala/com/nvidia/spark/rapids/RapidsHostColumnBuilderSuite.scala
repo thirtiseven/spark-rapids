@@ -647,21 +647,27 @@ class RapidsHostColumnBuilderSuite extends AnyFunSuite {
 
   /**
    * Appends the chunks to one builder in bulk and to another row by row, and checks that both
-   * build the same column.
+   * build the same column. The bulk builder also gets every other chunk row by row, as a column
+   * that switched to row-by-row copies does.
    */
   private def assertBulkAppendsMatch[T](dataType: DataType, chunks: Seq[Seq[Option[T]]])(
       appendBulk: (RapidsHostColumnBuilder, Seq[Option[T]], ByteBuffer, Long) => Long)(
       appendRow: (RapidsHostColumnBuilder, T) => Any)(
       read: (HostColumnVector, Int) => Any): Unit = {
-    estimates.foreach { estimate =>
+    def appendByRow(b: RapidsHostColumnBuilder, chunk: Seq[Option[T]]): Unit = chunk.foreach {
+      case Some(v) => appendRow(b, v)
+      case None => b.appendNull()
+    }
+    for (estimate <- estimates; interleave <- Seq(false, true)) {
       withResource(new RapidsHostColumnBuilder(dataType, estimate)) { bulk =>
         withResource(new RapidsHostColumnBuilder(dataType, estimate)) { byRow =>
-          chunks.foreach { chunk =>
-            appendBulk(bulk, chunk, validityOf(chunk), chunk.count(_.isEmpty))
-            chunk.foreach {
-              case Some(v) => appendRow(byRow, v)
-              case None => byRow.appendNull()
+          chunks.zipWithIndex.foreach { case (chunk, c) =>
+            if (interleave && c % 2 == 0) {
+              appendByRow(bulk, chunk)
+            } else {
+              appendBulk(bulk, chunk, validityOf(chunk), chunk.count(_.isEmpty))
             }
+            appendByRow(byRow, chunk)
           }
           withResource(byRow.build()) { expected =>
             withResource(bulk.build()) { actual =>

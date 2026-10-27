@@ -372,6 +372,7 @@ class RegularExpressionTranspilerSuite extends AnyFunSuite {
     doTranspileTest("a|b(?i)|c", "a|b|[cC]")
     doTranspileTest("(?i)a(?-i)b|c", "[aA]b|c")
     doTranspileTest("(?i)a|(?-i)b|c", "[aA]|b|c")
+    doTranspileTest("a(?i)b|x|c(?-i)d", "a[bB]|[xX]|[cC]d")
     // a group restores the outer flag state when it closes, so a flag inside it does not leak
     doTranspileTest("(x|(?i)y)|z", "(x|[yY])|z")
     doTranspileTest("(?i)(a|b(?-i))|c", "([aA]|[bB])|[cC]")
@@ -386,12 +387,12 @@ class RegularExpressionTranspilerSuite extends AnyFunSuite {
     val patterns = Seq("(?i)a|b", "a|(?i)b|c", "a(?i)b|c", "(a(?i)b|c)d", "(?i)a(?-i)b|c",
       "(x|(?i)y)|z", "((?i)a)|b", "a(?i:b)|c", "(?i)a+|b", "(?i)a|b|c", "a|b(?i)|c", "(?-i)a|b",
       "(?i)a|(?-i)b|c", "(?i)(a|b(?-i))|c", "(?i)(?:a|(?-i)b|c)|d", "(a|(?i)b)|c",
-      "(?i)ab|cd|ef", "x(?i)(y|z)|w",
+      "(?i)ab|cd|ef", "x(?i)(y|z)|w", "a(?i)b|c(?-i)d", "a(?i)b|x|c(?-i)d", "a(?i)b|cd|b(?-i)a",
       raw"(?i)\w+=false\||[|]*\w+=false")
     val inputs = Seq("", "a", "A", "b", "B", "c", "C", "d", "D", "x", "X", "y", "Y", "z", "Z",
-      "w", "W", "AB", "Ab", "aB", "cd", "Cd", "cD", "CD", "bd", "Bd", "BD", "ad", "Ad", "ABC",
-      "abcdef", "ABCDEF", "xY", "XY", "xZ", "aaAA", "x=false|", "X=FALSE|y=False",
-      "|x=FALSE", "||Q=False", "q=true|")
+      "w", "W", "AB", "Ab", "aB", "cd", "Cd", "cD", "CD", "bd", "Bd", "BD", "ad", "Ad", "ba", "Ba",
+      "bA", "BA", "ABC", "abcdef", "ABCDEF", "xY", "XY", "xZ", "aaAA", "x=false|",
+      "X=FALSE|y=False", "|x=FALSE", "||Q=False", "q=true|")
     assertCpuGpuMatchesRegexpFind(patterns, inputs)
     assertCpuGpuMatchesRegexpReplace(patterns, inputs)
     doStringSplitTest(patterns.toSet, inputs, -1)

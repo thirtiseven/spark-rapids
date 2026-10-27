@@ -261,16 +261,19 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
   }
 
   /**
-   * Fixes up instances of HostColumnarToGpu that are operating on nested types.
+   * Fixes up instances of HostColumnarToGpu that are operating on nested physical types.
    * There are no batch methods to access nested types in Spark's ColumnVector, and as such
    * HostColumnarToGpu does not support nested types due to the performance problem. If there's
    * nested types involved, use a CPU columnar to row transition followed by a GPU row to
    * columnar transition which is a more optimized code path for these types.
+   * Spark exposes VariantType as a logical atomic type, but its physical columnar representation
+   * is a struct containing value and metadata binary children, so it must take the same path.
    * This is done as a fixup pass since there are earlier transition optimizations that are
    * looking for HostColumnarToGpu when optimizing transitions.
    */
   def fixupHostColumnarTransitions(plan: SparkPlan): SparkPlan = plan match {
-    case HostColumnarToGpu(child, goal) if DataTypeUtils.hasNestedTypes(child.schema) =>
+    case HostColumnarToGpu(child, goal) if DataTypeUtils.hasNestedTypes(child.schema) ||
+        child.schema.fields.exists(field => GpuColumnVector.isVariantType(field.dataType)) =>
       GpuRowToColumnarExec(ColumnarToRowExec(fixupHostColumnarTransitions(child)), goal)
     case p => p.withNewChildren(p.children.map(fixupHostColumnarTransitions))
   }
@@ -427,7 +430,8 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
         }
       case fileSourceScan: GpuFileSourceScanExec =>
         if ((disableUntilInput || disableScanUntilInput(fileSourceScan))) {
-          fileSourceScan.copy(queryUsesInputFile = true)(fileSourceScan.rapidsConf)
+          fileSourceScan.copy(queryUsesInputFile = true)(
+            fileSourceScan.rapidsConf, fileSourceScan.partitionPlanningScan)
         } else {
           fileSourceScan
         }
@@ -465,7 +469,7 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
     }
 
     val prunedPartSchema = Some(StructType(neededPartIndexes.map(fss.relation.partitionSchema)))
-    fss.copy(requiredPartitionSchema = prunedPartSchema)(fss.rapidsConf)
+    fss.copy(requiredPartitionSchema = prunedPartSchema)(fss.rapidsConf, fss.partitionPlanningScan)
   }
 
   // This tries to prune the partition schema for GpuFileSourceScanExec by leveraging

@@ -132,8 +132,8 @@ private[rapids] trait RapidsConfSqlEntries extends RapidsConfResourceEntries {
   val ENABLE_FLOAT_AGG = conf("spark.rapids.sql.variableFloatAgg.enabled")
     .doc("Spark assumes that all operations produce the exact same result each time. " +
       "This is not true for some floating point aggregations, which can produce slightly " +
-      "different results on the GPU as the aggregation is done in parallel.  This can enable " +
-      "those operations if you know the query is only computing it once.")
+      "different results on the GPU as the aggregation is done in parallel.  Set this to false " +
+      "if a query may compute the same aggregation more than once.")
     .booleanConf
     .createWithDefault(true)
 
@@ -655,6 +655,16 @@ private[rapids] trait RapidsConfSqlEntries extends RapidsConfResourceEntries {
     .doc("When set to false disables orc output acceleration")
     .booleanConf
     .createWithDefault(true)
+
+  val ENABLE_ORC_DATE_WRITE = conf("spark.rapids.sql.format.orc.write.dateType.enabled")
+    .doc("When set to true, allows GPU ORC writes containing DATE columns, including nested " +
+      "DATE columns. The cuDF ORC writer does not record calendar metadata, so this is safe " +
+      "only when every DATE value written is on or after 1582-10-15. The plugin does not " +
+      "validate the values; the application must guarantee this range. By default, these " +
+      "writes fall back to the CPU writer.")
+    .sinceVersion("26.10.0")
+    .booleanConf
+    .createWithDefault(false)
 
   val ENABLE_ORC_BOOL = conf("spark.rapids.sql.format.orc.write.boolType.enabled")
     .doc("When set to false disables boolean columns for ORC writes. " +

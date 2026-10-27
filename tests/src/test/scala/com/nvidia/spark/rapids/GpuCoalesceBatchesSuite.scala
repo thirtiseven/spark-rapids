@@ -22,14 +22,15 @@ import java.nio.file.Files
 
 import scala.collection.JavaConverters._
 
-import ai.rapids.cudf.{ColumnVector, ContiguousTable, Cuda, HostColumnVector, Table}
+import ai.rapids.cudf.{ColumnVector, ContiguousTable, Cuda, HostColumnVector, PinnedMemoryPool,
+  Table}
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.format.CodecType
 import org.apache.arrow.memory.{BufferAllocator, RootAllocator}
 import org.apache.arrow.vector.{BaseFixedWidthVector, BaseLargeVariableWidthVector,
   BaseVariableWidthVector, BigIntVector, BitVector, DateDayVector, FieldVector, Float4Vector,
-  Float8Vector, IntVector, LargeVarCharVector, SmallIntVector, TimeStampMicroTZVector,
-  TinyIntVector, VarBinaryVector, VarCharVector}
+  Float8Vector, IntVector, LargeVarBinaryVector, LargeVarCharVector, SmallIntVector,
+  TimeStampMicroTZVector, TinyIntVector, VarBinaryVector, VarCharVector}
 import org.apache.arrow.vector.complex.ListVector
 import org.apache.arrow.vector.complex.MapVector
 import org.apache.arrow.vector.types.{DateUnit, FloatingPointPrecision, TimeUnit}
@@ -588,19 +589,130 @@ class GpuCoalesceBatchesSuite extends SparkQueryCompareTestSuite {
 
   test("HostToGpuCoalesceIterator keeps row order across bulk and row-by-row Arrow batches") {
     val schema = StructType(Seq(StructField("str", StringType)))
-    val values = Seq(Seq("a", null, "bc"), Seq("large", null, ""), Seq("d", "ef", null))
+    // Vectors with 64-bit offsets are copied row by row, and so is every batch after them.
+    val values = Seq(Seq("a", null, "bc"), Seq("g"), Seq("large", null, ""), Seq("d", "ef", null),
+      Seq(null, "large2"))
+    val isLarge = Seq(false, false, true, false, true)
     withResource(new RootAllocator(Long.MaxValue)) { allocator =>
-      val large = new LargeVarCharVector("str", allocator)
-      large.allocateNew()
-      values(1).zipWithIndex.foreach { case (value, i) => setArrowValue(large, i, value) }
-      large.setValueCount(values(1).length)
-      val input = Seq(arrowBatch(allocator, schema, Seq(values.head)),
-        new ColumnarBatch(Array(new ArrowColumnVector(large)), values(1).length),
-        arrowBatch(allocator, schema, Seq(values(2))))
+      val input = values.zip(isLarge).map {
+        case (batchValues, true) =>
+          val large = new LargeVarCharVector("str", allocator)
+          large.allocateNew()
+          batchValues.zipWithIndex.foreach { case (value, i) => setArrowValue(large, i, value) }
+          large.setValueCount(batchValues.length)
+          new ColumnarBatch(Array(new ArrowColumnVector(large)), batchValues.length)
+        case (batchValues, false) =>
+          arrowBatch(allocator, schema, Seq(batchValues))
+      }
       withResource(arrowCoalesce(input.iterator, schema).next()) { gpuBatch =>
         assertColumns(schema, Seq(values.flatten), gpuBatch)
       }
       input.foreach(_.close())
+    }
+  }
+
+  test("HostToGpuCoalesceIterator bounds the host memory of a column whose Arrow batches " +
+      "alternate between bulk and row-by-row copies") {
+    // A batch whose null row keeps its bytes needs a row-by-row copy. Starting a host column at
+    // every switch would hold up to 16 MiB for each such batch.
+    val schema = StructType(Seq(StructField("str", StringType)))
+    val value = ("x" * 100).getBytes(StandardCharsets.UTF_8)
+    val numRows = 100
+    val numBatches = 20
+    val hostLimit = 1L << 30
+    HostAlloc.initialize(hostLimit)
+    try {
+      withResource(new RootAllocator(Long.MaxValue)) { allocator =>
+        val iter = arrowCoalesce(Iterator.empty, schema)
+        (0 until numBatches).foreach { b =>
+          val vector = new VarCharVector("str", allocator)
+          vector.allocateNew()
+          (0 until numRows).foreach(i => vector.setSafe(i, value))
+          if (b % 2 == 1) {
+            vector.setNull(0)
+          }
+          vector.setValueCount(numRows)
+          withResource(new ColumnarBatch(Array(new ArrowColumnVector(vector)), numRows)) {
+            batch =>
+              if (b == 0) {
+                iter.initNewBatch(batch)
+              }
+              iter.addBatchToConcat(batch)
+          }
+        }
+        // Only the plugin's host memory, not the Arrow input
+        val hostBytes =
+          HostAlloc.getUsageRatio() * (PinnedMemoryPool.getTotalPoolSizeBytes + hostLimit)
+        iter.cleanupConcatIsDone()
+        val dataBytes = numBatches * numRows * (value.length + 4L)
+        assert(hostBytes < 3 * dataBytes, s"$hostBytes host bytes for $dataBytes bytes of data")
+      }
+    } finally {
+      HostAlloc.initialize(-1)
+    }
+  }
+
+  test("arrowBulkCopy copies supported Arrow vectors and leaves the others to the caller") {
+    // Both copies build the same values, so only the return value shows which one ran. A
+    // vector left to the caller must not ask for a host column, which would count its rows.
+    def bulkCopy(cv: ArrowColumnVector, dataType: DataType, rows: Int): (Long, Int) = {
+      var calls = 0
+      val copied = withResource(new RapidsHostColumnBuilder(
+          GpuColumnVector.convertFrom(dataType, true), rows)) { builder =>
+        HostColumnarToGpu.arrowBulkCopy(cv, dataType, rows, (_: Long) => {
+          calls += 1
+          builder
+        })
+      }
+      (copied, calls)
+    }
+    def bytes(values: Seq[Any]): Seq[Any] =
+      values.map(v => if (v == null) null else v.toString.getBytes(StandardCharsets.UTF_8))
+    withResource(new RootAllocator(Long.MaxValue)) { allocator =>
+      Seq(
+        StructField("bool", BooleanType) -> Seq(true, null, false),
+        StructField("byte", ByteType) -> Seq(1.toByte, null, 3.toByte),
+        StructField("short", ShortType) -> Seq(1.toShort, null, 3.toShort),
+        StructField("int", IntegerType) -> Seq(1, null, 3),
+        StructField("long", LongType) -> Seq(1L, null, 3L),
+        StructField("float", FloatType) -> Seq(1.5f, null, 3f),
+        StructField("double", DoubleType) -> Seq(1.5, null, 3.0),
+        StructField("date", DateType) -> Seq(1, null, 3),
+        StructField("ts", TimestampType) -> Seq(1L, null, 3L),
+        StructField("str", StringType) -> Seq("a", null, "bc"),
+        StructField("bin", BinaryType) -> bytes(Seq("a", null, "bc"))
+      ).foreach { case (field, values) =>
+        withResource(arrowVector(allocator, field, values)) { cv =>
+          val (copied, calls) = bulkCopy(cv, field.dataType, values.length)
+          assert(copied >= 0 && calls == 1, s"${field.name}: copied $copied with $calls calls")
+        }
+      }
+
+      val largeStrings = new LargeVarCharVector("str", allocator)
+      val largeBinary = new LargeVarBinaryVector("bin", allocator)
+      Seq(largeStrings, largeBinary).foreach { v =>
+        v.allocateNew()
+        v.setSafe(0, "a".getBytes(StandardCharsets.UTF_8))
+        v.setNull(1)
+        v.setValueCount(2)
+      }
+      val nullWithBytes = new VarCharVector("str", allocator)
+      nullWithBytes.allocateNew()
+      nullWithBytes.setSafe(0, "ab".getBytes(StandardCharsets.UTF_8))
+      nullWithBytes.setSafe(1, "c".getBytes(StandardCharsets.UTF_8))
+      nullWithBytes.setNull(0)
+      nullWithBytes.setValueCount(2)
+      val others = Seq(
+        ("64-bit offsets", new ArrowColumnVector(largeStrings), StringType),
+        ("64-bit binary offsets", new ArrowColumnVector(largeBinary), BinaryType),
+        ("a null holding bytes", new ArrowColumnVector(nullWithBytes), StringType),
+        ("more values than rows",
+          arrowVector(allocator, StructField("int", IntegerType), Seq(1, 2, 3)), IntegerType))
+      withResource(others.map(_._2)) { _ =>
+        others.foreach { case (name, cv, dataType) =>
+          assertResult((-1L, 0), name)(bulkCopy(cv, dataType, 2))
+        }
+      }
     }
   }
 

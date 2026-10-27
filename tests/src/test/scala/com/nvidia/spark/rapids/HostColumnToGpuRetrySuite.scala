@@ -67,34 +67,37 @@ class HostColumnToGpuRetrySuite extends RmmSparkRetrySuiteBase {
     }
   }
 
-  test("Arrow column builder frees copied pieces when a GPU OOM hits a later one") {
-    withResource(new RootAllocator()) { allocator =>
-      val allocatedBefore = Rmm.getTotalBytesAllocated
-      RmmSpark.getAndResetNumRetryThrow(/*taskId*/ 1)
-      val batch = withResource(new GpuArrowColumnarBatchBuilder(schema)) { builder =>
-        // Two input batches leave the column in two host pieces.
-        (0 until 2).foreach { _ =>
-          withResource(buildArrowIntColumn(allocator)) { arrowColumn =>
-            builder.copyColumnar(arrowColumn, 0, NUM_ROWS)
+  // Each piece takes one device allocation, so skipping one fails copying the second piece and
+  // skipping two fails the concatenation.
+  Seq(1 -> "the copy of a later one", 2 -> "their concatenation").foreach { case (skip, step) =>
+    test(s"Arrow column builder frees copied pieces when a GPU OOM hits $step") {
+      withResource(new RootAllocator()) { allocator =>
+        val allocatedBefore = Rmm.getTotalBytesAllocated
+        RmmSpark.getAndResetNumRetryThrow(/*taskId*/ 1)
+        val batch = withResource(new GpuArrowColumnarBatchBuilder(schema)) { builder =>
+          // Two input batches leave the column in two host pieces.
+          (0 until 2).foreach { _ =>
+            withResource(buildArrowIntColumn(allocator)) { arrowColumn =>
+              builder.copyColumnar(arrowColumn, 0, NUM_ROWS)
+            }
+          }
+          RmmSpark.forceRetryOOM(RmmSpark.getCurrentThreadId, 1,
+            RmmSpark.OomInjectionType.GPU.ordinal, skip)
+          RmmRapidsRetryIterator.withRetryNoSplit[ColumnarBatch] {
+            builder.tryBuild(2 * NUM_ROWS)
           }
         }
-        // Skip the first piece's device allocation and fail the second one.
-        RmmSpark.forceRetryOOM(RmmSpark.getCurrentThreadId, 1,
-          RmmSpark.OomInjectionType.GPU.ordinal, 1)
-        RmmRapidsRetryIterator.withRetryNoSplit[ColumnarBatch] {
-          builder.tryBuild(2 * NUM_ROWS)
-        }
-      }
-      withResource(batch) { _ =>
-        assertResult(2 * NUM_ROWS)(batch.numRows())
-        withResource(batch.column(0).asInstanceOf[GpuColumnVector].copyToHost()) { hostCol =>
-          (0 until 2 * NUM_ROWS).foreach { pos =>
-            assertResult((pos % NUM_ROWS) * 10)(hostCol.getInt(pos))
+        withResource(batch) { _ =>
+          assertResult(2 * NUM_ROWS)(batch.numRows())
+          withResource(batch.column(0).asInstanceOf[GpuColumnVector].copyToHost()) { hostCol =>
+            (0 until 2 * NUM_ROWS).foreach { pos =>
+              assertResult((pos % NUM_ROWS) * 10)(hostCol.getInt(pos))
+            }
           }
         }
+        assertResult(1)(RmmSpark.getAndResetNumRetryThrow(/*taskId*/ 1))
+        assertResult(allocatedBefore)(Rmm.getTotalBytesAllocated)
       }
-      assertResult(1)(RmmSpark.getAndResetNumRetryThrow(/*taskId*/ 1))
-      assertResult(allocatedBefore)(Rmm.getTotalBytesAllocated)
     }
   }
 

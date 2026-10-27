@@ -610,10 +610,10 @@ class RapidsHostColumnBuilderSuite extends AnyFunSuite {
     }
   }
 
-  // Chunks of 8, 5, 6 and 3 rows start at aligned and unaligned rows of the validity mask. The
-  // third one has no nulls.
+  // Chunks of 8, 5, 6 and 11 rows start at aligned and unaligned rows of the validity mask, and
+  // the last one spans two of its bytes. The third one has no nulls.
   private def chunksOf[T](value: (Int, Int) => T): Seq[Seq[Option[T]]] =
-    Seq(8, 5, 6, 3).zipWithIndex.map { case (size, c) =>
+    Seq(8, 5, 6, 11).zipWithIndex.map { case (size, c) =>
       (0 until size).map(i => if (c != 2 && (i + c) % 3 == 0) None else Some(value(c, i)))
     }
 

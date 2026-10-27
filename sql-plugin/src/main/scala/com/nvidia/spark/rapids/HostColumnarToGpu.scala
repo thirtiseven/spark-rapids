@@ -19,7 +19,11 @@ package com.nvidia.spark.rapids
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.function.LongFunction
 
+import scala.collection.JavaConverters._
+
+import ai.rapids.cudf.HostColumnVector
 import com.nvidia.spark.rapids.Arm.withResource
+import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.shims.{GpuTypeShims, ShimUnaryExecNode}
 import org.apache.arrow.vector.{BaseFixedWidthVector, BaseVariableWidthVector, BigIntVector,
   BitVector, DateDayVector, Float4Vector, Float8Vector, IntVector, SmallIntVector,
@@ -114,6 +118,18 @@ object HostColumnarToGpu extends Logging {
           variableWidthCopy(v, validity, rows, nulls, builderFor, strings = false)
         case _ =>
           -1L
+      }
+    }
+  }
+
+  /** Copies the host pieces of a column to the GPU and concatenates them there. */
+  def concatenateOnDevice(
+      pieces: java.util.List[HostColumnVector]): ai.rapids.cudf.ColumnVector = {
+    if (pieces.size() == 1) {
+      pieces.get(0).copyToDevice()
+    } else {
+      withResource(pieces.asScala.toSeq.safeMap(_.copyToDevice())) { onDevice =>
+        ai.rapids.cudf.ColumnVector.concatenate(onDevice: _*)
       }
     }
   }

@@ -280,23 +280,7 @@ public class GpuColumnVector extends GpuColumnVectorBase {
 
     private ai.rapids.cudf.ColumnVector buildOnDevice(int builderIndex) {
       finishChunk(builderIndex);
-      List<HostColumnVector> columnPieces = pieces.get(builderIndex);
-      if (columnPieces.size() == 1) {
-        return columnPieces.get(0).copyToDevice();
-      }
-      ai.rapids.cudf.ColumnVector[] onDevice = new ai.rapids.cudf.ColumnVector[columnPieces.size()];
-      try {
-        for (int i = 0; i < onDevice.length; i++) {
-          onDevice[i] = columnPieces.get(i).copyToDevice();
-        }
-        return ai.rapids.cudf.ColumnVector.concatenate(onDevice);
-      } finally {
-        for (ai.rapids.cudf.ColumnVector piece : onDevice) {
-          if (piece != null) {
-            piece.close();
-          }
-        }
-      }
+      return HostColumnarToGpu.concatenateOnDevice(pieces.get(builderIndex));
     }
 
     @Override

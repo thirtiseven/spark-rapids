@@ -39,6 +39,7 @@ import org.apache.spark.SparkConf
 import org.apache.spark.sql.catalyst.expressions.ExprId
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.metric.SQLMetric
+import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector
 import org.apache.spark.sql.rapids.ExecutionPlanCaptureCallback
 import org.apache.spark.sql.rapids.metrics.source.MockTaskContext
 import org.apache.spark.sql.types._
@@ -524,6 +525,22 @@ class GpuCoalesceBatchesSuite extends SparkQueryCompareTestSuite {
         withResource(arrowCoalesce(Iterator.single(batch), schema).next()) { gpuBatch =>
           assertColumns(schema, Seq(Seq("abc", null, "f")), gpuBatch)
           assert(!gpuBatch.column(0).asInstanceOf[GpuColumnVector].getBase.hasNonEmptyNulls)
+        }
+      }
+    }
+  }
+
+  test("HostToGpuCoalesceIterator copies batches that mix Arrow and other column vectors") {
+    // A source can return Arrow vectors next to Spark's own, such as for partition values.
+    val schema = StructType(Seq(StructField("str", StringType), StructField("int", IntegerType)))
+    val values = Seq(Seq("a", null, "bc"), Seq(1, 2, 3))
+    withResource(new RootAllocator(Long.MaxValue)) { allocator =>
+      val ints = new OnHeapColumnVector(values(1).length, IntegerType)
+      values(1).zipWithIndex.foreach { case (v: Int, i) => ints.putInt(i, v) }
+      val strings = arrowVector(allocator, schema.fields(0), values.head)
+      withResource(new ColumnarBatch(Array(strings, ints), values(1).length)) { batch =>
+        withResource(arrowCoalesce(Iterator.single(batch), schema).next()) { gpuBatch =>
+          assertColumns(schema, values, gpuBatch)
         }
       }
     }

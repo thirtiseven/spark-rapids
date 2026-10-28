@@ -27,7 +27,7 @@ import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.shims.{GpuTypeShims, ShimUnaryExecNode}
 import org.apache.arrow.vector.{BaseFixedWidthVector, BaseVariableWidthVector, BigIntVector,
   BitVector, DateDayVector, Float4Vector, Float8Vector, IntVector, SmallIntVector,
-  TimeStampMicroTZVector, TinyIntVector, ValueVector, VarBinaryVector, VarCharVector}
+  TimeStampMicroTZVector, TinyIntVector, VarBinaryVector, VarCharVector}
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
@@ -41,33 +41,6 @@ import org.apache.spark.sql.vectorized.{ArrowColumnVector, ColumnarBatch, Column
 
 object HostColumnarToGpu extends Logging {
 
-  // use reflection to get access to a private field in a class
-  private def getClassFieldAccessible(className: String, fieldName: String) = {
-    val classObj = ShimReflectionUtils.loadClass(className)
-    val fields = classObj.getDeclaredFields.toList
-    val field = fields.filter( x => {
-      x.getName.contains(fieldName)
-    }).head
-    field.setAccessible(true)
-    field
-  }
-
-  private lazy val accessorField = {
-    getClassFieldAccessible("org.apache.spark.sql.vectorized.ArrowColumnVector", "accessor")
-  }
-
-  private lazy val vecField = {
-    getClassFieldAccessible("org.apache.spark.sql.vectorized.ArrowColumnVector$ArrowVectorAccessor",
-      "vector")
-  }
-
-  // use reflection to get value vector from ArrowColumnVector
-  private def getArrowValueVector(cv: ColumnVector): ValueVector = {
-    val arrowCV = cv.asInstanceOf[ArrowColumnVector]
-    val accessor = accessorField.get(arrowCV)
-    vecField.get(accessor).asInstanceOf[ValueVector]
-  }
-
   /**
    * Copies an Arrow vector in bulk when cuDF shares its layout for the given type, into the
    * builder that `builderFor` returns for the bytes of the values or of their variable-width
@@ -78,13 +51,7 @@ object HostColumnarToGpu extends Logging {
       dataType: DataType,
       rows: Int,
       builderFor: LongFunction[RapidsHostColumnBuilder]): Long = {
-    val vector = try {
-      getArrowValueVector(cv)
-    } catch {
-      case e: Exception =>
-        throw new IllegalStateException("Trying to read from a ArrowColumnVector but can't " +
-          "access its Arrow ValueVector", e)
-    }
+    val vector = cv.getValueVector
     val nulls = vector.getNullCount.toLong
     lazy val validity: ByteBuffer = if (nulls == 0) {
       null

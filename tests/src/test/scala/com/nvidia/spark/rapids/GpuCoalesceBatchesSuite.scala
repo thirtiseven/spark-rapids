@@ -548,6 +548,7 @@ class GpuCoalesceBatchesSuite extends SparkQueryCompareTestSuite {
   }
 
   test("HostToGpuCoalesceIterator copies Arrow vectors with 64-bit offsets by row") {
+    assume(cmpSparkVersion(3, 5, 0) >= 0, "Spark reads 64-bit offset vectors from 3.5.0 on")
     val schema = StructType(Seq(StructField("str", StringType), StructField("int", IntegerType)))
     val values = Seq(Seq("abc", null, "", "xyz"), Seq(1, 2, null, 4))
     withResource(new RootAllocator(Long.MaxValue)) { allocator =>
@@ -589,21 +590,23 @@ class GpuCoalesceBatchesSuite extends SparkQueryCompareTestSuite {
 
   test("HostToGpuCoalesceIterator keeps row order across bulk and row-by-row Arrow batches") {
     val schema = StructType(Seq(StructField("str", StringType)))
-    // Vectors with 64-bit offsets are copied row by row, into a host column that the batches
-    // after them append to, in bulk where they can.
-    val values = Seq(Seq("a", null, "bc"), Seq("g"), Seq("large", null, ""), Seq("d", "ef", null),
-      Seq(null, "large2"))
-    val isLarge = Seq(false, false, true, false, true)
+    // A batch whose null rows hold bytes is copied row by row, into a host column that the
+    // batches after it append to, in bulk where they can.
+    val values = Seq(Seq("a", null, "bc"), Seq("g"), Seq("x", null, ""), Seq("d", "ef", null),
+      Seq(null, "y"))
+    val nullsHoldBytes = Seq(false, false, true, false, true)
     withResource(new RootAllocator(Long.MaxValue)) { allocator =>
-      val input = values.zip(isLarge).map {
-        case (batchValues, true) =>
-          val large = new LargeVarCharVector("str", allocator)
-          large.allocateNew()
-          batchValues.zipWithIndex.foreach { case (value, i) => setArrowValue(large, i, value) }
-          large.setValueCount(batchValues.length)
-          new ColumnarBatch(Array(new ArrowColumnVector(large)), batchValues.length)
-        case (batchValues, false) =>
-          arrowBatch(allocator, schema, Seq(batchValues))
+      val input = values.zip(nullsHoldBytes).map { case (batchValues, dirty) =>
+        val vector = new VarCharVector("str", allocator)
+        vector.allocateNew()
+        batchValues.zipWithIndex.foreach {
+          case (null, i) if dirty =>
+            vector.setSafe(i, "dirty".getBytes(StandardCharsets.UTF_8))
+            vector.setNull(i)
+          case (value, i) => setArrowValue(vector, i, value)
+        }
+        vector.setValueCount(batchValues.length)
+        new ColumnarBatch(Array(new ArrowColumnVector(vector)), batchValues.length)
       }
       withResource(arrowCoalesce(input.iterator, schema).next()) { gpuBatch =>
         assertColumns(schema, Seq(values.flatten), gpuBatch)
@@ -689,23 +692,29 @@ class GpuCoalesceBatchesSuite extends SparkQueryCompareTestSuite {
         }
       }
 
-      val largeStrings = new LargeVarCharVector("str", allocator)
-      val largeBinary = new LargeVarBinaryVector("bin", allocator)
-      Seq(largeStrings, largeBinary).foreach { v =>
-        v.allocateNew()
-        v.setSafe(0, "a".getBytes(StandardCharsets.UTF_8))
-        v.setNull(1)
-        v.setValueCount(2)
-      }
+      // Spark reads Arrow vectors with 64-bit offsets from 3.5.0 on.
+      val large: Seq[(String, ArrowColumnVector, DataType)] =
+        if (cmpSparkVersion(3, 5, 0) >= 0) {
+          val largeStrings = new LargeVarCharVector("str", allocator)
+          val largeBinary = new LargeVarBinaryVector("bin", allocator)
+          Seq(largeStrings, largeBinary).foreach { v =>
+            v.allocateNew()
+            v.setSafe(0, "a".getBytes(StandardCharsets.UTF_8))
+            v.setNull(1)
+            v.setValueCount(2)
+          }
+          Seq(("64-bit offsets", new ArrowColumnVector(largeStrings), StringType),
+            ("64-bit binary offsets", new ArrowColumnVector(largeBinary), BinaryType))
+        } else {
+          Seq.empty
+        }
       val nullWithBytes = new VarCharVector("str", allocator)
       nullWithBytes.allocateNew()
       nullWithBytes.setSafe(0, "ab".getBytes(StandardCharsets.UTF_8))
       nullWithBytes.setSafe(1, "c".getBytes(StandardCharsets.UTF_8))
       nullWithBytes.setNull(0)
       nullWithBytes.setValueCount(2)
-      val others = Seq(
-        ("64-bit offsets", new ArrowColumnVector(largeStrings), StringType),
-        ("64-bit binary offsets", new ArrowColumnVector(largeBinary), BinaryType),
+      val others = large ++ Seq(
         ("a null holding bytes", new ArrowColumnVector(nullWithBytes), StringType),
         ("more values than rows",
           arrowVector(allocator, StructField("int", IntegerType), Seq(1, 2, 3)), IntegerType))

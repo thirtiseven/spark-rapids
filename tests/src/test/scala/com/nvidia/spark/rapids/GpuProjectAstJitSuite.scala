@@ -18,6 +18,7 @@ package com.nvidia.spark.rapids
 
 import ai.rapids.cudf.{ColumnVector, DType, Table}
 import ai.rapids.cudf.ast.{AstExpression, AstJitProgram, CompiledExpression}
+import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.ProjectAstTestUtils.collectExpressions
 import org.mockito.Mockito.{doThrow, mock, times, verify, when}
@@ -622,6 +623,43 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
     verify(secondProgram, times(1)).close()
     verify(ownerCompiled, times(1)).close()
     verify(siblingCompiled, times(1)).close()
+  }
+
+  test("AST JIT kernel key splits on mask presence only for multi-output groups") {
+    def column(ordinal: Int, nullable: Boolean) =
+      GpuBoundReference(ordinal, LongType, nullable)(NamedExpression.newExprId, s"c$ordinal")
+    def add() = GpuAstJitExpression(
+      GpuAdd(column(0, nullable = false), column(2, nullable = true), failOnError = false)())
+    def multiply() = GpuAstJitExpression(
+      GpuMultiply(column(0, nullable = true), column(2, nullable = true), failOnError = false)())
+
+    val single = GpuAstJitExpression.JitProgramGroup(Seq(add()))
+    assertResult(single.kernelKey(anyInputMasked = false))(single.kernelKey(anyInputMasked = true))
+    // Each task deserializes its own expressions, so equal trees must share one precompile.
+    assertResult(single.kernelKey(anyInputMasked = true))(
+      GpuAstJitExpression.JitProgramGroup(Seq(add())).kernelKey(anyInputMasked = true))
+
+    val multi = GpuAstJitExpression.JitProgramGroup(Seq(add(), multiply()))
+    assert(multi.kernelKey(anyInputMasked = true) != multi.kernelKey(anyInputMasked = false))
+    assertResult(Vector(
+      GpuAstJitExpression.JitPlanInput(0, LongType, nullable = true),
+      GpuAstJitExpression.JitPlanInput(2, LongType, nullable = true)))(multi.planInputs)
+  }
+
+  test("AST JIT lowering table has plan types and the requested mask presence") {
+    val inputs = Vector(
+      GpuAstJitExpression.JitPlanInput(1, LongType, nullable = true),
+      GpuAstJitExpression.JitPlanInput(3, IntegerType, nullable = false))
+    Seq(true, false).foreach { masked =>
+      withResource(GpuAstJitExpression.loweringTable(inputs, masked)) { table =>
+        assertResult(4)(table.getNumberOfColumns)
+        assertResult(1L)(table.getRowCount)
+        assertResult(DType.INT64)(table.getColumn(1).getType)
+        assertResult(DType.INT32)(table.getColumn(3).getType)
+        assertResult(Seq(false, masked, false, masked))(
+          (0 until 4).map(table.getColumn(_).hasValidityVector))
+      }
+    }
   }
 
   test("project AST JIT metrics count failed group attempts without counting each output") {

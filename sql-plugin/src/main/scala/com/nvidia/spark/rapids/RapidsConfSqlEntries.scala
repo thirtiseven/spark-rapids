@@ -291,6 +291,34 @@ private[rapids] trait RapidsConfSqlEntries extends RapidsConfResourceEntries {
       .checkValue(_ > 0, "The maximum AST JIT group output count must be greater than zero.")
       .createWithDefault(32)
 
+  val PROJECT_AST_JIT_PRECOMPILE =
+    conf("spark.rapids.sql.projectAstJit.precompile.enabled")
+      .doc("Start compiling a Project's AST JIT kernels on executor threads when its task " +
+        "starts, so compilation overlaps reading the task's input. The first batch waits for " +
+        "any compilation it needs that has not finished yet.")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
+  val PROJECT_AST_JIT_PRECOMPILE_THREADS =
+    conf("spark.rapids.sql.projectAstJit.precompile.threads")
+      .doc("Number of executor threads that compile AST JIT kernels ahead of the first batch. " +
+        "The first task to precompile on an executor sets the pool size.")
+      .internal()
+      .integerConf
+      .checkValue(_ > 0, "The AST JIT precompile thread count must be greater than zero.")
+      .createWithDefault(2)
+
+  val PROJECT_AST_JIT_PRECOMPILE_SPECULATIVE =
+    conf("spark.rapids.sql.projectAstJit.precompile.speculative")
+      .doc("For a multi-output AST JIT group, also precompile the kernel for the null-mask " +
+        "presence the plan does not predict, after the predicted kernels finish. Whether any " +
+        "input column carries a null mask selects a different kernel, and Spark nullability " +
+        "does not determine it.")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
   val ENABLE_TIERED_PROJECT = conf("spark.rapids.sql.tiered.project.enabled")
       .doc("Enable tiered projections.")
       .internal()

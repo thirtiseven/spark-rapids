@@ -333,6 +333,12 @@ object NvtxRegistry {
   val COMPILE_AST_JIT: NvtxId = NvtxId("Compile AST JIT", NvtxColor.ORANGE,
     "Compiling an AST expression for JIT evaluation")
 
+  val PRECOMPILE_AST_JIT: NvtxId = NvtxId("Precompile AST JIT", NvtxColor.ORANGE,
+    "Compiling an AST JIT kernel on an executor thread before the first batch needs it")
+
+  val WAIT_PRECOMPILE_AST_JIT: NvtxId = NvtxId("Wait for AST JIT precompile", NvtxColor.RED,
+    "Waiting for an in-flight AST JIT precompile needed by the current batch")
+
   // Aggregate operations
   val COMPUTE_AGGREGATE: NvtxId = NvtxId("computeAggregate", NvtxColor.CYAN,
     "Computing aggregation on input batch")
@@ -757,6 +763,8 @@ object NvtxRegistry {
     register(COMPILE_ASTS)
     register(PROJECT_AST_JIT)
     register(COMPILE_AST_JIT)
+    register(PRECOMPILE_AST_JIT)
+    register(WAIT_PRECOMPILE_AST_JIT)
     register(COMPUTE_AGGREGATE)
     register(FINALIZE_AGG)
     register(POST_PROCESS_AGG)

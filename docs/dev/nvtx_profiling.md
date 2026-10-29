@@ -138,6 +138,7 @@ With `spark.rapids.sql.metrics.level=DEBUG`, `GpuProjectExec` exposes:
 | `astJitProgramBuildAttempts` | Calls to construct a schema-bound native program, including failed attempts. |
 | `astJitProgramCacheHits` | Reuse of the owning expression's existing schema-compatible program. |
 | `astJitProgramBuildTime` | Host elapsed time constructing programs, including failures, native cache lookup, and any compilation/waiting inside that call. |
+| `astJitPrecompileWaitTime` | Host elapsed time a program build waited for an executor thread still precompiling the same kernel. Zero unless `spark.rapids.sql.projectAstJit.precompile.enabled` is set. |
 | `astJitEvalAttempts` | Group evaluation calls, including failed attempts. A multi-output group counts once. |
 | `astJitEvalRows` | Input rows summed over group evaluation attempts, including retries and repeated processing by different groups. |
 | `astJitEvalTime` | Host elapsed time of group evaluation, including failed attempts and output wrapping; excludes explicit program construction. |

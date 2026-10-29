@@ -408,6 +408,32 @@ def test_jit_add_multiply(data_gen):
         conf=_project_ast_jit_enabled_conf)
 
 @pytest.mark.parametrize('data_gen', [int_gen, long_gen], ids=idfn)
+@pytest.mark.parametrize('masks', ['present', 'absent'])
+@pytest.mark.parametrize('speculative', ['true', 'false'])
+@disable_ansi_mode
+def test_jit_precompile(spark_tmp_path, data_gen, masks, speculative):
+    # A multi-output group compiles a different kernel when no input carries a null mask, and
+    # Parquet REQUIRED columns arrive without masks although Spark reports them nullable.
+    data_path = spark_tmp_path + '/AST_JIT_PRECOMPILE'
+    type_name = data_gen.data_type.simpleString()
+    if masks == 'present':
+        with_cpu_session(lambda spark: binary_op_df(spark, data_gen).write.parquet(data_path))
+    else:
+        with_cpu_session(lambda spark: spark.range(0, 2048, 1, 4).selectExpr(
+            f"CAST(id * 7 - 3000 AS {type_name}) AS a",
+            f"CAST(id * 13 - 9000 AS {type_name}) AS b").write.parquet(data_path))
+    conf = copy_and_update(_project_ast_jit_enabled_conf, {
+        'spark.rapids.sql.projectAstJit.precompile.enabled': 'true',
+        'spark.rapids.sql.projectAstJit.precompile.speculative': speculative})
+    assert_cpu_and_gpu_are_equal_collect_with_capture(
+        lambda spark: spark.read.parquet(data_path).select(
+            f.col('a') + f.col('b'),
+            f.col('a') * f.col('b')),
+        exist_classes=r"GpuProject.*AST_JIT",
+        non_exist_classes="GpuProjectAst",
+        conf=conf)
+
+@pytest.mark.parametrize('data_gen', [int_gen, long_gen], ids=idfn)
 @disable_ansi_mode
 def test_jit_partial_project_with_unique_unsupported_expression(data_gen):
     assert_cpu_and_gpu_are_equal_collect_with_capture(

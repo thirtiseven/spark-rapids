@@ -16,17 +16,26 @@
 
 package com.nvidia.spark.rapids
 
-import scala.collection.mutable
+import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, ExecutionException,
+  ThreadPoolExecutor}
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.function.BiConsumer
 
-import ai.rapids.cudf.{DType, Table}
+import scala.collection.mutable
+import scala.util.control.NonFatal
+
+import ai.rapids.cudf.{ColumnVector, DType, Scalar, Table}
 import ai.rapids.cudf.ast.{AstExpression, AstJitProgram, CompiledExpression}
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 
-import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.internal.Logging
+import org.apache.spark.sql.catalyst.expressions.{Expression, Literal}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.catalyst.expressions.GpuExpressionEquals
+import org.apache.spark.sql.rapids.execution.TrampolineUtil
+import org.apache.spark.sql.types.DataType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 object GpuAstJitExpression {
@@ -41,25 +50,67 @@ object GpuAstJitExpression {
       dataType: DType,
       nullable: Boolean)
 
-  private final class JitProgramGroup(
+  // Set by the first precompile on this executor, so tasks without one never load the precompiler.
+  @volatile private[rapids] var precompileSubmitted = false
+
+  /** A column referenced by a JIT group, as the bound plan describes it. */
+  private[rapids] final case class JitPlanInput(
+      ordinal: Int,
+      dataType: DataType,
+      nullable: Boolean)
+
+  private[rapids] final class JitProgramGroup(
       val expressions: Vector[GpuAstJitExpression],
-      val referencedOrdinals: Vector[Int]) {
+      val planInputs: Vector[JitPlanInput]) {
+    val referencedOrdinals: Vector[Int] = planInputs.map(_.ordinal)
+
     def matches(other: Seq[GpuAstJitExpression]): Boolean = {
       expressions.size == other.size &&
         expressions.iterator.zip(other.iterator).forall { case (left, right) => left eq right }
     }
+
+    /**
+     * Identifies the native kernel this group compiles to. cuDF gives a multi-output group a
+     * null-aware kernel when any input column carries a null mask, whether or not it holds
+     * nulls; otherwise mask presence does not change the kernel.
+     */
+    def kernelKey(anyInputMasked: Boolean): GpuAstJitPrecompiler.Key =
+      GpuAstJitPrecompiler.Key(expressions.map(_.child), anyInputMasked && expressions.size > 1)
   }
 
-  private object JitProgramGroup {
+  private[rapids] object JitProgramGroup {
     def apply(expressions: Seq[GpuAstJitExpression]): JitProgramGroup = {
       val roots = expressions.toVector
-      val referencedOrdinals = roots.iterator.flatMap { expression =>
-        expression.child.collect {
-          case reference: GpuBoundReference => reference.ordinal
-        }
-      }.toSet.toVector.sorted
-      new JitProgramGroup(roots, referencedOrdinals)
+      val references = roots.flatMap(_.child.collect {
+        case reference: GpuBoundReference => reference
+      })
+      val planInputs = references.groupBy(_.ordinal).toVector.sortBy(_._1).map {
+        case (ordinal, sameColumn) =>
+          JitPlanInput(ordinal, sameColumn.head.dataType, sameColumn.exists(_.nullable))
+      }
+      new JitProgramGroup(roots, planInputs)
     }
+  }
+
+  /**
+   * Builds a one-row table with each input's plan type, where `masked` gives every input a null
+   * mask. Types and mask presence are all a group's kernel depends on, so this table compiles
+   * the kernel a batch will need before any batch exists. Unreferenced ordinals get placeholders.
+   */
+  private[rapids] def loweringTable(inputs: Vector[JitPlanInput], masked: Boolean): Table = {
+    val byOrdinal = inputs.map(input => input.ordinal -> input).toMap
+    val numColumns = inputs.lastOption.map(_.ordinal + 1).getOrElse(1)
+    val columns = (0 until numColumns).safeMap { ordinal =>
+      val scalar = byOrdinal.get(ordinal) match {
+        // A column made from a null scalar carries a null mask; one from a valid scalar does not.
+        case Some(input) =>
+          val value = if (masked) null else Literal.default(input.dataType).value
+          GpuScalar.from(value, input.dataType)
+        case None => Scalar.fromBool(false)
+      }
+      withResource(scalar)(ColumnVector.fromScalar(_, 1))
+    }
+    withResource(columns)(new Table(_: _*))
   }
 
   private def inputSchema(
@@ -237,6 +288,7 @@ case class GpuAstJitExpression(child: GpuExpression, groupId: Int = 0)
   private[this] var programBuildAttempts: GpuMetric = NoopMetric
   private[this] var programCacheHits: GpuMetric = NoopMetric
   private[this] var programBuildTime: GpuMetric = NoopMetric
+  private[this] var precompileWaitTime: GpuMetric = NoopMetric
   private[this] var evalAttempts: GpuMetric = NoopMetric
   private[this] var evalRows: GpuMetric = NoopMetric
   private[this] var evalTime: GpuMetric = NoopMetric
@@ -246,6 +298,7 @@ case class GpuAstJitExpression(child: GpuExpression, groupId: Int = 0)
     programBuildAttempts = metrics.getOrElse(AST_JIT_PROGRAM_BUILD_ATTEMPTS, NoopMetric)
     programCacheHits = metrics.getOrElse(AST_JIT_PROGRAM_CACHE_HITS, NoopMetric)
     programBuildTime = metrics.getOrElse(AST_JIT_PROGRAM_BUILD_TIME, NoopMetric)
+    precompileWaitTime = metrics.getOrElse(AST_JIT_PRECOMPILE_WAIT_TIME, NoopMetric)
     evalAttempts = metrics.getOrElse(AST_JIT_EVAL_ATTEMPTS, NoopMetric)
     evalRows = metrics.getOrElse(AST_JIT_EVAL_ROWS, NoopMetric)
     evalTime = metrics.getOrElse(AST_JIT_EVAL_TIME, NoopMetric)
@@ -284,6 +337,12 @@ case class GpuAstJitExpression(child: GpuExpression, groupId: Int = 0)
     }
     val schema = GpuAstJitExpression.inputSchema(group, table)
     if (jitProgram == null || !groupMatches || jitProgramSchema != schema) {
+      if (GpuAstJitExpression.precompileSubmitted) {
+        // If this kernel is still being precompiled, the build below hits the native cache after.
+        precompileWaitTime.ns {
+          GpuAstJitPrecompiler.awaitInFlight(group.kernelKey(schema.exists(_.nullable)))
+        }
+      }
       val compiledExpressions = group.expressions.map(_.getCompiledExpression).toArray
       programBuildAttempts += 1
       // A program build may hit the native kernel cache without invoking NVRTC.
@@ -310,4 +369,153 @@ case class GpuAstJitExpression(child: GpuExpression, groupId: Int = 0)
   }
 
   override def toString: String = s"AST_JIT($child)"
+}
+
+/**
+ * Compiles a Project's AST JIT kernels on executor threads when its task starts, so NVRTC runs
+ * while the task reads its input instead of after the first batch arrives. A precompile only
+ * fills the process-wide native kernel cache: each task still builds its program from the
+ * batch's actual schema, and that build then hits the cache.
+ */
+private[rapids] object GpuAstJitPrecompiler extends Logging {
+  /** A native kernel: the group's expressions and whether it is the multi-output null-aware one. */
+  final case class Key(roots: Vector[Expression], nullAware: Boolean)
+
+  /**
+   * One kernel compile. Whichever thread claims it first runs it: an executor thread that reaches
+   * it in the queue, or a task that needs it before that happens.
+   */
+  private final class Compile(
+      key: Key,
+      group: GpuAstJitExpression.JitProgramGroup,
+      masked: Boolean) extends Runnable {
+    private val claimed = new AtomicBoolean(false)
+    val finished = new CompletableFuture[Unit]()
+
+    def claim(): Boolean = claimed.compareAndSet(false, true)
+
+    override def run(): Unit = {
+      if (claim()) {
+        try {
+          compileKernel(group, masked)
+          if (compiled.size >= MAX_COMPILED_KEYS) {
+            compiled.clear()
+          }
+          compiled.add(key)
+          finished.complete(())
+        } catch {
+          case t: Throwable =>
+            finished.completeExceptionally(t)
+            if (!NonFatal(t)) throw t
+        } finally {
+          inFlight.remove(key, this)
+        }
+      }
+    }
+  }
+
+  // Only queued and running compiles: a finished one leaves, and the native cache answers after.
+  private val inFlight = new ConcurrentHashMap[Key, Compile]()
+  // Kernels precompiled in this process, so later tasks and queries skip lowering them again. The
+  // native cache still holds them, so forgetting keys at the cap costs only a cache-hit lowering.
+  private val compiled = ConcurrentHashMap.newKeySet[Key]()
+  private val MAX_COMPILED_KEYS = 4096
+  @volatile private var pool: ThreadPoolExecutor = _
+
+  private def getPool(threads: Int): ThreadPoolExecutor = {
+    if (pool == null) {
+      synchronized {
+        if (pool == null) {
+          pool = TrampolineUtil.newDaemonCachedThreadPool("ast-jit-precompile", threads)
+        }
+      }
+    }
+    pool
+  }
+
+  /**
+   * Starts compiling the kernels for every JIT group in `tiers`, for the null masks the plan
+   * predicts. Speculative kernels for the other mask presence start only after those finish.
+   */
+  def submit(
+      tiers: Seq[Seq[Expression]],
+      multiOutputEnabled: Boolean,
+      speculative: Boolean,
+      threads: Int): Unit = {
+    GpuAstJitExpression.precompileSubmitted = true
+    val groups = tiers.flatMap { tier =>
+      GpuAstJitExpression.executionGroups(
+        tier.flatMap(GpuAstJitExpression.extractTopLevel), multiOutputEnabled)
+    }.map(GpuAstJitExpression.JitProgramGroup(_)).filter { group =>
+      group.planInputs.forall(input => GpuBatchUtils.isFixedWidth(input.dataType))
+    }
+    // Plan nullability only predicts masks: file scans report every column nullable, Parquet
+    // REQUIRED columns arrive without a mask, and filtered columns can keep one without nulls.
+    val predicted = groups.map(group => group -> group.planInputs.exists(_.nullable))
+    val pending = predicted.flatMap { case (group, masked) => start(group, masked, threads) }
+    val others = predicted.collect {
+      case (group, masked) if speculative && group.expressions.size > 1 => group -> !masked
+    }
+    if (others.nonEmpty) {
+      // NVRTC is CPU bound and busier cores run at lower clocks, so a speculative compile running
+      // next to a predicted one slows it down.
+      CompletableFuture.allOf(pending: _*).whenComplete(new BiConsumer[Void, Throwable] {
+        override def accept(ignored: Void, failure: Throwable): Unit =
+          others.foreach { case (group, masked) => start(group, masked, threads) }
+      })
+    }
+  }
+
+  /** Starts a compile unless it already ran in this process; returns what to wait for, if any. */
+  private def start(
+      group: GpuAstJitExpression.JitProgramGroup,
+      masked: Boolean,
+      threads: Int): Option[CompletableFuture[Unit]] = {
+    val key = group.kernelKey(masked)
+    if (compiled.contains(key)) {
+      None
+    } else {
+      val compile = new Compile(key, group, masked)
+      val existing = inFlight.putIfAbsent(key, compile)
+      if (existing == null) {
+        getPool(threads).execute(compile)
+        Some(compile.finished)
+      } else {
+        Some(existing.finished)
+      }
+    }
+  }
+
+  private def compileKernel(
+      group: GpuAstJitExpression.JitProgramGroup,
+      masked: Boolean): Unit = NvtxRegistry.PRECOMPILE_AST_JIT {
+    withResource(GpuAstJitExpression.loweringTable(group.planInputs, masked)) { table =>
+      withResource(group.expressions.safeMap(_.child.convertToAst(Int.MaxValue).compileJit())) {
+        compiled => AstJitProgram.compile(table, compiled: _*).close()
+      }
+    }
+  }
+
+  /**
+   * Waits for a running precompile of `key`. One still queued is claimed instead, so the caller
+   * compiles it now; tasks already waiting on it then wait in the native compile cache.
+   */
+  def awaitInFlight(key: Key): Unit = {
+    val compile = inFlight.get(key)
+    if (compile != null) {
+      if (compile.claim()) {
+        inFlight.remove(key, compile)
+        compile.finished.complete(())
+      } else {
+        NvtxRegistry.WAIT_PRECOMPILE_AST_JIT {
+          try {
+            compile.finished.get()
+          } catch {
+            // The caller's own build reports a real failure.
+            case e: ExecutionException => logDebug("AST JIT precompile failed", e.getCause)
+          }
+        }
+      }
+    }
+  }
 }

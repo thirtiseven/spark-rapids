@@ -878,7 +878,9 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
       val batch = GpuColumnVector.from(input, Array[DataType](LongType, LongType))
       withResource(batch) { _ =>
         expressions.zip(jit).foreach { case (expression, jitValues) =>
-          val regular = withResource(expression.columnarEval(batch)) { c => collectLongs(c.getBase) }
+          val regular = withResource(expression.columnarEval(batch)) { c =>
+            collectLongs(c.getBase)
+          }
           assertResult(regular, expression)(jitValues)
         }
       }
@@ -927,7 +929,9 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
         val batch = GpuColumnVector.from(input, Array[DataType](dataType, dataType))
         withResource(batch) { _ =>
           expressions.zip(jit).foreach { case (expression, jitValues) =>
-            val regular = withResource(expression.columnarEval(batch)) { c => collectLongs(c.getBase) }
+            val regular = withResource(expression.columnarEval(batch)) { c =>
+              collectLongs(c.getBase)
+            }
             assertResult(regular, expression)(jitValues)
           }
         }

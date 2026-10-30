@@ -14,12 +14,11 @@
 
 import pytest
 
-from asserts import assert_cpu_and_gpu_are_equal_collect_with_capture, \
-    assert_gpu_and_cpu_are_equal_collect, assert_gpu_and_cpu_error
+from asserts import assert_cpu_and_gpu_are_equal_collect_with_capture, assert_gpu_and_cpu_are_equal_collect
 from data_gen import *
 from marks import approximate_float, datagen_overrides, ignore_order, disable_ansi_mode
-from spark_session import with_cpu_session, is_before_spark_400, is_databricks_version, \
-    is_spark_359, is_spark_403_or_404, is_spark_412_or_later, is_spark_420_or_later
+from spark_session import with_cpu_session, is_databricks_version, is_spark_359, \
+    is_spark_403_or_404, is_spark_412_or_later, is_spark_420_or_later
 import pyspark.sql.functions as f
 
 # Each descriptor contains a list of data generators and a corresponding boolean
@@ -545,34 +544,6 @@ def test_cross_backend_shared_subtree(data_gen, legacy_expr):
         conf=_project_ast_jit_and_legacy_enabled_conf)
 
 
-_project_ast_jit_ansi_conf = copy_and_update(ansi_enabled_conf, _project_ast_jit_enabled_conf)
-
-# The bounds keep every expression below in range, so ANSI mode raises no error.
-@pytest.mark.parametrize('data_gen', [
-    ByteGen(min_val=-11, max_val=11, special_cases=[]),
-    ShortGen(min_val=-181, max_val=181, special_cases=[]),
-    IntegerGen(min_val=-46340, max_val=46340, special_cases=[]),
-    LongGen(min_val=-3037000499, max_val=3037000499, special_cases=[])], ids=idfn)
-def test_jit_ansi_integral_arithmetic(data_gen):
-    assert_cpu_and_gpu_are_equal_collect_with_capture(
-        lambda spark: binary_op_df(spark, data_gen).selectExpr(
-            '(a + b) * 2 AS add_mul', 'a - b AS sub', '-(a * b) AS neg_mul',
-            'abs(a - b) AS abs_sub'),
-        exist_classes=(r'GpuProject.*AST_JIT.*AS add_mul.*AST_JIT.*AS sub.*'
-                       r'AST_JIT.*AS neg_mul.*AST_JIT.*AS abs_sub'),
-        non_exist_classes='GpuProjectAst',
-        conf=_project_ast_jit_ansi_conf)
-
-@pytest.mark.parametrize('data_descr', [(float_gen, True), (double_gen, True)], ids=idfn)
-@pytest.mark.parametrize('jit', ['false', 'true'], ids=['jit_off', 'jit_on'])
-def test_ansi_float_arithmetic_uses_interpreted_ast(data_descr, jit):
-    # Interpreted AST supports ANSI floating-point arithmetic, which AST JIT excludes, so these
-    # roots must convert to interpreted AST operators rather than checked JIT operators.
-    assert_binary_ast(data_descr,
-                      lambda df: df.selectExpr('(a + b) * a', 'abs(a - b)', '-(a * b)'),
-                      conf=copy_and_update(ansi_enabled_conf,
-                                           {'spark.rapids.sql.projectAstJitEnabled': jit}))
-
 @pytest.mark.parametrize('data_gen', [byte_gen, short_gen, int_gen, long_gen], ids=idfn)
 @disable_ansi_mode
 def test_jit_wrapping_integral_arithmetic(data_gen):
@@ -587,48 +558,14 @@ def test_jit_wrapping_integral_arithmetic(data_gen):
         conf=_project_ast_jit_enabled_conf)
 
 @pytest.mark.parametrize('narrow_gen', [byte_gen, short_gen, int_gen], ids=idfn)
-@pytest.mark.parametrize('ansi', [False, True], ids=['legacy', 'ansi'])
-def test_jit_integral_widening_cast(narrow_gen, ansi):
-    # |b| <= 2^31 keeps a * b in range for every narrow type.
-    wide_gen = LongGen(min_val=-(1 << 31), max_val=1 << 31, special_cases=[])
-    conf = copy_and_update(_project_ast_jit_enabled_conf,
-                           {'spark.sql.ansi.enabled': str(ansi).lower()})
+@disable_ansi_mode
+def test_jit_integral_widening_cast(narrow_gen):
     assert_cpu_and_gpu_are_equal_collect_with_capture(
-        lambda spark: two_col_df(spark, narrow_gen, wide_gen).selectExpr(
+        lambda spark: two_col_df(spark, narrow_gen, long_gen).selectExpr(
             'a + b AS widened_sum', 'b * a AS widened_product'),
         exist_classes=r'GpuProject.*AST_JIT.*AS widened_sum.*AST_JIT.*AS widened_product',
         non_exist_classes='GpuProjectAst',
-        conf=conf)
-
-_arithmetic_exception_string = 'org.apache.spark.SparkArithmeticException' \
-    if is_before_spark_400() else 'pyspark.errors.exceptions.captured.ArithmeticException'
-
-# Maps each expression to a row (a, b) that overflows it, given the type's (min, max).
-_jit_ansi_overflow_rows = {
-    'a + b': lambda lo, hi: (hi, 1),
-    'a - b': lambda lo, hi: (lo, 1),
-    'a * b': lambda lo, hi: (hi, 2),
-    '-a': lambda lo, hi: (lo, 0),
-    'abs(a)': lambda lo, hi: (lo, 0),
-    # Only the intermediate sum overflows.
-    '(a + b) - b': lambda lo, hi: (hi, 1)}
-
-@pytest.mark.parametrize('data_type, min_value, max_value', [
-    (ByteType(), BYTE_MIN, BYTE_MAX),
-    (ShortType(), SHORT_MIN, SHORT_MAX),
-    (IntegerType(), INT_MIN, INT_MAX),
-    (LongType(), LONG_MIN, LONG_MAX)], ids=idfn)
-@pytest.mark.parametrize('expr', list(_jit_ansi_overflow_rows), ids=idfn)
-def test_jit_ansi_overflow(data_type, min_value, max_value, expr):
-    # The JIT kernel detects the overflow and the regular GPU path reports it. The second output
-    # never overflows, so it shares the failing JIT program.
-    data = [(1, 1), (None, None), _jit_ansi_overflow_rows[expr](min_value, max_value)]
-    schema = StructType([StructField('a', data_type), StructField('b', data_type)])
-    assert_gpu_and_cpu_error(
-        lambda spark: spark.createDataFrame(data, schema).selectExpr(
-            f'{expr} AS result', 'a * 0 AS zero').collect(),
-        conf=_project_ast_jit_ansi_conf,
-        error_message=_arithmetic_exception_string)
+        conf=_project_ast_jit_enabled_conf)
 
 
 # Each descriptor contains a list of data generators and a corresponding boolean

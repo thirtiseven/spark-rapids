@@ -16,8 +16,9 @@
 
 package com.nvidia.spark.rapids
 
-import ai.rapids.cudf.{ColumnVector, DType, Table}
+import ai.rapids.cudf.{BinaryOp, ColumnVector, CudfException, DType, Table}
 import ai.rapids.cudf.ast.{AstExpression, AstJitProgram, CompiledExpression, JitOperation}
+import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.ProjectAstTestUtils.collectExpressions
 import org.mockito.Mockito.{doThrow, mock, times, verify, when}
@@ -30,7 +31,8 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.{GpuAbs, GpuAdd, GpuBitwiseAnd, GpuGreatest, GpuMultiply,
   GpuSubtract, GpuUnaryMinus}
 import org.apache.spark.sql.rapids.metrics.source.MockTaskContext
-import org.apache.spark.sql.types.{BooleanType, FloatType, IntegerType, LongType}
+import org.apache.spark.sql.types.{BooleanType, ByteType, DataType, DoubleType, FloatType,
+  IntegerType, LongType, ShortType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.TaskCompletionListener
 
@@ -839,6 +841,296 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
         thrown.getMessage)
       astExpression.close()
       verify(compiled, times(1)).close()
+    }
+  }
+
+  private def boundRef(ordinal: Int, dataType: DataType): GpuBoundReference =
+    GpuBoundReference(ordinal, dataType, nullable = true)(NamedExpression.newExprId, s"c$ordinal")
+
+  /** Applies `nulls`' validity without touching the data, so null rows keep their values. */
+  private def withNullsOver(data: ColumnVector, nulls: ColumnVector): ColumnVector =
+    withResource(data) { _ =>
+      withResource(nulls) { _ => data.mergeAndSetValidity(BinaryOp.BITWISE_AND, nulls) }
+    }
+
+  private def longs(values: java.lang.Long*): Seq[java.lang.Long] = values
+
+  /** Builds a table that owns `columns`. */
+  private def gpuTable(columns: ColumnVector*): Table =
+    withResource(columns) { _ => new Table(columns: _*) }
+
+  private def collectLongs(column: ai.rapids.cudf.ColumnView): Seq[java.lang.Long] =
+    withResource(column.copyToHost()) { host =>
+      (0 until host.getRowCount.toInt).map { row =>
+        if (host.isNull(row)) {
+          null
+        } else {
+          java.lang.Long.valueOf(column.getType match {
+            case DType.INT8 => host.getByte(row).toLong
+            case DType.INT16 => host.getShort(row).toLong
+            case DType.INT32 => host.getInt(row).toLong
+            case _ => host.getLong(row)
+          })
+        }
+      }
+    }
+
+  /** Runs the JIT program directly, so a JIT failure is not hidden by the fallback. */
+  private def jitOnly(expressions: Seq[GpuExpression], table: Table): Seq[Seq[java.lang.Long]] = {
+    val roots = expressions.map(GpuAstJitExpression(_))
+    try {
+      withResource(roots.head.getJitProgram(roots, table).computeTable(table)) { result =>
+        (0 until result.getNumberOfColumns).map(i => collectLongs(result.getColumn(i)))
+      }
+    } finally {
+      roots.foreach(_.close())
+    }
+  }
+
+  private def nullableLongTable(): Table = {
+    // Null rows hold values that overflow every checked operation below.
+    val left = withNullsOver(
+      ColumnVector.fromLongs(Long.MaxValue, Long.MinValue, 3L, 4L),
+      ColumnVector.fromBoxedLongs(null, null, 1L, 1L))
+    val right = withNullsOver(
+      ColumnVector.fromLongs(1L, -1L, Long.MaxValue, 2L),
+      ColumnVector.fromBoxedLongs(1L, 1L, null, 1L))
+    gpuTable(left, right)
+  }
+
+  test("ANSI AST JIT ignores overflowing values in null rows") {
+    withResource(nullableLongTable()) { input =>
+      val left = boundRef(0, LongType)
+      val right = boundRef(1, LongType)
+      val results = jitOnly(Seq(
+        GpuAdd(left, right, failOnError = true)(),
+        GpuSubtract(left, right, failOnError = true)(),
+        GpuMultiply(left, right, failOnError = true)(),
+        GpuUnaryMinus(left, failOnError = true),
+        GpuAbs(left, failOnError = true)), input)
+      assertResult(longs(null, null, null, 6L))(results(0))
+      assertResult(longs(null, null, null, 2L))(results(1))
+      assertResult(longs(null, null, null, 8L))(results(2))
+      assertResult(longs(null, null, -3L, -4L))(results(3))
+      assertResult(longs(null, null, 3L, 4L))(results(4))
+    }
+  }
+
+  test("ANSI AST JIT reports overflow from the kernel") {
+    val cases: Seq[(GpuBoundReference => GpuExpression, Long)] = Seq(
+      (r => GpuAdd(r, GpuLiteral(1L, LongType), failOnError = true)(), Long.MaxValue),
+      (r => GpuSubtract(r, GpuLiteral(1L, LongType), failOnError = true)(), Long.MinValue),
+      (r => GpuMultiply(r, GpuLiteral(2L, LongType), failOnError = true)(), Long.MaxValue),
+      (r => GpuUnaryMinus(r, failOnError = true), Long.MinValue),
+      (r => GpuAbs(r, failOnError = true), Long.MinValue))
+    cases.foreach { case (build, overflowing) =>
+      withResource(gpuTable(ColumnVector.fromLongs(0L, overflowing))) { input =>
+        val error = intercept[CudfException] { jitOnly(Seq(build(boundRef(0, LongType))), input) }
+        assert(error.getMessage.contains("ARITHMETIC_OVERFLOW"), error.getMessage)
+      }
+    }
+  }
+
+  test("non-ANSI AST JIT wraps like the regular GPU path") {
+    val values = Seq(Long.MinValue, -1L, 0L, Long.MaxValue)
+    withResource(gpuTable(
+        ColumnVector.fromLongs(values: _*), ColumnVector.fromLongs(1L, 2L, 3L, -1L))) { input =>
+      val left = boundRef(0, LongType)
+      val right = boundRef(1, LongType)
+      val expressions = Seq(
+        GpuAdd(left, right, failOnError = false)(),
+        GpuSubtract(left, right, failOnError = false)(),
+        GpuMultiply(left, right, failOnError = false)(),
+        GpuUnaryMinus(left, failOnError = false),
+        GpuAbs(left, failOnError = false))
+      val jit = jitOnly(expressions, input)
+      val batch = GpuColumnVector.from(input, Array[DataType](LongType, LongType))
+      withResource(batch) { _ =>
+        expressions.zip(jit).foreach { case (expression, jitValues) =>
+          val regular = withResource(expression.columnarEval(batch)) { c => collectLongs(c.getBase) }
+          assertResult(regular, expression)(jitValues)
+        }
+      }
+    }
+  }
+
+  test("AST JIT inlines an integral widening cast") {
+    withResource(gpuTable(
+        ColumnVector.fromBoxedInts(Int.MaxValue, null, -3),
+        ColumnVector.fromLongs(1L, 2L, 3L))) { input =>
+      val widened = GpuCast(boundRef(0, IntegerType), LongType)()
+      val sum = GpuAdd(widened, boundRef(1, LongType), failOnError = true)()
+      assert(GpuAstJitExpression.canUseAstJit(sum))
+      assert(!GpuAstJitExpression.canUseAstJit(widened))
+      assertResult(Seq(longs(Int.MaxValue + 1L, null, 0L)))(jitOnly(Seq(sum), input))
+    }
+  }
+
+  test("a JIT overflow throws the regular GPU error") {
+    withResource(gpuTable(
+        ColumnVector.fromLongs(1L, Long.MaxValue), ColumnVector.fromLongs(1L, 1L))) { input =>
+      val left = boundRef(0, LongType)
+      val right = boundRef(1, LongType)
+      // Only the second output overflows; the group reports it like the regular path does.
+      val roots = Seq(
+        GpuAstJitExpression(GpuMultiply(left, right, failOnError = true)()),
+        GpuAstJitExpression(GpuAdd(left, right, failOnError = true)()))
+      val batch = GpuColumnVector.from(input, Array[DataType](LongType, LongType))
+      try {
+        withResource(batch) { _ =>
+          val error = intercept[ArithmeticException] {
+            GpuAstJitExpression.computeColumns(roots, input, batch).close()
+          }
+          assert(error.getMessage.contains("overflow"), error.getMessage)
+          assert(error.getSuppressed.exists(_.isInstanceOf[CudfException]))
+        }
+      } finally {
+        roots.foreach(_.close())
+      }
+    }
+  }
+
+  test("a JIT group without errors returns the JIT columns") {
+    withResource(nullableLongTable()) { input =>
+      val left = boundRef(0, LongType)
+      val right = boundRef(1, LongType)
+      val roots = Seq(
+        GpuAstJitExpression(GpuAdd(left, right, failOnError = true)()),
+        GpuAstJitExpression(GpuUnaryMinus(right, failOnError = true)))
+      val batch = GpuColumnVector.from(input, Array[DataType](LongType, LongType))
+      try {
+        withResource(batch) { _ =>
+          withResource(GpuAstJitExpression.computeColumns(roots, input, batch)) { result =>
+            def column(i: Int) = result.column(i).asInstanceOf[GpuColumnVector].getBase
+            assertResult(longs(null, null, null, 6L))(collectLongs(column(0)))
+            assertResult(longs(-1L, 1L, null, -2L))(collectLongs(column(1)))
+          }
+        }
+      } finally {
+        roots.foreach(_.close())
+      }
+    }
+  }
+
+  // Spark wraps or checks byte and short arithmetic at every step. A kernel that kept a promoted
+  // intermediate would differ for abs of a wrapped value and miss an overflow undone by a later
+  // operation.
+  for ((dataType, min, max) <- Seq(
+      (ByteType, Byte.MinValue.toLong, Byte.MaxValue.toLong),
+      (ShortType, Short.MinValue.toLong, Short.MaxValue.toLong))) {
+    def column(values: Long*): ColumnVector = dataType match {
+      case ByteType => ColumnVector.fromBytes(values.map(_.toByte): _*)
+      case _ => ColumnVector.fromShorts(values.map(_.toShort): _*)
+    }
+
+    test(s"non-ANSI AST JIT wraps $dataType at each operation like the regular GPU path") {
+      withResource(gpuTable(
+          column(max, min, max - 27, -1L, 0L, 3L),
+          column(1L, -1L, max - 27, min, 5L, -7L))) { input =>
+        val left = boundRef(0, dataType)
+        val right = boundRef(1, dataType)
+        val sum = GpuAdd(left, right, failOnError = false)()
+        val expressions = Seq(
+          sum,
+          GpuSubtract(left, right, failOnError = false)(),
+          GpuMultiply(left, right, failOnError = false)(),
+          GpuUnaryMinus(left, failOnError = false),
+          GpuAbs(left, failOnError = false),
+          GpuAbs(sum, failOnError = false),
+          GpuSubtract(GpuMultiply(sum, right, failOnError = false)(), left,
+            failOnError = false)())
+        val jit = jitOnly(expressions, input)
+        val batch = GpuColumnVector.from(input, Array[DataType](dataType, dataType))
+        withResource(batch) { _ =>
+          expressions.zip(jit).foreach { case (expression, jitValues) =>
+            val regular = withResource(expression.columnarEval(batch)) { c => collectLongs(c.getBase) }
+            assertResult(regular, expression)(jitValues)
+          }
+        }
+      }
+    }
+
+    test(s"ANSI AST JIT reports $dataType overflow in an intermediate result") {
+      // max + 1 overflows even though (max + 1) - 1 is back in range.
+      withResource(gpuTable(column(0L, max), column(1L, 1L))) { input =>
+        val left = boundRef(0, dataType)
+        val right = boundRef(1, dataType)
+        val expression = GpuSubtract(
+          GpuAdd(left, right, failOnError = true)(), right, failOnError = true)()
+        val error = intercept[CudfException] { jitOnly(Seq(expression), input) }
+        assert(error.getMessage.contains("ARITHMETIC_OVERFLOW"), error.getMessage)
+      }
+    }
+  }
+
+  test("ANSI floating-point arithmetic keeps interpreted AST operators") {
+    // Interpreted AST accepts ANSI floating-point arithmetic, so it must not get checked JIT
+    // operators, which only AST JIT can compile.
+    val left = GpuBoundReference(0, DoubleType, nullable = true)(NamedExpression.newExprId, "l")
+    val right = GpuBoundReference(1, DoubleType, nullable = true)(NamedExpression.newExprId, "r")
+    Seq(
+      GpuAdd(left, right, failOnError = true)(),
+      GpuSubtract(left, right, failOnError = true)(),
+      GpuMultiply(left, right, failOnError = true)(),
+      GpuUnaryMinus(left, failOnError = true),
+      GpuAbs(left, failOnError = true)).foreach { expression =>
+      assert(!expression.convertToAst(Int.MaxValue).isInstanceOf[JitOperation], expression)
+    }
+  }
+
+  /** Fails every evaluation with a real cuDF schema error, unlike a checked overflow. */
+  private def failingJit(child: GpuExpression): GpuAstJitExpression =
+    new GpuAstJitExpression(child) {
+      override protected def compileJitProgram(
+          table: Table,
+          expressions: Array[CompiledExpression]): AstJitProgram =
+        withResource(gpuTable(ColumnVector.fromInts(0), ColumnVector.fromInts(0))) { int32 =>
+          AstJitProgram.compile(int32, expressions: _*)
+        }
+    }
+
+  test("a failed JIT group returns the regular GPU result") {
+    withResource(gpuTable(
+        ColumnVector.fromLongs(1L, Long.MaxValue, 3L),
+        ColumnVector.fromLongs(2L, 1L, -3L))) { input =>
+      val left = boundRef(0, LongType)
+      val right = boundRef(1, LongType)
+      val roots = Seq(
+        failingJit(GpuAdd(left, right, failOnError = false)()),
+        failingJit(GpuMultiply(left, right, failOnError = false)()))
+      val batch = GpuColumnVector.from(input, Array[DataType](LongType, LongType))
+      try {
+        withResource(batch) { _ =>
+          withResource(GpuAstJitExpression.computeColumns(roots, input, batch)) { result =>
+            def column(i: Int) = result.column(i).asInstanceOf[GpuColumnVector].getBase
+            assertResult(longs(3L, Long.MinValue, 0L))(collectLongs(column(0)))
+            assertResult(longs(2L, Long.MaxValue, -9L))(collectLongs(column(1)))
+          }
+          // The input batch still owns its columns after the fallback.
+          assertResult(longs(1L, Long.MaxValue, 3L))(
+            collectLongs(batch.column(0).asInstanceOf[GpuColumnVector].getBase))
+        }
+      } finally {
+        roots.foreach(_.close())
+      }
+    }
+  }
+
+  test("a failed single JIT expression returns the regular GPU result") {
+    withResource(gpuTable(
+        ColumnVector.fromLongs(1L, Long.MaxValue), ColumnVector.fromLongs(2L, 1L))) { input =>
+      val root = failingJit(
+        GpuSubtract(boundRef(0, LongType), boundRef(1, LongType), failOnError = false)())
+      val batch = GpuColumnVector.from(input, Array[DataType](LongType, LongType))
+      try {
+        withResource(batch) { _ =>
+          withResource(root.columnarEval(batch)) { result =>
+            assertResult(longs(-1L, Long.MaxValue - 1))(collectLongs(result.getBase))
+          }
+        }
+      } finally {
+        root.close()
+      }
     }
   }
 }

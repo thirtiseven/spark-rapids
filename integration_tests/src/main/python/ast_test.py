@@ -563,6 +563,16 @@ def test_jit_ansi_integral_arithmetic(data_gen):
         non_exist_classes='GpuProjectAst',
         conf=_project_ast_jit_ansi_conf)
 
+@pytest.mark.parametrize('data_descr', [(float_gen, True), (double_gen, True)], ids=idfn)
+@pytest.mark.parametrize('jit', ['false', 'true'], ids=['jit_off', 'jit_on'])
+def test_ansi_float_arithmetic_uses_interpreted_ast(data_descr, jit):
+    # Interpreted AST supports ANSI floating-point arithmetic, which AST JIT excludes, so these
+    # roots must convert to interpreted AST operators rather than checked JIT operators.
+    assert_binary_ast(data_descr,
+                      lambda df: df.selectExpr('(a + b) * a', 'abs(a - b)', '-(a * b)'),
+                      conf=copy_and_update(ansi_enabled_conf,
+                                           {'spark.rapids.sql.projectAstJitEnabled': jit}))
+
 @pytest.mark.parametrize('data_gen', [byte_gen, short_gen, int_gen, long_gen], ids=idfn)
 @disable_ansi_mode
 def test_jit_wrapping_integral_arithmetic(data_gen):

@@ -293,7 +293,11 @@ case class GpuAbs(child: Expression, failOnError: Boolean) extends CudfUnaryExpr
   override protected def astJitCompatible: Boolean = dataType.isInstanceOf[IntegralType]
 
   override protected def astJitErrorOperator: Option[ast.JitOperator] =
-    if (failOnError) Some(ast.JitOperator.ABS_OVERFLOW) else None
+    if (failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType)) {
+      Some(ast.JitOperator.ABS_OVERFLOW)
+    } else {
+      None
+    }
 
   override def hasSideEffects: Boolean = super.hasSideEffects ||
     (failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType))
@@ -333,7 +337,11 @@ abstract class GpuAddBase extends CudfBinaryArithmetic with Serializable {
   override protected def astJitCompatible: Boolean = dataType.isInstanceOf[IntegralType]
 
   override protected def astJitErrorOperator: Option[ast.JitOperator] =
-    if (failOnError) Some(ast.JitOperator.ADD_OVERFLOW) else None
+    if (failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType)) {
+      Some(ast.JitOperator.ADD_OVERFLOW)
+    } else {
+      None
+    }
 
   override def hasSideEffects: Boolean =
     (failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType)) || super.hasSideEffects
@@ -370,7 +378,11 @@ abstract class GpuSubtractBase extends CudfBinaryArithmetic with Serializable {
   override protected def astJitCompatible: Boolean = dataType.isInstanceOf[IntegralType]
 
   override protected def astJitErrorOperator: Option[ast.JitOperator] =
-    if (failOnError) Some(ast.JitOperator.SUB_OVERFLOW) else None
+    if (failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType)) {
+      Some(ast.JitOperator.SUB_OVERFLOW)
+    } else {
+      None
+    }
 
   private[this] def decimalOpOverflowCheck(
       lhs: BinaryOperable,
@@ -740,7 +752,11 @@ case class GpuMultiply(
   override protected def astJitCompatible: Boolean = dataType.isInstanceOf[IntegralType]
 
   override protected def astJitErrorOperator: Option[ast.JitOperator] =
-    if (failOnError) Some(ast.JitOperator.MUL_OVERFLOW) else None
+    if (failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType)) {
+      Some(ast.JitOperator.MUL_OVERFLOW)
+    } else {
+      None
+    }
 
   private def multiplyOverflowError(msg: String): ArithmeticException = {
     RapidsErrorUtils.arithmeticOverflowError(msg, origin)

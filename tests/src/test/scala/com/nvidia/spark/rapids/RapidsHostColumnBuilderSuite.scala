@@ -728,6 +728,58 @@ class RapidsHostColumnBuilderSuite extends AnyFunSuite {
       b.appendByteLists(offsets, data, validity, chunk.length, nulls)
     } { (b, v) => b.appendByteList(v) } { (v, i) => v.getBytesFromList(i).toSeq }
   }
+
+  test("the bulk appends check the column type and the null count without assertions") {
+    val values = ByteBuffer.allocate(16)
+    // Row 1 of 3 is null.
+    val validity = ByteBuffer.wrap(Array[Byte](5))
+    withResource(new RapidsHostColumnBuilder(intType, 4)) { b =>
+      intercept[IllegalStateException](b.appendBooleanBits(values, null, 3, 0))
+      intercept[IllegalStateException](b.appendStrings(values, values, null, 3, 0))
+      intercept[IllegalStateException](b.appendByteLists(values, values, null, 3, 0))
+      intercept[IllegalArgumentException](b.appendFixedWidth(values, validity, 3, 0))
+      intercept[IllegalArgumentException](b.appendFixedWidth(values, validity, 3, 2))
+      intercept[IllegalArgumentException](b.appendFixedWidth(values, null, 3, 1))
+      // The rejected appends left the builder as it was.
+      b.appendFixedWidth(values, validity, 3, 1)
+      withResource(b.build()) { v =>
+        assertResult(3L)(v.getRowCount)
+        assertResult(1L)(v.getNullCount)
+        assertNullCountsMatchMasks(v)
+      }
+    }
+    withResource(new RapidsHostColumnBuilder(stringType, 4)) { b =>
+      intercept[IllegalStateException](b.appendFixedWidth(values, null, 3, 0))
+    }
+  }
+
+  test("a bulk append that would cross a limit is rejected before it changes the builder") {
+    val limit = 6
+    withLimits(limits(fixedWidthElements = limit)) {
+      withResource(new RapidsHostColumnBuilder(intType, 1)) { b =>
+        assertRejects(elementsMessage(limit + 1L, limit, DType.INT32)) {
+          b.appendFixedWidth(ByteBuffer.allocate((limit + 1) * 4), null, limit + 1, 0)
+        }
+        assertResult(0)(b.getCurrentIndex)
+      }
+    }
+    withLimits(limits(offsetRows = 2)) {
+      withResource(new RapidsHostColumnBuilder(binaryType, 1)) { b =>
+        val (offsets, bytes) = variableWidth(Seq(Some(Array[Byte](1, 2))))
+        b.appendByteLists(offsets, bytes, null, 1, 0)
+        // The parent rejects the rows before its child takes their bytes.
+        val (more, moreBytes) = variableWidth(Seq(Some(Array[Byte](3)), Some(Array[Byte](4))))
+        assertRejects(rowsMessage(3, 2, DType.LIST)) {
+          b.appendByteLists(more, moreBytes, null, 2, 0)
+        }
+        withResource(b.build()) { v =>
+          assertResult(1L)(v.getRowCount)
+          assertResult(2L)(v.getChildColumnView(0).getRowCount)
+          assert(v.getBytesFromList(0).sameElements(Array[Byte](1, 2)))
+        }
+      }
+    }
+  }
 }
 
 /** Helpers for the suites that lower the builder's limits. */

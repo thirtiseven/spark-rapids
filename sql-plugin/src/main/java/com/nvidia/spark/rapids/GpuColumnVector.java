@@ -269,6 +269,10 @@ public class GpuColumnVector extends GpuColumnVectorBase {
         boolean variableWidth =
             field.dataType() instanceof StringType || field.dataType() instanceof BinaryType;
         long bytes = variableWidth ? dataBytes + ((long) rows << 2) : dataBytes;
+        if (field.nullable()) {
+          // A validity bit per row, as a null can come in any batch
+          bytes += ((long) rows + 7) >> 3;
+        }
         // Chunks double up to the limit, so a short input does not take much memory.
         long capacity = Math.max(bytes, Math.min(chunkLimit, 2 * lastChunkBytes[colNum]));
         long scale = Math.max(1, capacity / Math.max(1, bytes));
@@ -300,9 +304,10 @@ public class GpuColumnVector extends GpuColumnVectorBase {
 
     @Override
     protected ai.rapids.cudf.ColumnVector buildAndPutOnDevice(int builderIndex) {
-      ai.rapids.cudf.ColumnVector cv = buildOnDevice(builderIndex);
-      closePieces(builderIndex);
-      return cv;
+      return Arm.closeOnExcept(buildOnDevice(builderIndex), cv -> {
+        closePieces(builderIndex);
+        return cv;
+      });
     }
 
     @Override
@@ -327,11 +332,7 @@ public class GpuColumnVector extends GpuColumnVectorBase {
     }
 
     private void closePieces(int builderIndex) {
-      List<HostColumnVector> columnPieces = pieces.get(builderIndex);
-      for (HostColumnVector piece : columnPieces) {
-        piece.close();
-      }
-      columnPieces.clear();
+      HostColumnarToGpu.closeAll(pieces.get(builderIndex));
     }
 
     @Override
@@ -342,17 +343,20 @@ public class GpuColumnVector extends GpuColumnVectorBase {
 
     @Override
     public void close() {
+      List<AutoCloseable> toClose = new ArrayList<>();
       for (int i = 0; i < pieces.size(); i++) {
         if (chunks[i] != null) {
-          chunks[i].builder.close();
+          toClose.add(chunks[i].builder);
           chunks[i] = null;
         }
         if (growingBuilders[i] != null) {
-          growingBuilders[i].close();
+          toClose.add(growingBuilders[i]);
           growingBuilders[i] = null;
         }
-        closePieces(i);
+        toClose.addAll(pieces.get(i));
+        pieces.get(i).clear();
       }
+      HostColumnarToGpu.closeAll(toClose);
     }
   }
 

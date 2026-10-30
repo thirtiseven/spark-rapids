@@ -101,6 +101,15 @@ object HostColumnarToGpu extends Logging {
     }
   }
 
+  /** Closes every resource in the list, even if some fail to close, and empties it. */
+  def closeAll[T <: AutoCloseable](resources: java.util.List[T]): Unit = {
+    try {
+      resources.asScala.safeClose()
+    } finally {
+      resources.clear()
+    }
+  }
+
   private def variableWidthCopy(
       v: BaseVariableWidthVector,
       validity: ByteBuffer,

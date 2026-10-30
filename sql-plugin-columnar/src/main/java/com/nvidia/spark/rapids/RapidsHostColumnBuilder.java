@@ -485,6 +485,13 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
    * @param stringLength number of bytes required by the next row
    */
   private void growStringBuffersAndRows(int stringLength) {
+    // Short enough for the JIT to inline into each per-row append, which it does not do for the
+    // general method below.
+    if (offsets != null && rows < rowCapacity &&
+        currentStringByteIndex + (long) stringLength <= data.getLength()) {
+      rows++;
+      return;
+    }
     growStringBuffersAndRows(1, stringLength);
   }
 
@@ -904,6 +911,8 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
   // The bulk appends below take buffers laid out as in Arrow, which cuDF shares for these types:
   // values back to back, 32-bit offsets for variable-width rows, and a validity bitmap with bit i
   // for row i. nulls must be the number of null rows, and validity may be null when it is 0.
+  // They must be public, as HostColumnarToGpu can be in another runtime package (see Classloader
+  // Coupling in docs/dev/shims.md), so they check their arguments without assertions.
 
   /**
    * Appends {@code numRows} fixed-width values.
@@ -911,7 +920,8 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
    * @return the number of bytes appended
    */
   public long appendFixedWidth(ByteBuffer values, ByteBuffer validity, int numRows, long nulls) {
-    assert !type.isNestedType() && !type.equals(DType.STRING) && !type.equals(DType.BOOL8);
+    checkBulkType(!type.isNestedType() && !type.equals(DType.STRING) && !type.equals(DType.BOOL8));
+    checkNulls(validity, numRows, nulls);
     long firstRow = currentIndex;
     long bytes = (long) numRows << bitShiftBySize;
     if (numRows > 0) {
@@ -929,7 +939,8 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
    * @return the number of bytes appended
    */
   public long appendBooleanBits(ByteBuffer bits, ByteBuffer validity, int numRows, long nulls) {
-    assert type.equals(DType.BOOL8);
+    checkBulkType(type.equals(DType.BOOL8));
+    checkNulls(validity, numRows, nulls);
     long firstRow = currentIndex;
     if (numRows > 0) {
       growFixedWidthBuffersAndRows(numRows);
@@ -946,11 +957,12 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
    * Appends {@code numRows} strings stored in {@code chars} at the given {@code offsets}.
    * Null rows must be empty.
    *
-   * @return the number of bytes appended
+   * @return the number of bytes appended, including the offsets
    */
   public long appendStrings(ByteBuffer offsets, ByteBuffer chars, ByteBuffer validity,
       int numRows, long nulls) {
-    assert type.equals(DType.STRING) : " type " + type + " is not String";
+    checkBulkType(type.equals(DType.STRING));
+    checkNulls(validity, numRows, nulls);
     if (numRows == 0) {
       return 0;
     }
@@ -965,7 +977,7 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
     currentStringByteIndex += length;
     currentIndex += numRows;
     appendNulls(validity, firstRow, numRows, nulls);
-    return length;
+    return length + ((long) numRows << bitShiftByOffset);
   }
 
   /**
@@ -976,7 +988,8 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
    */
   public long appendByteLists(ByteBuffer offsets, ByteBuffer bytes, ByteBuffer validity,
       int numRows, long nulls) {
-    assert type.equals(DType.LIST) : " type " + type + " is not LIST";
+    checkBulkType(type.equals(DType.LIST) && getChild(0).type.isBackedByByte());
+    checkNulls(validity, numRows, nulls);
     if (numRows == 0) {
       return 0;
     }
@@ -986,7 +999,6 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
     int first = srcOffsets.getInt(0);
     int length = srcOffsets.getInt(numRows << bitShiftByOffset) - first;
     RapidsHostColumnBuilder child = getChild(0);
-    assert child.type.isBackedByByte();
     long firstRow = currentIndex;
     int firstChild = child.getCurrentIndex();
     if (length > 0) {
@@ -999,6 +1011,36 @@ public final class RapidsHostColumnBuilder implements AutoCloseable {
     currentIndex += numRows;
     appendNulls(validity, firstRow, numRows, nulls);
     return length + ((long) numRows << bitShiftByOffset);
+  }
+
+  private void checkBulkType(boolean supported) {
+    if (!supported) {
+      throw new IllegalStateException("This bulk append does not support a column of type " +
+          type);
+    }
+  }
+
+  // The column takes its null count from nulls, so it must match the validity.
+  private static void checkNulls(ByteBuffer validity, int numRows, long nulls) {
+    if (numRows < 0) {
+      throw new IllegalArgumentException("The number of rows cannot be negative, got " + numRows);
+    }
+    long validityNulls = 0;
+    if (validity != null) {
+      int fullBytes = numRows >> 3;
+      for (int b = 0; b < fullBytes; b++) {
+        validityNulls += Byte.SIZE - Integer.bitCount(validity.get(b) & 0xFF);
+      }
+      int tailRows = numRows & 7;
+      if (tailRows > 0) {
+        validityNulls += tailRows -
+            Integer.bitCount(validity.get(fullBytes) & ((1 << tailRows) - 1));
+      }
+    }
+    if (nulls != validityNulls) {
+      throw new IllegalArgumentException("The null count is " + nulls + ", but the validity has " +
+          validityNulls + " nulls in " + numRows + " rows");
+    }
   }
 
   private static void copyFrom(ByteBuffer src, int srcOffset, HostMemoryBuffer dst,

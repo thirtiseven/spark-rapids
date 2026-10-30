@@ -62,7 +62,7 @@ trait GpuProjectAstExpressionBase
     toClose.safeClose()
   }
 
-  override final def columnarEval(batch: ColumnarBatch): GpuColumnVector = {
+  override def columnarEval(batch: ColumnarBatch): GpuColumnVector = {
     withResource(GpuProjectAstExpressionBase.tableFromBatch(batch)) { table =>
       computeColumn(table)
     }

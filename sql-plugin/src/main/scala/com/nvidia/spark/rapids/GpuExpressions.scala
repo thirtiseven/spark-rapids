@@ -355,13 +355,24 @@ trait CudfUnaryExpression extends GpuUnaryExpression {
 
   override final def selfIsAstJitOperator: Boolean = selfSupportsAstJit
 
+  /**
+   * The checked AST JIT operator that reports this node's evaluation errors in its current mode.
+   * Interpreted AST rejects such modes, so only AST JIT converts to it.
+   */
+  protected def astJitErrorOperator: Option[ast.JitOperator] = None
+
   override def doColumnar(input: GpuColumnVector): ColumnVector = input.getBase.unaryOp(unaryOp)
 
   override def convertToAst(numFirstTableColumns: Int): ast.AstExpression = {
-    val astOp = CudfUnaryExpression.opToAstMap.getOrElse(unaryOp,
-      throw new IllegalStateException(s"${this.getClass.getSimpleName} is not supported by AST"))
-    new ast.UnaryOperation(astOp,
-      child.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns))
+    val input = child.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns)
+    astJitErrorOperator match {
+      case Some(jitOp) => new ast.JitOperation(jitOp, input)
+      case None =>
+        val astOp = CudfUnaryExpression.opToAstMap.getOrElse(unaryOp,
+          throw new IllegalStateException(
+            s"${this.getClass.getSimpleName} is not supported by AST"))
+        new ast.UnaryOperation(astOp, input)
+    }
   }
 }
 
@@ -432,6 +443,12 @@ trait CudfBinaryExpression extends GpuBinaryExpression {
 
   override final def selfIsAstJitOperator: Boolean = selfSupportsAstJit
 
+  /**
+   * The checked AST JIT operator that reports this node's evaluation errors in its current mode.
+   * Interpreted AST rejects such modes, so only AST JIT converts to it.
+   */
+  protected def astJitErrorOperator: Option[ast.JitOperator] = None
+
   def outputType(l: BinaryOperable, r: BinaryOperable): DType = {
     val over = outputTypeOverride
     if (over == null) {
@@ -481,9 +498,12 @@ trait CudfBinaryExpression extends GpuBinaryExpression {
     val astOp = astOperator.getOrElse(
       throw new IllegalStateException(s"$this is not supported by AST"))
     assert(left.dataType == right.dataType)
-    new ast.BinaryOperation(astOp,
-      left.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns),
-      right.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns))
+    val lhs = left.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns)
+    val rhs = right.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns)
+    astJitErrorOperator match {
+      case Some(jitOp) => new ast.JitOperation(jitOp, lhs, rhs)
+      case None => new ast.BinaryOperation(astOp, lhs, rhs)
+    }
   }
 }
 

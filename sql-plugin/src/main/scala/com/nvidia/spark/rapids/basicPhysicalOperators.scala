@@ -171,7 +171,7 @@ object GpuProjectExec {
               RapidsConf.ENABLE_PROJECT_AST_JIT_MULTI_OUTPUT.get(SQLConf.get))
             if (jitGroups.nonEmpty) {
               val jitBatches = jitGroups.safeMap(
-                GpuAstJitExpression.computeColumns(_, table))
+                GpuAstJitExpression.computeColumns(_, table, cb))
               withResource(jitBatches) { _ =>
                 val jitColumns = new IdentityHashMap[
                   GpuAstJitExpression, ArrayDeque[GpuColumnVector]]()

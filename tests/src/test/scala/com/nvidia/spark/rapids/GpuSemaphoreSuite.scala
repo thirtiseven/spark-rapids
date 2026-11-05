@@ -24,8 +24,18 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.time.{Seconds, Span}
 import org.scalatestplus.mockito.MockitoSugar
 
-import org.apache.spark.TaskContext
+import scala.collection.mutable.ArrayBuffer
+
+import com.nvidia.spark.rapids.Arm.withResource
+import com.nvidia.spark.rapids.spill.SpillFramework
+
+import org.apache.spark.{SparkConf, TaskContext}
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, UnsafeProjection}
+import org.apache.spark.sql.rapids.metrics.source.MockTaskContext
+import org.apache.spark.sql.types.{DataType, IntegerType, StructField, StructType}
+import org.apache.spark.sql.vectorized.ColumnarBatch
 
 class GpuSemaphoreSuite extends AnyFunSuite
     with BeforeAndAfterEach with MockitoSugar with TimeLimits  with TimeLimitedTests {
@@ -121,5 +131,85 @@ class GpuSemaphoreSuite extends AnyFunSuite
       GpuSemaphore.releaseIfNecessary(context1)
       GpuSemaphore.releaseIfNecessary(context2)
     }
+  }
+
+  /**
+   * Pulls every batch from an R2C iterator while the caller holds the semaphore, as an operator
+   * above would, and checks that rows are pulled from the child only in next() and only with
+   * the semaphore released, and that each batch comes back with the semaphore held.
+   */
+  private def checkRowPullsReleaseSemaphore(
+      numRows: Int,
+      r2c: Iterator[InternalRow] => Iterator[ColumnarBatch]): Unit = {
+    GpuDeviceManager.setRmmTaskInitEnabled(false)
+    val context1 = new MockTaskContext(taskAttemptId = 1, partitionId = 0)
+    val context2 = mockContext(2)
+    // With one concurrent GPU task, task 2 gets the semaphore only if task 1 released it.
+    def released: Boolean = GpuSemaphore.tryAcquire(context2) match {
+      case SemaphoreAcquired =>
+        GpuSemaphore.releaseIfNecessary(context2)
+        true
+      case AcquireFailed(_) => false
+    }
+    var inNext = false
+    // Whether each pull of a row happened in next() and with the semaphore released
+    val pulls = ArrayBuffer[(Boolean, Boolean)]()
+    val toUnsafe = UnsafeProjection.create(Array[DataType](IntegerType))
+    val rows = new Iterator[InternalRow] {
+      private var i = 0
+      override def hasNext: Boolean = {
+        pulls += ((inNext, released))
+        i < numRows
+      }
+      override def next(): InternalRow = {
+        pulls += ((inNext, released))
+        i += 1
+        toUnsafe(InternalRow(i)).copy()
+      }
+    }
+    // The generated iterator keeps its rows in spillable host buffers.
+    SpillFramework.initialize(new RapidsConf(new SparkConf))
+    TestUtils.withTaskContext(context1) {
+      try {
+        val iter = r2c(rows)
+        GpuSemaphore.acquireIfNecessary(context1)
+        var total = 0
+        var batches = 0
+        while (iter.hasNext) {
+          inNext = true
+          withResource(iter.next()) { batch =>
+            inNext = false
+            assert(!released, "the semaphore is not held for the GPU batch")
+            total += batch.numRows()
+            batches += 1
+          }
+        }
+        assertResult(numRows)(total)
+        assert(batches >= 2, s"$batches GPU batches")
+        assert(pulls.exists(_._1) && pulls.exists(!_._1), pulls)
+        assert(pulls.forall { case (pulledInNext, wasReleased) => pulledInNext == wasReleased },
+          pulls)
+      } finally {
+        GpuSemaphore.releaseIfNecessary(context1)
+        GpuSemaphore.releaseIfNecessary(context2)
+        TaskRegistryTracker.clearRegistry()
+        SpillFramework.shutdown()
+      }
+    }
+  }
+
+  test("RowToColumnarIterator releases the semaphore only while next() pulls rows") {
+    val schema = StructType(Seq(StructField("i", IntegerType)))
+    // A tiny target makes batches of VALIDITY_BUFFER_BOUNDARY_ROWS (512) rows.
+    checkRowPullsReleaseSemaphore(1500, rows => new RowToColumnarIterator(rows, schema,
+      TargetSize(1), 1L, new GpuRowToColumnConverter(schema)))
+  }
+
+  test("the generated row to columnar iterator releases the semaphore only while next() " +
+      "pulls rows") {
+    val attrs = Array(AttributeReference("i", IntegerType)().toAttribute)
+    // A tiny target makes batches of one row.
+    checkRowPullsReleaseSemaphore(5, rows => GeneratedInternalRowToCudfRowIterator(rows, attrs,
+      TargetSize(1), NoopMetric, NoopMetric, NoopMetric, NoopMetric, NoopMetric))
   }
 }

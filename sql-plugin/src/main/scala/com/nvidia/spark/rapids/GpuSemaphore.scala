@@ -23,7 +23,7 @@ import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue, TimeUnit}
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
-import ai.rapids.cudf.{NvtxColor, NvtxUniqueRange}
+import ai.rapids.cudf.{NvtxColor, NvtxUniqueRange, Rmm}
 import com.nvidia.spark.rapids.ScalableTaskCompletion.onTaskCompletion
 import com.nvidia.spark.rapids.jni.{RmmSpark, TaskPriority}
 import com.nvidia.spark.rapids.metrics.GpuBubbleTimerManager
@@ -55,6 +55,21 @@ private object GpuTaskMemoryEstimator {
   private val TIME_WINDOW: Double = TimeUnit.MILLISECONDS.toNanos(100).toDouble
 }
 
+private object GpuSemaphoreDiagnostics extends Logging {
+  def enabled: Boolean = log.isDebugEnabled
+
+  def emit(event: String, stageId: Int, taskId: Long, lease: Long, permits: Long,
+      demandBytes: Long, demandTimeNanos: Long, stage: GpuStageMemoryEstimator): Unit = {
+    if (enabled) {
+      val now = System.nanoTime()
+      logDebug(s"GPU_SEMAPHORE_DIAG event=$event stage=$stageId task=$taskId lease=$lease " +
+        s"timeNs=$now usedPermits=$permits grantDemandBytes=$demandBytes " +
+        s"grantEstimateTimeNs=$demandTimeNanos ${stage.diagnosticSnapshot(taskId, now)} " +
+        s"rmmBytes=${Rmm.getTotalBytesAllocated}")
+    }
+  }
+}
+
 class GpuTaskMemoryEstimator(val stageId: Int,
                              val taskId: Long,
                              val defaultEstimate: Long,
@@ -64,6 +79,19 @@ class GpuTaskMemoryEstimator(val stageId: Int,
   private val startTimeNanos: Long = System.nanoTime()
   private var totalTimeLost: Long = 0
   private var maxMemory: Long = 0
+  private var diagnosticBornRawLost: Long = 0
+
+  def recordDiagnosticBirth(): Unit = {
+    diagnosticBornRawLost = RmmSpark.getTotalBlockedOrLostTime(taskId)
+  }
+
+  def diagnosticSnapshot(now: Long): String = {
+    s"taskDefaultBytes=$defaultEstimate taskAgeNs=${now - startTimeNanos} " +
+      s"cachedEstimatorMaxBytes=$maxMemory cachedEstimatorLostNs=$totalTimeLost " +
+      s"maxFootprintBytes=${RmmSpark.getMaxGpuTaskMemory(taskId)} " +
+      s"rawLostNs=${RmmSpark.getTotalBlockedOrLostTime(taskId)} " +
+      s"bornRawLostNs=$diagnosticBornRawLost"
+  }
 
   def update(timeLost: Long, memory: Long): Unit = {
     // timeLost and maxMemory are not reset when they are read
@@ -94,6 +122,8 @@ class GpuTaskMemoryEstimator(val stageId: Int,
 class StatEstimator(minEntries:Int, defaultValue: Double) {
   require(minEntries > 0, "Minimum entries must be positive")
   private val values = ArrayBuffer.empty[Double]
+
+  def size: Int = values.size
 
   def add(value: Double): Unit = {
     values += value
@@ -136,6 +166,7 @@ class GpuStageMemoryEstimator(val stageId: Int,
                               val allowDynamicUpdate: Boolean) {
   private val stats = new StatEstimator(4, defaultEstimate.toDouble)
   private val activeTasks = new util.HashMap[Long, GpuTaskMemoryEstimator]()
+  private var diagnosticCachedP80: Long = defaultEstimate
 
   override def toString: String = synchronized {
     s"Stage $stageId Estimator ${activeTasks.keySet()}"
@@ -144,8 +175,20 @@ class GpuStageMemoryEstimator(val stageId: Int,
   def addTaskIfNeeded(taskId: Long): Unit = synchronized {
     activeTasks.computeIfAbsent(taskId: Long, _ => {
       val newDefaultEstimate = estimate()
-      new GpuTaskMemoryEstimator(stageId, taskId, newDefaultEstimate, allowDynamicUpdate)
+      val estimator =
+        new GpuTaskMemoryEstimator(stageId, taskId, newDefaultEstimate, allowDynamicUpdate)
+      if (GpuSemaphoreDiagnostics.enabled) {
+        estimator.recordDiagnosticBirth()
+      }
+      estimator
     })
+  }
+
+  def diagnosticSnapshot(taskId: Long, now: Long): String = synchronized {
+    val task = activeTasks.get(taskId)
+    val taskSnapshot = if (task == null) "taskEstimator=absent" else task.diagnosticSnapshot(now)
+    s"stageCachedP80Bytes=$diagnosticCachedP80 stageActiveTasks=${activeTasks.size()} " +
+      s"stageCompletedSamples=${stats.size} $taskSnapshot"
   }
 
   def taskDone(taskId: Long): Unit = synchronized {
@@ -176,7 +219,11 @@ class GpuStageMemoryEstimator(val stageId: Int,
     activeTasks.values().forEach(estimator => {
       active += estimator.estimate().toDouble
     })
-    stats.percentile(0.8, active).toLong
+    val result = stats.percentile(0.8, active).toLong
+    if (GpuSemaphoreDiagnostics.enabled) {
+      diagnosticCachedP80 = result
+    }
+    result
   }
 }
 
@@ -335,6 +382,9 @@ private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
    */
   private val activeThreads = new util.LinkedHashSet[Thread]()
   private var permitsUsed: Long = 0;
+  private var diagnosticLease: Long = 0
+  private var diagnosticDemandBytes: Long = 0
+  private var diagnosticDemandTimeNanos: Long = 0
   private lazy val trackSemaphore = RapidsConf.TRACE_TASK_GPU_OWNERSHIP.get(SQLConf.get)
   /**
    * If this task holds the GPU semaphore or not.
@@ -386,8 +436,9 @@ private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
   /**
    * Block the current thread until we have the semaphore.
    * @param semaphore what we are going to wait on.
+   * @return the permits newly acquired, or zero if this task already held the semaphore.
    */
-  def blockUntilReady(semaphore: GpuBackingSemaphore): Unit = {
+  def blockUntilReady(semaphore: GpuBackingSemaphore): Long = {
     val t = Thread.currentThread()
     // All threads start out in blocked, but will move out of it inside of the while loop.
     synchronized {
@@ -397,6 +448,7 @@ private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
     }
     var done = false
     var shouldBlockOnSemaphore = false
+    var acquiredPermits = 0L
     while (!done) {
       try {
         synchronized {
@@ -423,12 +475,24 @@ private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
         if (!done && shouldBlockOnSemaphore) {
           // We cannot be in a synchronized block and wait on the semaphore
           // so we have to release it and grab it again afterwards.
-          val used = semaphore.acquire(() => 
-              GpuSemaphore.memToPermitsWithMax(memoryEstimator.estimate()),
+          var demandBytes = 0L
+          var demandTimeNanos = 0L
+          val used = semaphore.acquire(() => {
+              val estimate = memoryEstimator.estimate()
+              if (GpuSemaphoreDiagnostics.enabled) {
+                demandBytes = estimate
+                demandTimeNanos = System.nanoTime()
+              }
+              GpuSemaphore.memToPermitsWithMax(estimate)
+            },
             () => lastAcquired > 0,
             TaskPriority.getTaskPriority(taskAttemptId), taskAttemptId)
           synchronized {
             permitsUsed = used
+            acquiredPermits = used
+            diagnosticLease += 1
+            diagnosticDemandBytes = demandBytes
+            diagnosticDemandTimeNanos = demandTimeNanos
             // We now own the semaphore so we need to wake up all of the other tasks that are
             // waiting.
             hasSemaphore = true
@@ -458,18 +522,22 @@ private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
           throw throwable
       }
     }
+    acquiredPermits
   }
 
+  // Negative means failure, zero means already held, and positive means a new grant.
   def tryAcquire(semaphore: GpuBackingSemaphore,
-                 taskAttemptId: Long): Boolean = synchronized {
+                 taskAttemptId: Long): Long = synchronized {
     val t = Thread.currentThread()
     if (hasSemaphore) {
       activeThreads.add(t)
-      true
+      0L
     } else {
       if (blockedThreads.size() == 0) {
         // No other threads for this task are waiting, so we might be able to grab this directly
-        val numPermits = GpuSemaphore.memToPermitsWithMax(memoryEstimator.estimate())
+        val estimate = memoryEstimator.estimate()
+        val estimateTime = if (GpuSemaphoreDiagnostics.enabled) System.nanoTime() else 0L
+        val numPermits = GpuSemaphore.memToPermitsWithMax(estimate)
         val ret = semaphore.tryAcquire(numPermits,
           TaskPriority.getTaskPriority(taskAttemptId),
           () => lastAcquired > 0,
@@ -479,13 +547,23 @@ private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
           lastAcquired = System.nanoTime()
           activeThreads.add(t)
           permitsUsed = numPermits
+          diagnosticLease += 1
+          diagnosticDemandBytes = estimate
+          diagnosticDemandTimeNanos = estimateTime
           // no need to notify because there are no other threads and we are holding the lock
           // to ensure that.
         }
-        ret
+        if (ret) numPermits else -1L
       } else {
-        false
+        -1L
       }
+    }
+  }
+
+  def traceGrant(usedPermits: Long): Unit = synchronized {
+    if (usedPermits > 0 && GpuSemaphoreDiagnostics.enabled) {
+      GpuSemaphoreDiagnostics.emit("grant", stageId, taskAttemptId, diagnosticLease,
+        usedPermits, diagnosticDemandBytes, diagnosticDemandTimeNanos, memoryEstimator)
     }
   }
 
@@ -499,6 +577,10 @@ private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
       GpuTaskMetrics.get.addSemaphoreHoldingTime(lastReleased - lastAcquired)
       nvtxRange.foreach(_.close())
       nvtxRange = None
+      if (GpuSemaphoreDiagnostics.enabled) {
+        GpuSemaphoreDiagnostics.emit("release", stageId, taskAttemptId, diagnosticLease,
+          permitsUsed, diagnosticDemandBytes, diagnosticDemandTimeNanos, memoryEstimator)
+      }
     }
     // It should be impossible for the current thread to be blocked when releasing the semaphore
     // because no blocked thread should ever leave `blockUntilReady`, which is where we put it in
@@ -560,9 +642,13 @@ private final class GpuSemaphore(val maxConcurrentGpuTasksLimit: Int) extends Lo
       onTaskCompletion(context, completeTask)
       new SemaphoreTaskInfo(stageId, taskAttemptId, stageEstimate, bubbleTimerMgr)
     })
-    if (taskInfo.tryAcquire(semaphore, taskAttemptId)) {
+    val usedPermits = taskInfo.tryAcquire(semaphore, taskAttemptId)
+    if (usedPermits >= 0) {
       GpuDeviceManager.initializeFromTask()
       stageEstimate.addTaskIfNeeded(taskAttemptId)
+      if (GpuSemaphoreDiagnostics.enabled) {
+        taskInfo.traceGrant(usedPermits)
+      }
       SemaphoreAcquired
     } else {
       // We need to get the number of tasks that are still waiting
@@ -591,9 +677,12 @@ private final class GpuSemaphore(val maxConcurrentGpuTasksLimit: Int) extends Lo
         onTaskCompletion(context, completeTask)
         new SemaphoreTaskInfo(stageId, taskAttemptId, stageEstimate, bubbleTimerMgr)
       })
-      taskInfo.blockUntilReady(semaphore)
+      val usedPermits = taskInfo.blockUntilReady(semaphore)
       GpuDeviceManager.initializeFromTask()
       stageEstimate.addTaskIfNeeded(taskAttemptId)
+      if (GpuSemaphoreDiagnostics.enabled) {
+        taskInfo.traceGrant(usedPermits)
+      }
     }
   }
 

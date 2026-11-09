@@ -433,6 +433,16 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .checkValue(v => v >= 0.0, "must be non-negative")
       .createWithDefault(1.0)
 
+  val GPU_SEMAPHORE_MEMORY_LEDGER_RESERVE_ESTIMATES =
+    conf("spark.rapids.sql.gpuSemaphore.memoryLedger.reserveEstimates")
+      .doc("Whether the memory ledger reserves the dynamic per-task memory estimate (the stage " +
+        "p80 footprint) for every holder and candidate. When false, admission only counts " +
+        "memory that is allocated plus demand that operators declared, and growth beyond that " +
+        "is left to spill and retry.")
+      .internal()
+      .booleanConf
+      .createWithDefault(true)
+
   val MULTITHREADED_READ_RELEASE_SEMAPHORE_ON_IO_WAIT =
     conf("spark.rapids.sql.multiThreadedRead.releaseSemaphoreOnIoWait")
       .doc("Let the multithreaded (cloud) reader release the GPU semaphore while it waits for " +

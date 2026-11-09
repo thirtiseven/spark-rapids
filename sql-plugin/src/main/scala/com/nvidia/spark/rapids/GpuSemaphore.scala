@@ -265,7 +265,7 @@ class GpuStageMemoryEstimator(val stageId: Int,
  */
 class GpuMemoryLedger(val capacityFraction: Double, val pollMillis: Long, val reclaim: Boolean,
     val minFirstLeaseMillis: Long = 0L, val firstLeaseFloorBytes: Long = 0L,
-    val decodeReserveFraction: Double = 0.0)
+    val decodeReserveFraction: Double = 0.0, val reserveEstimates: Boolean = true)
     extends SemaphoreAdmissionPolicy with Logging {
   // task id -> absolute resident bytes the task is expected to reach for its declared work
   private val declaredTargets = new ConcurrentHashMap[Long, Long]()
@@ -330,7 +330,7 @@ class GpuMemoryLedger(val capacityFraction: Double, val pollMillis: Long, val re
     i = 0
     var uncertain = 0L
     holders.forEach { (t, permits) =>
-      val reserved = permits * PERMIT_BYTES
+      val reserved = if (reserveEstimates) permits * PERMIT_BYTES else 0L
       var charged = reserved
       if (minFirstLeaseNanos > 0 && firstLeaseFloorBytes > reserved &&
           residentN(i) < firstLeaseFloorBytes &&
@@ -343,13 +343,14 @@ class GpuMemoryLedger(val capacityFraction: Double, val pollMillis: Long, val re
       headroom += math.max(0L, math.max(charged - residentN(i), target - residentN(i)))
       i += 1
     }
+    val estimate = if (reserveEstimates) numPermits * PERMIT_BYTES else 0L
     val candidateReserve = if (minFirstLeaseNanos > 0 && candidateFirstLease) {
-      math.max(numPermits * PERMIT_BYTES, firstLeaseFloorBytes)
+      math.max(estimate, firstLeaseFloorBytes)
     } else {
-      numPermits * PERMIT_BYTES
+      estimate
     }
-    if (candidateReserve > numPermits * PERMIT_BYTES) {
-      uncertain += candidateReserve - numPermits * PERMIT_BYTES
+    if (candidateReserve > estimate) {
+      uncertain += candidateReserve - estimate
     }
     val candidateTarget = declaredTarget(taskId)
     val need = math.max(0L, math.max(candidateReserve - residentN(n - 1),
@@ -409,7 +410,8 @@ object GpuMemoryLedger {
         conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_MIN_FIRST_LEASE_MS),
         (conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_FIRST_LEASE_FLOOR_BATCHES) *
           conf.get(RapidsConf.GPU_BATCH_SIZE_BYTES)).toLong,
-        conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_DECODE_RESERVE_FRACTION)))
+        conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_DECODE_RESERVE_FRACTION),
+        conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_RESERVE_ESTIMATES)))
     } else {
       None
     }

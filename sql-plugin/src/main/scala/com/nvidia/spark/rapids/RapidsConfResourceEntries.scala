@@ -408,6 +408,14 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .booleanConf
       .createWithDefault(false)
 
+  val GPU_SEMAPHORE_MEMORY_LEDGER_MIN_FIRST_LEASE_MS =
+    conf("spark.rapids.sql.gpuSemaphore.memoryLedger.minFirstLeaseMs")
+      .doc("Slow start for the memory ledger: while a task on its first lease is younger than " +
+        "this and has not grown past its reservation, admit no other task. 0 disables it.")
+      .internal()
+      .longConf
+      .createWithDefault(0L)
+
   val HOST_TO_GPU_RELEASE_SEMAPHORE = conf("spark.rapids.sql.hostToGpu.releaseSemaphore")
       .doc("Release the GPU semaphore while HostColumnarToGpu pulls host batches (CPU work " +
         "such as decoding) and acquire it again to copy them to the GPU.")

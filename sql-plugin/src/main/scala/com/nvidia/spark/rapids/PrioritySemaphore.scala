@@ -32,11 +32,14 @@ import org.apache.spark.sql.rapids.GpuTaskMetrics
 trait SemaphoreAdmissionPolicy {
   /**
    * @param holders task id -> permits of every task currently holding the semaphore
+   * @param firstLeaseSince task id -> System.nanoTime() of the grant, for holders that had never
+   *                        held the semaphore before this lease (their footprint is unknown)
    * @param taskId the task asking to be admitted
    * @param numPermits the permits it asks for
    * @return Some(decision), or None to fall back to the plain permit count
    */
-  def admits(holders: util.HashMap[Long, Long], taskId: Long, numPermits: Long): Option[Boolean]
+  def admits(holders: util.HashMap[Long, Long], firstLeaseSince: util.HashMap[Long, Long],
+      taskId: Long, numPermits: Long): Option[Boolean]
 
   /** How long a waiter sleeps before it re-evaluates the head of the queue, in ms. */
   def pollMillis: Long
@@ -57,6 +60,7 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
   private var currentConcurrentGpuTasksNum: Long = 0
   // task id -> permits for the current holders, used by the admission policy
   private val holders = new util.HashMap[Long, Long]()
+  private val firstLeaseSince = new util.HashMap[Long, Long]()
 
   private case class ThreadInfo(priority: T,
                                 condition: Condition,
@@ -91,7 +95,7 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
       } else if (!canAcquire(numPermits, taskAttemptId)) {
         false
       } else {
-        commitAcquire(numPermits, taskAttemptId)
+        commitAcquire(numPermits, taskAttemptId, wasOnGpuBefore())
         true
       }
     } finally {
@@ -154,10 +158,14 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
     }
   }
 
-  private def commitAcquire(numPermits: Long, taskAttemptId: Long): Unit = {
+  private def commitAcquire(numPermits: Long, taskAttemptId: Long,
+      wasOnGpuBefore: Boolean): Unit = {
     occupiedSlots += numPermits
     currentConcurrentGpuTasksNum += 1
     holders.put(taskAttemptId, numPermits)
+    if (!wasOnGpuBefore && admissionPolicy.isDefined) {
+      firstLeaseSince.put(taskAttemptId, System.nanoTime())
+    }
     // Report current concurrent tasks to GpuTaskMetrics, let it handle max tracking
     GpuTaskMetrics.get.recordConcurrentGpuTasks(currentConcurrentGpuTasksNum)
   }
@@ -168,6 +176,7 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
       occupiedSlots -= numPermits
       currentConcurrentGpuTasksNum -= 1
       holders.remove(taskAttemptId)
+      firstLeaseSince.remove(taskAttemptId)
       grantWaiters()
     } finally {
       lock.unlock()
@@ -186,7 +195,7 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
       if (canAcquire(threadPermits, nextThread.taskId)) {
         val popped = waitingQueue.poll()
         assert(popped eq nextThread)
-        commitAcquire(threadPermits, nextThread.taskId)
+        commitAcquire(threadPermits, nextThread.taskId, nextThread.wasOnGpuBefore())
         nextThread.signaled = true
         nextThread.permitsUsed = threadPermits
         nextThread.condition.signal()
@@ -200,7 +209,7 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
     val withinTaskLimit = maxConcurrentGpuTasksLimit <= 0 ||
       currentConcurrentGpuTasksNum < maxConcurrentGpuTasksLimit
     withinTaskLimit && {
-      admissionPolicy.flatMap(_.admits(holders, taskAttemptId, numPermits))
+      admissionPolicy.flatMap(_.admits(holders, firstLeaseSince, taskAttemptId, numPermits))
         .getOrElse(occupiedSlots + numPermits <= maxPermits)
     }
   }

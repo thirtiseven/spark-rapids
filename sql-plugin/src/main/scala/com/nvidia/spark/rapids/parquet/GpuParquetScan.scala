@@ -2775,6 +2775,10 @@ class MultiFileParquetPartitionReader(
 
     val parseOpts = getParquetOptions(readDataSchema, clippedSchema, useFieldId)
 
+    // Tell the memory ledger what the decode needs before waiting for the GPU: the compressed
+    // buffer copied to the device plus one pass of the (chunked) reader.
+    GpuSemaphore.declareGpuDemand(TaskContext.get(),
+      dataSize + math.max(maxChunkedReaderMemoryUsageSizeBytes, currentTargetBatchSize))
     // About to start using the GPU
     GpuSemaphore.acquireIfNecessary(TaskContext.get())
 

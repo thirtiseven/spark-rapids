@@ -1390,12 +1390,18 @@ abstract class MultiFileCoalescingPartitionReaderBase(
           val effectiveRows = getRowsPerPartition(
             decodeMeta.rowsPerPartition, decodeMeta.allPartValues, decodeMeta.extraInfo)
           startNewBufferRetry
-          val iter = RmmRapidsRetryIterator.withRetryNoSplit(
-              Seq[AutoCloseable](dataBuffer, decodeMeta.extraInfo)) { _ =>
-            val dataBuf = dataBuffer.getDataHostBuffer()
-            val tableReader = readBufferToTablesAndClose(dataBuf, dataBuf.getLength,
-              decodeMeta.clippedSchema, decodeMeta.readSchema, decodeMeta.extraInfo)
-            CachedGpuBatchIterator(tableReader, colTypes)
+          // readBufferToTablesAndClose may declare the device memory the decode needs to the
+          // GPU semaphore; the decode is done (the producer drained) once this returns.
+          val iter = try {
+            RmmRapidsRetryIterator.withRetryNoSplit(
+                Seq[AutoCloseable](dataBuffer, decodeMeta.extraInfo)) { _ =>
+              val dataBuf = dataBuffer.getDataHostBuffer()
+              val tableReader = readBufferToTablesAndClose(dataBuf, dataBuf.getLength,
+                decodeMeta.clippedSchema, decodeMeta.readSchema, decodeMeta.extraInfo)
+              CachedGpuBatchIterator(tableReader, colTypes)
+            }
+          } finally {
+            GpuSemaphore.clearGpuDemand(TaskContext.get())
           }
           (iter, decodeMeta, effectiveRows)
         }

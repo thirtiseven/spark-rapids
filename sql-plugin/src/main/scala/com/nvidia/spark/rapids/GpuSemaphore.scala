@@ -255,10 +255,40 @@ class GpuStageMemoryEstimator(val stageId: Int,
  * has grown past it, it is charged at least firstLeaseFloorBytes (a few batches); a first-lease
  * candidate is charged the same way. When the pool is roomy this changes nothing; when it is
  * tight the ledger waits to see real growth before it commits more memory.
+ *
+ * Declared demand (decodeReserveFraction > 0): an operator that knows how much device memory it
+ * is about to need (a scan about to decode a host buffer) declares it before it acquires the
+ * semaphore. Until it clears the declaration, the task is charged at least
+ * resident-at-declaration + fraction * declared bytes, as a holder and as a candidate. This
+ * replaces guessing the footprint of a cold stage with the reader's own bound, and it only
+ * applies while the declared work is running.
  */
 class GpuMemoryLedger(val capacityFraction: Double, val pollMillis: Long, val reclaim: Boolean,
-    val minFirstLeaseMillis: Long = 0L, val firstLeaseFloorBytes: Long = 0L)
+    val minFirstLeaseMillis: Long = 0L, val firstLeaseFloorBytes: Long = 0L,
+    val decodeReserveFraction: Double = 0.0)
     extends SemaphoreAdmissionPolicy with Logging {
+  // task id -> absolute resident bytes the task is expected to reach for its declared work
+  private val declaredTargets = new ConcurrentHashMap[Long, Long]()
+  private val declarations = new AtomicLong()
+  private val declaredDenied = new AtomicLong()
+
+  /** Declare that `taskId` is about to need `bytes` more device memory. */
+  def declare(taskId: Long, bytes: Long): Unit = {
+    val reserve = (bytes * decodeReserveFraction).toLong
+    if (reserve > 0) {
+      val out = new Array[Long](1)
+      val allocated = RmmSpark.getGpuMemoryLedger(Array(taskId), out)
+      val base = if (allocated < 0) 0L else out(0)
+      declaredTargets.put(taskId, base + reserve)
+      declarations.incrementAndGet()
+    }
+  }
+
+  /** The declared work of `taskId` is done (or failed). */
+  def clearDeclaration(taskId: Long): Unit = declaredTargets.remove(taskId)
+
+  private def declaredTarget(taskId: Long): Long = declaredTargets.getOrDefault(taskId, 0L)
+
   private val slowStartDenied = new AtomicLong()
   private val PERMIT_BYTES = 32L * 1024 * 1024
   @volatile private var lastDeficit = 0L
@@ -308,7 +338,9 @@ class GpuMemoryLedger(val capacityFraction: Double, val pollMillis: Long, val re
         charged = firstLeaseFloorBytes
         uncertain += charged - reserved
       }
-      headroom += math.max(0L, charged - residentN(i))
+      // the floor covers an unknown footprint; a declaration replaces it with a known one
+      val target = declaredTarget(t)
+      headroom += math.max(0L, math.max(charged - residentN(i), target - residentN(i)))
       i += 1
     }
     val candidateReserve = if (minFirstLeaseNanos > 0 && candidateFirstLease) {
@@ -319,7 +351,9 @@ class GpuMemoryLedger(val capacityFraction: Double, val pollMillis: Long, val re
     if (candidateReserve > numPermits * PERMIT_BYTES) {
       uncertain += candidateReserve - numPermits * PERMIT_BYTES
     }
-    val need = math.max(0L, candidateReserve - residentN(n - 1))
+    val candidateTarget = declaredTarget(taskId)
+    val need = math.max(0L, math.max(candidateReserve - residentN(n - 1),
+      candidateTarget - residentN(n - 1)))
     val committed = allocated + headroom + need
     if (allocated > maxAllocated) {
       maxAllocated = allocated
@@ -333,6 +367,9 @@ class GpuMemoryLedger(val capacityFraction: Double, val pollMillis: Long, val re
       if (committed - uncertain <= capacity) {
         // denied only because of the first-lease floor
         slowStartDenied.incrementAndGet()
+      }
+      if (candidateTarget > 0 || !declaredTargets.isEmpty) {
+        declaredDenied.incrementAndGet()
       }
       lastDeficit = committed - capacity
     }
@@ -357,7 +394,8 @@ class GpuMemoryLedger(val capacityFraction: Double, val pollMillis: Long, val re
       logInfo(s"GPU_MEMORY_LEDGER admitted=${admitted.get} denied=${denied.get} " +
         s"unavailable=${unavailable.get} reclaimCalls=${reclaimCalls.get} " +
         s"reclaimedBytes=${reclaimed.get} maxAllocatedBytes=$maxAllocated capacity=$capacity " +
-        s"slowStartDenied=${slowStartDenied.get}")
+        s"slowStartDenied=${slowStartDenied.get} declarations=${declarations.get} " +
+        s"deniedWithDeclarations=${declaredDenied.get}")
     }
   }
 }
@@ -370,7 +408,8 @@ object GpuMemoryLedger {
         conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_RECLAIM),
         conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_MIN_FIRST_LEASE_MS),
         (conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_FIRST_LEASE_FLOOR_BATCHES) *
-          conf.get(RapidsConf.GPU_BATCH_SIZE_BYTES)).toLong))
+          conf.get(RapidsConf.GPU_BATCH_SIZE_BYTES)).toLong,
+        conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_DECODE_RESERVE_FRACTION)))
     } else {
       None
     }
@@ -407,6 +446,23 @@ object GpuSemaphore {
       throw new IllegalStateException("already initialized")
     }
     instance = new GpuSemaphore(maxConcurrentGpuTasksLimit, ledger)
+  }
+
+  /**
+   * Declare that the current task is about to need `bytes` more device memory for work it is
+   * about to start (e.g. decoding a host buffer). Call before acquiring the semaphore for that
+   * work and pair with [[clearGpuDemand]]. A no-op unless the memory ledger is enabled.
+   */
+  def declareGpuDemand(context: TaskContext, bytes: Long): Unit = {
+    if (context != null && instance != null) {
+      instance.declareGpuDemand(context.taskAttemptId(), bytes)
+    }
+  }
+
+  def clearGpuDemand(context: TaskContext): Unit = {
+    if (context != null && instance != null) {
+      instance.clearGpuDemand(context.taskAttemptId())
+    }
   }
 
   /**
@@ -758,6 +814,12 @@ private final class GpuSemaphore(val maxConcurrentGpuTasksLimit: Int,
   // on the GPU.
   private val tasks = new ConcurrentHashMap[Long, SemaphoreTaskInfo]
 
+  def declareGpuDemand(taskAttemptId: Long, bytes: Long): Unit =
+    ledger.foreach(_.declare(taskAttemptId, bytes))
+
+  def clearGpuDemand(taskAttemptId: Long): Unit =
+    ledger.foreach(_.clearDeclaration(taskAttemptId))
+
   private val stageEstimators = {
     val lru = new util.LinkedHashMap[Int, GpuStageMemoryEstimator]() {
       override def removeEldestEntry(entry: Map.Entry[Int, GpuStageMemoryEstimator]): Boolean = {
@@ -859,6 +921,7 @@ private final class GpuSemaphore(val maxConcurrentGpuTasksLimit: Int,
     GpuTaskMetrics.get.updateRetry(taskAttemptId)
     GpuTaskMetrics.get.updateMaxMemory(taskAttemptId)
     GpuTaskMetrics.get.updateFootprint(taskAttemptId)
+    clearGpuDemand(taskAttemptId)
     val refs = tasks.remove(taskAttemptId)
     if (refs == null) {
       throw new IllegalStateException(s"Completion of unknown task $taskAttemptId")

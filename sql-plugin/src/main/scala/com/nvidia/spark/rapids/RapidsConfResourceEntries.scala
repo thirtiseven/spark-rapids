@@ -424,6 +424,15 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .doubleConf
       .createWithDefault(4.0)
 
+  val GPU_SEMAPHORE_MEMORY_LEDGER_DECODE_RESERVE_FRACTION =
+    conf("spark.rapids.sql.gpuSemaphore.memoryLedger.decodeReserveFraction")
+      .doc("Fraction of the device memory a scan declares for decoding a host buffer that the " +
+        "memory ledger reserves for it while it decodes. 0 ignores declarations.")
+      .internal()
+      .doubleConf
+      .checkValue(v => v >= 0.0, "must be non-negative")
+      .createWithDefault(1.0)
+
   val HOST_TO_GPU_RELEASE_SEMAPHORE = conf("spark.rapids.sql.hostToGpu.releaseSemaphore")
       .doc("Release the GPU semaphore while HostColumnarToGpu pulls host batches (CPU work " +
         "such as decoding) and acquire it again to copy them to the GPU.")

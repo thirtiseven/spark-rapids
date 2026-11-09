@@ -39,7 +39,7 @@ trait SemaphoreAdmissionPolicy {
    * @return Some(decision), or None to fall back to the plain permit count
    */
   def admits(holders: util.HashMap[Long, Long], firstLeaseSince: util.HashMap[Long, Long],
-      taskId: Long, numPermits: Long): Option[Boolean]
+      taskId: Long, numPermits: Long, candidateFirstLease: Boolean): Option[Boolean]
 
   /** How long a waiter sleeps before it re-evaluates the head of the queue, in ms. */
   def pollMillis: Long
@@ -92,7 +92,7 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
           ThreadInfo(priority, null, () => numPermits, wasOnGpuBefore, taskAttemptId)
         ) < 0) {
         false
-      } else if (!canAcquire(numPermits, taskAttemptId)) {
+      } else if (!canAcquire(numPermits, taskAttemptId, !wasOnGpuBefore())) {
         false
       } else {
         commitAcquire(numPermits, taskAttemptId, wasOnGpuBefore())
@@ -192,7 +192,7 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
     while (!done && waitingQueue.size() > 0) {
       val nextThread = waitingQueue.peek()
       val threadPermits = nextThread.computeNumPermits()
-      if (canAcquire(threadPermits, nextThread.taskId)) {
+      if (canAcquire(threadPermits, nextThread.taskId, !nextThread.wasOnGpuBefore())) {
         val popped = waitingQueue.poll()
         assert(popped eq nextThread)
         commitAcquire(threadPermits, nextThread.taskId, nextThread.wasOnGpuBefore())
@@ -205,11 +205,13 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
     }
   }
 
-  private def canAcquire(numPermits: Long, taskAttemptId: Long): Boolean = {
+  private def canAcquire(numPermits: Long, taskAttemptId: Long,
+      firstLease: Boolean): Boolean = {
     val withinTaskLimit = maxConcurrentGpuTasksLimit <= 0 ||
       currentConcurrentGpuTasksNum < maxConcurrentGpuTasksLimit
     withinTaskLimit && {
-      admissionPolicy.flatMap(_.admits(holders, firstLeaseSince, taskAttemptId, numPermits))
+      admissionPolicy.flatMap(
+        _.admits(holders, firstLeaseSince, taskAttemptId, numPermits, firstLease))
         .getOrElse(occupiedSlots + numPermits <= maxPermits)
     }
   }

@@ -168,4 +168,65 @@ class PrioritySemaphoreSuite extends AnyFunSuite {
     semaphore.release(10)
     semaphore.release(10)
   }
+
+  /** A test policy whose decision the test flips; records what it was asked. */
+  private class FlagPolicy extends SemaphoreAdmissionPolicy {
+    @volatile var allow = false
+    @volatile var lastHolders: Set[Long] = Set.empty
+    @volatile var lastFirstLease: Set[Long] = Set.empty
+    @volatile var blockedCalls = 0
+    override def admits(holders: java.util.HashMap[Long, Long],
+        firstLeaseSince: java.util.HashMap[Long, Long], taskId: Long,
+        numPermits: Long, candidateFirstLease: Boolean): Option[Boolean] = {
+      lastHolders = holders.keySet().asScala.toSet
+      lastFirstLease = firstLeaseSince.keySet().asScala.toSet
+      Some(allow || holders.isEmpty)
+    }
+    override def pollMillis: Long = 2
+    override def onStillBlocked(): Unit = blockedCalls += 1
+  }
+
+  test("admission policy replaces the permit count") {
+    val policy = new FlagPolicy
+    // Only 1 permit, but the policy decides.
+    val semaphore = new TestPrioritySemaphore(1, 0, Some(policy))
+    assert(semaphore.tryAcquire(1, 0, () => false, 1))
+    policy.allow = true
+    assert(semaphore.tryAcquire(1, 0, () => true, 2))
+    assert(policy.lastHolders == Set(1L))
+    assert(policy.lastFirstLease == Set(1L))
+    semaphore.release(1, 1)
+    semaphore.release(1, 2)
+  }
+
+  test("a waiter is admitted by polling when the policy changes without a release") {
+    val policy = new FlagPolicy
+    val semaphore = new TestPrioritySemaphore(100, 0, Some(policy))
+    assert(semaphore.tryAcquire(1, 0, () => false, 1))
+    @volatile var acquired = false
+    val t = new Thread(() => {
+      semaphore.acquire(() => 1, () => false, 0, 2)
+      acquired = true
+    })
+    t.start()
+    Thread.sleep(50)
+    assert(!acquired)
+    assert(policy.blockedCalls > 0)
+    policy.allow = true
+    t.join(1000)
+    assert(acquired)
+    assert(policy.lastHolders == Set(1L))
+    semaphore.release(1, 2)
+    semaphore.release(1, 1)
+  }
+
+  test("the task limit still applies with an admission policy") {
+    val policy = new FlagPolicy
+    policy.allow = true
+    val semaphore = new TestPrioritySemaphore(100, 1, Some(policy))
+    assert(semaphore.tryAcquire(1, 0, () => false, 1))
+    assert(!semaphore.tryAcquire(1, 0, () => false, 2))
+    semaphore.release(1, 1)
+    assert(semaphore.tryAcquire(1, 0, () => false, 2))
+  }
 }

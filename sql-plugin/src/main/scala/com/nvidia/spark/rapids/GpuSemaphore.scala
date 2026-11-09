@@ -248,14 +248,16 @@ class GpuStageMemoryEstimator(val stageId: Int,
  * With reclaim enabled, the head of the queue proactively spills the deficit from the device
  * spill store instead of waiting for holders to hit an OOM.
  *
- * Slow start (minFirstLeaseMillis > 0): a task on its first lease has an unknown footprint, and
- * a stage typically starts with many such tasks arriving at once, all carrying the same default
- * estimate. While any first-lease holder is younger than minFirstLeaseMillis and has not yet
- * grown past its reservation, no further task is admitted, so the ledger sees real growth
- * before it commits more memory.
+ * Unknown footprints (minFirstLeaseMillis > 0): a task on its first lease has an unknown
+ * footprint, and a stage typically starts with many such tasks arriving at once, all carrying
+ * the same default estimate, which scales with the pool (pool / concurrentGpuTasks) while the
+ * real footprint scales with the batch size. Until such a holder is minFirstLeaseMillis old or
+ * has grown past it, it is charged at least firstLeaseFloorBytes (a few batches); a first-lease
+ * candidate is charged the same way. When the pool is roomy this changes nothing; when it is
+ * tight the ledger waits to see real growth before it commits more memory.
  */
 class GpuMemoryLedger(val capacityFraction: Double, val pollMillis: Long, val reclaim: Boolean,
-    val minFirstLeaseMillis: Long = 0L)
+    val minFirstLeaseMillis: Long = 0L, val firstLeaseFloorBytes: Long = 0L)
     extends SemaphoreAdmissionPolicy with Logging {
   private val slowStartDenied = new AtomicLong()
   private val PERMIT_BYTES = 32L * 1024 * 1024
@@ -273,7 +275,7 @@ class GpuMemoryLedger(val capacityFraction: Double, val pollMillis: Long, val re
   // Called with the semaphore lock held.
   override def admits(holders: util.HashMap[Long, Long],
       firstLeaseSince: util.HashMap[Long, Long], taskId: Long,
-      numPermits: Long): Option[Boolean] = {
+      numPermits: Long, candidateFirstLease: Boolean): Option[Boolean] = {
     if (holders.isEmpty) {
       admitted.incrementAndGet()
       return Some(true)
@@ -293,26 +295,31 @@ class GpuMemoryLedger(val capacityFraction: Double, val pollMillis: Long, val re
       return None
     }
     var headroom = 0L
-    var growing = false
     val now = System.nanoTime()
     val minFirstLeaseNanos = TimeUnit.MILLISECONDS.toNanos(minFirstLeaseMillis)
     i = 0
+    var uncertain = 0L
     holders.forEach { (t, permits) =>
       val reserved = permits * PERMIT_BYTES
-      headroom += math.max(0L, reserved - residentN(i))
-      if (minFirstLeaseNanos > 0 && residentN(i) < reserved) {
-        if (firstLeaseSince.containsKey(t) && now - firstLeaseSince.get(t) < minFirstLeaseNanos) {
-          growing = true
-        }
+      var charged = reserved
+      if (minFirstLeaseNanos > 0 && firstLeaseFloorBytes > reserved &&
+          residentN(i) < firstLeaseFloorBytes &&
+          firstLeaseSince.containsKey(t) && now - firstLeaseSince.get(t) < minFirstLeaseNanos) {
+        charged = firstLeaseFloorBytes
+        uncertain += charged - reserved
       }
+      headroom += math.max(0L, charged - residentN(i))
       i += 1
     }
-    if (growing) {
-      slowStartDenied.incrementAndGet()
-      maybeLog()
-      return Some(false)
+    val candidateReserve = if (minFirstLeaseNanos > 0 && candidateFirstLease) {
+      math.max(numPermits * PERMIT_BYTES, firstLeaseFloorBytes)
+    } else {
+      numPermits * PERMIT_BYTES
     }
-    val need = math.max(0L, numPermits * PERMIT_BYTES - residentN(n - 1))
+    if (candidateReserve > numPermits * PERMIT_BYTES) {
+      uncertain += candidateReserve - numPermits * PERMIT_BYTES
+    }
+    val need = math.max(0L, candidateReserve - residentN(n - 1))
     val committed = allocated + headroom + need
     if (allocated > maxAllocated) {
       maxAllocated = allocated
@@ -323,6 +330,10 @@ class GpuMemoryLedger(val capacityFraction: Double, val pollMillis: Long, val re
       lastDeficit = 0L
     } else {
       denied.incrementAndGet()
+      if (committed - uncertain <= capacity) {
+        // denied only because of the first-lease floor
+        slowStartDenied.incrementAndGet()
+      }
       lastDeficit = committed - capacity
     }
     maybeLog()
@@ -357,7 +368,9 @@ object GpuMemoryLedger {
       Some(new GpuMemoryLedger(conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_CAPACITY_FRACTION),
         conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_POLL_MS),
         conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_RECLAIM),
-        conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_MIN_FIRST_LEASE_MS)))
+        conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_MIN_FIRST_LEASE_MS),
+        (conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_FIRST_LEASE_FLOOR_BATCHES) *
+          conf.get(RapidsConf.GPU_BATCH_SIZE_BYTES)).toLong))
     } else {
       None
     }

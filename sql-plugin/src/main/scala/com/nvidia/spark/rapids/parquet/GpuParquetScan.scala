@@ -3493,7 +3493,11 @@ class MultiFileCloudParquetPartitionReader(
     }
     val colTypes = readDataSchema.fields.map(f => f.dataType)
 
-    withResource(hostBuffers) { _ =>
+    // Tell the memory ledger what the decode needs before waiting for the GPU: the compressed
+    // buffers copied to the device plus one pass of the (chunked) reader.
+    GpuSemaphore.declareGpuDemand(TaskContext.get(), hmbAndInfo.bytes +
+      math.max(maxChunkedReaderMemoryUsageSizeBytes, targetBatchSizeBytes))
+    try withResource(hostBuffers) { _ =>
       RmmRapidsRetryIterator.withRetryNoSplit {
         // The MakeParquetTableProducer will close the input buffers
         val hostBufs = hostBuffers.safeMap(_.getDataHostBuffer())
@@ -3528,6 +3532,9 @@ class MultiFileCloudParquetPartitionReader(
           }
         }
       }
+    } finally {
+      // CachedGpuBatchIterator has drained the producer, so the decode is done
+      GpuSemaphore.clearGpuDemand(TaskContext.get())
     }
   }
 

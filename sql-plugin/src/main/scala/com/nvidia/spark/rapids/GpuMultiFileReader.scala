@@ -806,7 +806,26 @@ abstract class MultiFileCloudPartitionReaderBase(
     convertAsyncResult(taskResult)
   }
 
+  private val releaseSemaphoreOnIoWait =
+    RapidsConf.MULTITHREADED_READ_RELEASE_SEMAPHORE_ON_IO_WAIT.get(SQLConf.get)
+
+  /** Whether the next buffer the task will consume has already been read. */
+  private def nextBufferReady: Boolean = {
+    if (keepReadsInOrder) {
+      val head = tasks.peek()
+      head != null && head.isDone
+    } else {
+      tasks.iterator().asScala.exists(_.isDone)
+    }
+  }
+
   private def getNextBuffersAndMeta(): HostMemoryBuffersWithMetaDataBase = {
+    // Waiting for remote I/O does not use the GPU, so let other tasks in while we wait. The
+    // memory this task keeps on the device stays charged by the memory ledger, if enabled, and
+    // decoding the buffer acquires the semaphore again.
+    if (releaseSemaphoreOnIoWait && !nextBufferReady) {
+      GpuSemaphore.releaseIfNecessary(TaskContext.get())
+    }
     if (canUseCombine) {
       getNextBuffersAndMetaAndCombine()
     } else {

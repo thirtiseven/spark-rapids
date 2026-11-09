@@ -433,6 +433,14 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .checkValue(v => v >= 0.0, "must be non-negative")
       .createWithDefault(1.0)
 
+  val MULTITHREADED_READ_RELEASE_SEMAPHORE_ON_IO_WAIT =
+    conf("spark.rapids.sql.multiThreadedRead.releaseSemaphoreOnIoWait")
+      .doc("Let the multithreaded (cloud) reader release the GPU semaphore while it waits for " +
+        "the next file buffer to be read. Pair with the GPU semaphore memory ledger.")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
   val HOST_TO_GPU_RELEASE_SEMAPHORE = conf("spark.rapids.sql.hostToGpu.releaseSemaphore")
       .doc("Release the GPU semaphore while HostColumnarToGpu pulls host batches (CPU work " +
         "such as decoding) and acquire it again to copy them to the GPU.")

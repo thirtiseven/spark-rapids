@@ -36,6 +36,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.{ArrowColumnVector, ColumnarBatch, ColumnVector}
 
@@ -313,6 +314,19 @@ class HostToGpuCoalesceIterator(iter: Iterator[ColumnarBatch],
   }
 
   override def hasAnyToConcat: Boolean = totalRows > 0
+
+  private val releaseForHostWork =
+    RapidsConf.HOST_TO_GPU_RELEASE_SEMAPHORE.get(SQLConf.get)
+
+  // Pulling the host batches of a GPU batch is CPU work, such as decoding a file, so next()
+  // can give up the semaphore while it does that, and concatAllAndPutOnGPU acquires it again.
+  // hasNext leaves it alone, as operators above may call it while they still use the GPU.
+  override def next(): ColumnarBatch = {
+    if (releaseForHostWork) {
+      GpuSemaphore.releaseIfNecessary(TaskContext.get())
+    }
+    super.next()
+  }
 
   override def concatAllAndPutOnGPU(): ColumnarBatch = {
     // About to place data back on the GPU

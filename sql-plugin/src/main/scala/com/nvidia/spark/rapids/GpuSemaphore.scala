@@ -19,6 +19,7 @@ package com.nvidia.spark.rapids
 import java.util
 import java.util.Map
 import java.util.concurrent.{ConcurrentHashMap, LinkedBlockingQueue, TimeUnit}
+import java.util.concurrent.atomic.AtomicLong
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
@@ -27,6 +28,7 @@ import ai.rapids.cudf.{NvtxColor, NvtxUniqueRange, Rmm}
 import com.nvidia.spark.rapids.ScalableTaskCompletion.onTaskCompletion
 import com.nvidia.spark.rapids.jni.{RmmSpark, TaskPriority}
 import com.nvidia.spark.rapids.metrics.GpuBubbleTimerManager
+import com.nvidia.spark.rapids.spill.SpillFramework
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
@@ -227,6 +229,116 @@ class GpuStageMemoryEstimator(val stageId: Int,
   }
 }
 
+/**
+ * Admission by a live device memory ledger instead of a pure permit count.
+ *
+ * Permits are the memory a task is estimated to need while it holds the semaphore, but what is
+ * really on the device also includes memory that tasks keep after they release the semaphore
+ * (spillable batches, build tables, partial aggregates, ...) and holders that outgrow their
+ * estimate. The ledger admits a task only if
+ *
+ *   allocated + sum over holders of max(0, reserved - resident) + max(0, reserve - resident)
+ *     <= capacityFraction * pool size
+ *
+ * where allocated is every byte currently allocated through RMM, resident is what a task has
+ * currently allocated (exact, from the JNI allocation ledger) and reserved is its permits. So
+ * memory a task keeps across a release stays charged, and a task that comes back only needs its
+ * remaining growth. A task is always admitted when nobody holds the semaphore, so memory that
+ * waiting tasks keep cannot deadlock admission; the holder's allocations make it spill as usual.
+ * With reclaim enabled, the head of the queue proactively spills the deficit from the device
+ * spill store instead of waiting for holders to hit an OOM.
+ */
+class GpuMemoryLedger(val capacityFraction: Double, val pollMillis: Long, val reclaim: Boolean)
+    extends SemaphoreAdmissionPolicy with Logging {
+  private val PERMIT_BYTES = 32L * 1024 * 1024
+  @volatile private var lastDeficit = 0L
+  private val admitted = new AtomicLong()
+  private val denied = new AtomicLong()
+  private val unavailable = new AtomicLong()
+  private val reclaimed = new AtomicLong()
+  private val reclaimCalls = new AtomicLong()
+  @volatile private var maxAllocated = 0L
+  @volatile private var lastLog = System.nanoTime()
+
+  private def capacity: Long = (GpuDeviceManager.getMemorySize * capacityFraction).toLong
+
+  // Called with the semaphore lock held.
+  override def admits(holders: util.HashMap[Long, Long], taskId: Long,
+      numPermits: Long): Option[Boolean] = {
+    if (holders.isEmpty) {
+      admitted.incrementAndGet()
+      return Some(true)
+    }
+    val n = holders.size() + 1
+    val ids = new Array[Long](n)
+    val residentN = new Array[Long](n)
+    var i = 0
+    holders.forEach { (t, _) =>
+      ids(i) = t
+      i += 1
+    }
+    ids(n - 1) = taskId
+    val allocated = RmmSpark.getGpuMemoryLedger(ids, residentN)
+    if (allocated < 0) {
+      unavailable.incrementAndGet()
+      return None
+    }
+    var headroom = 0L
+    i = 0
+    holders.forEach { (_, permits) =>
+      headroom += math.max(0L, permits * PERMIT_BYTES - residentN(i))
+      i += 1
+    }
+    val need = math.max(0L, numPermits * PERMIT_BYTES - residentN(n - 1))
+    val committed = allocated + headroom + need
+    if (allocated > maxAllocated) {
+      maxAllocated = allocated
+    }
+    val ok = committed <= capacity
+    if (ok) {
+      admitted.incrementAndGet()
+      lastDeficit = 0L
+    } else {
+      denied.incrementAndGet()
+      lastDeficit = committed - capacity
+    }
+    maybeLog()
+    Some(ok)
+  }
+
+  override def onStillBlocked(): Unit = {
+    val deficit = lastDeficit
+    if (reclaim && deficit > 0) {
+      reclaimCalls.incrementAndGet()
+      val spilled = SpillFramework.stores.deviceStore.spill(deficit)
+      reclaimed.addAndGet(spilled)
+    }
+    maybeLog()
+  }
+
+  private def maybeLog(): Unit = {
+    val now = System.nanoTime()
+    if (now - lastLog > TimeUnit.SECONDS.toNanos(10)) {
+      lastLog = now
+      logInfo(s"GPU_MEMORY_LEDGER admitted=${admitted.get} denied=${denied.get} " +
+        s"unavailable=${unavailable.get} reclaimCalls=${reclaimCalls.get} " +
+        s"reclaimedBytes=${reclaimed.get} maxAllocatedBytes=$maxAllocated capacity=$capacity")
+    }
+  }
+}
+
+object GpuMemoryLedger {
+  def fromConf(conf: RapidsConf): Option[GpuMemoryLedger] = {
+    if (conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER)) {
+      Some(new GpuMemoryLedger(conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_CAPACITY_FRACTION),
+        conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_POLL_MS),
+        conf.get(RapidsConf.GPU_SEMAPHORE_MEMORY_LEDGER_RECLAIM)))
+    } else {
+      None
+    }
+  }
+}
+
 object GpuSemaphore {
   // DO NOT ACCESS DIRECTLY!  Use `getInstance` instead.
   @volatile private var instance: GpuSemaphore = _
@@ -248,11 +360,15 @@ object GpuSemaphore {
   /**
    * Initializes the GPU task semaphore.
    */
-  def initialize(maxConcurrentGpuTasksLimit: Int): Unit = synchronized {
+  def initialize(maxConcurrentGpuTasksLimit: Int): Unit =
+    initialize(maxConcurrentGpuTasksLimit, None)
+
+  def initialize(maxConcurrentGpuTasksLimit: Int,
+      ledger: Option[GpuMemoryLedger]): Unit = synchronized {
     if (instance != null) {
       throw new IllegalStateException("already initialized")
     }
-    instance = new GpuSemaphore(maxConcurrentGpuTasksLimit)
+    instance = new GpuSemaphore(maxConcurrentGpuTasksLimit, ledger)
   }
 
   /**
@@ -571,7 +687,7 @@ private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
     val t = Thread.currentThread()
     activeThreads.remove(t)
     if (hasSemaphore) {
-      semaphore.release(permitsUsed)
+      semaphore.release(permitsUsed, taskAttemptId)
       hasSemaphore = false
       lastReleased = System.nanoTime()
       GpuTaskMetrics.get.addSemaphoreHoldingTime(lastReleased - lastAcquired)
@@ -591,12 +707,14 @@ private final class SemaphoreTaskInfo(val stageId: Int, val taskAttemptId: Long,
   }
 }
 
-private final class GpuSemaphore(val maxConcurrentGpuTasksLimit: Int) extends Logging {
+private final class GpuSemaphore(val maxConcurrentGpuTasksLimit: Int,
+    ledger: Option[GpuMemoryLedger] = None) extends Logging {
 
   import GpuSemaphore._
 
   type GpuBackingSemaphore = PrioritySemaphore[Long]
-  private val semaphore = new GpuBackingSemaphore(computeMaxPermits(), maxConcurrentGpuTasksLimit)
+  private val semaphore = new GpuBackingSemaphore(computeMaxPermits(), maxConcurrentGpuTasksLimit,
+    ledger)
   // A map of taskAttemptId => semaphoreTaskInfo.
   // This map keeps track of all tasks that are both active on the GPU and blocked waiting
   // on the GPU.

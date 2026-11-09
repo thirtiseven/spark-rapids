@@ -378,6 +378,43 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .integerConf
       .createWithDefault(0)
 
+  val GPU_SEMAPHORE_MEMORY_LEDGER = conf("spark.rapids.sql.gpuSemaphore.memoryLedger.enabled")
+      .doc("Admit tasks to the GPU semaphore by a live device memory ledger (allocated bytes " +
+        "plus the remaining reservation of holders) instead of by permits alone, so memory " +
+        "that tasks keep after releasing the semaphore stays charged.")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
+  val GPU_SEMAPHORE_MEMORY_LEDGER_CAPACITY_FRACTION =
+    conf("spark.rapids.sql.gpuSemaphore.memoryLedger.capacityFraction")
+      .doc("Fraction of the RMM pool the memory ledger may commit.")
+      .internal()
+      .doubleConf
+      .createWithDefault(1.0)
+
+  val GPU_SEMAPHORE_MEMORY_LEDGER_POLL_MS =
+    conf("spark.rapids.sql.gpuSemaphore.memoryLedger.pollMs")
+      .doc("How often the first waiter re-evaluates the memory ledger, in milliseconds.")
+      .internal()
+      .longConf
+      .createWithDefault(5L)
+
+  val GPU_SEMAPHORE_MEMORY_LEDGER_RECLAIM =
+    conf("spark.rapids.sql.gpuSemaphore.memoryLedger.reclaim")
+      .doc("When the memory ledger blocks the first waiter, spill the deficit from the " +
+        "device spill store instead of waiting for holders to free memory.")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
+  val HOST_TO_GPU_RELEASE_SEMAPHORE = conf("spark.rapids.sql.hostToGpu.releaseSemaphore")
+      .doc("Release the GPU semaphore while HostColumnarToGpu pulls host batches (CPU work " +
+        "such as decoding) and acquire it again to copy them to the GPU.")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
   val GPU_BATCH_SIZE_BYTES = conf("spark.rapids.sql.batchSizeBytes")
     .doc("Set the target number of bytes for a GPU batch. Splits sizes for input data " +
       "is covered by separate configs.")

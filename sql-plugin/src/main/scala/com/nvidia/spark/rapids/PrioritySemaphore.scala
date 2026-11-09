@@ -16,14 +16,37 @@
 
 package com.nvidia.spark.rapids
 
+import java.util
 import java.util.PriorityQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.{Condition, ReentrantLock}
 
 import scala.collection.JavaConverters.asScalaIteratorConverter
 
 import org.apache.spark.sql.rapids.GpuTaskMetrics
 
-class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit: Int)
+/**
+ * An admission policy that can replace the plain permit count of a [[PrioritySemaphore]].
+ * It is consulted with the semaphore lock held.
+ */
+trait SemaphoreAdmissionPolicy {
+  /**
+   * @param holders task id -> permits of every task currently holding the semaphore
+   * @param taskId the task asking to be admitted
+   * @param numPermits the permits it asks for
+   * @return Some(decision), or None to fall back to the plain permit count
+   */
+  def admits(holders: util.HashMap[Long, Long], taskId: Long, numPermits: Long): Option[Boolean]
+
+  /** How long a waiter sleeps before it re-evaluates the head of the queue, in ms. */
+  def pollMillis: Long
+
+  /** Called by a waiter, without the semaphore lock, after a poll did not admit it. */
+  def onStillBlocked(): Unit = {}
+}
+
+class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit: Int,
+    val admissionPolicy: Option[SemaphoreAdmissionPolicy] = None)
   (implicit ordering: Ordering[T]) {
   // This lock is used to generate condition variables, which affords us the flexibility to notify
   // specific threads at a time. If we use the regular synchronized pattern, we have to either
@@ -32,6 +55,8 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
   private val lock = new ReentrantLock()
   private var occupiedSlots: Long = 0
   private var currentConcurrentGpuTasksNum: Long = 0
+  // task id -> permits for the current holders, used by the admission policy
+  private val holders = new util.HashMap[Long, Long]()
 
   private case class ThreadInfo(priority: T,
                                 condition: Condition,
@@ -63,10 +88,10 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
           ThreadInfo(priority, null, () => numPermits, wasOnGpuBefore, taskAttemptId)
         ) < 0) {
         false
-      } else if (!canAcquire(numPermits)) {
+      } else if (!canAcquire(numPermits, taskAttemptId)) {
         false
       } else {
-        commitAcquire(numPermits)
+        commitAcquire(numPermits, taskAttemptId)
         true
       }
     } finally {
@@ -89,15 +114,35 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
           GpuTaskMetrics.get.recordOnGpuTasksWaitingNumber(
             waitingQueue.iterator().asScala.count(_.wasOnGpuBefore()))
 
-          while (!info.signaled) {
-            info.condition.await()
+          admissionPolicy match {
+            case None =>
+              while (!info.signaled) {
+                info.condition.await()
+              }
+            case Some(policy) =>
+              // The policy depends on memory that can be freed without a release, so the head
+              // of the queue re-evaluates itself periodically.
+              while (!info.signaled) {
+                info.condition.await(policy.pollMillis, TimeUnit.MILLISECONDS)
+                if (!info.signaled && (waitingQueue.peek() eq info)) {
+                  grantWaiters()
+                  if (!info.signaled) {
+                    lock.unlock()
+                    try {
+                      policy.onStillBlocked()
+                    } finally {
+                      lock.lock()
+                    }
+                  }
+                }
+              }
           }
           info.permitsUsed
         } catch {
           case e: Exception =>
             waitingQueue.remove(info)
             if (info.signaled) {
-              release(info.permitsUsed)
+              release(info.permitsUsed, taskAttemptId)
             }
             throw e
         }
@@ -109,43 +154,54 @@ class PrioritySemaphore[T](val maxPermits: Long, val maxConcurrentGpuTasksLimit:
     }
   }
 
-  private def commitAcquire(numPermits: Long): Unit = {
+  private def commitAcquire(numPermits: Long, taskAttemptId: Long): Unit = {
     occupiedSlots += numPermits
     currentConcurrentGpuTasksNum += 1
+    holders.put(taskAttemptId, numPermits)
     // Report current concurrent tasks to GpuTaskMetrics, let it handle max tracking
     GpuTaskMetrics.get.recordConcurrentGpuTasks(currentConcurrentGpuTasksNum)
   }
 
-  def release(numPermits: Long): Unit = {
+  def release(numPermits: Long, taskAttemptId: Long): Unit = {
     lock.lock()
     try {
       occupiedSlots -= numPermits
       currentConcurrentGpuTasksNum -= 1
-      // acquire and wakeup for all threads that now have enough permits
-      var done = false
-      while (!done && waitingQueue.size() > 0) {
-        val nextThread = waitingQueue.peek()
-        val threadPermits = nextThread.computeNumPermits()
-        if (canAcquire(threadPermits)) {
-          val popped = waitingQueue.poll()
-          assert(popped eq nextThread)
-          commitAcquire(threadPermits)
-          nextThread.signaled = true
-          nextThread.permitsUsed = threadPermits
-          nextThread.condition.signal()
-        } else {
-          done = true
-        }
-      }
+      holders.remove(taskAttemptId)
+      grantWaiters()
     } finally {
       lock.unlock()
     }
   }
 
-  private def canAcquire(numPermits: Long): Boolean = {
-    val hasPermits = occupiedSlots + numPermits <= maxPermits
+  /** Release permits that were not acquired on behalf of a known task (tests). */
+  def release(numPermits: Long): Unit = release(numPermits, -1L)
+
+  /** Acquire and wake up waiters, in priority order, while the head can be admitted. */
+  private def grantWaiters(): Unit = {
+    var done = false
+    while (!done && waitingQueue.size() > 0) {
+      val nextThread = waitingQueue.peek()
+      val threadPermits = nextThread.computeNumPermits()
+      if (canAcquire(threadPermits, nextThread.taskId)) {
+        val popped = waitingQueue.poll()
+        assert(popped eq nextThread)
+        commitAcquire(threadPermits, nextThread.taskId)
+        nextThread.signaled = true
+        nextThread.permitsUsed = threadPermits
+        nextThread.condition.signal()
+      } else {
+        done = true
+      }
+    }
+  }
+
+  private def canAcquire(numPermits: Long, taskAttemptId: Long): Boolean = {
     val withinTaskLimit = maxConcurrentGpuTasksLimit <= 0 ||
       currentConcurrentGpuTasksNum < maxConcurrentGpuTasksLimit
-    hasPermits && withinTaskLimit
+    withinTaskLimit && {
+      admissionPolicy.flatMap(_.admits(holders, taskAttemptId, numPermits))
+        .getOrElse(occupiedSlots + numPermits <= maxPermits)
+    }
   }
 }

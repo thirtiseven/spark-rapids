@@ -136,10 +136,17 @@ public abstract class InternalRowToColumnarBatchIterator implements Iterator<Col
 
   @Override
   public ColumnarBatch next() {
+    boolean pullRows = !hasPendingOutput();
+    if (pullRows) {
+      // Pulling the rows of a batch is CPU work in the child, so next() gives up the semaphore
+      // while it does that, and acquires it again before the copy to the GPU. hasNext leaves
+      // it alone, as operators above may call it while they still use the GPU.
+      GpuSemaphore$.MODULE$.releaseIfNecessary(TaskContext.get());
+    }
     if (!hasNext()) {
       throw new NoSuchElementException();
     }
-    if (!hasPendingOutput()) {
+    if (pullRows) {
       collectRows();
     }
     // Grab the semaphore because we are about to put data onto the GPU.

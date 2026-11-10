@@ -634,9 +634,14 @@ class RowToColumnarIterator(
       recordOutput(NvtxIdWithMetrics(NvtxRegistry.ROW_TO_COLUMNAR, opTime) {
         pendingBatchIter.next()
       })
-    } else if (!hasNext) {
-      throw new NoSuchElementException
     } else {
+      // Pulling the rows of a batch is CPU work in the child, so next() gives up the semaphore
+      // while it does that, and buildBatch acquires it again before the copy to the GPU. hasNext
+      // leaves it alone, as operators above may call it while they still use the GPU.
+      GpuSemaphore.releaseIfNecessary(TaskContext.get())
+      if (!hasNext) {
+        throw new NoSuchElementException
+      }
       recordOutput(buildBatch())
     }
   }

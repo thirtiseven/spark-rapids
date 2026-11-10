@@ -790,7 +790,7 @@ class RowToColumnarIterator(
         val sampleRows = GpuBatchUtils.VALIDITY_BUFFER_BOUNDARY_ROWS
         val sampleBytes = GpuBatchUtils.estimateGpuMemory(localSchema, sampleRows)
         targetRows = GpuBatchUtils.estimateRowCount(targetSizeBytes, sampleBytes, sampleRows)
-        initialRows = GpuBatchUtils.estimateRowCount(batchSizeBytes, sampleBytes, sampleRows)
+        initialRows = RowToColumnarIterator.initialRows(batchSizeBytes, sampleBytes, sampleRows)
       }
     }
   }
@@ -865,6 +865,30 @@ class RowToColumnarIterator(
   private val splitHostBatchInHalf
       : HostColumnarBatchWithRowRange => Seq[HostColumnarBatchWithRowRange] = {
     (batch: HostColumnarBatchWithRowRange) => HostColumnarBatchWithRowRange.splitInHalf(batch)
+  }
+}
+
+object RowToColumnarIterator {
+  // The builders reserve host memory for a batch's rows on its first row, and nothing can
+  // reclaim it until the batch ends, so they start with room for a batch of at most this much
+  // and grow by doubling beyond it.
+  private val maxInitialReservationBytes = 128L * 1024 * 1024
+
+  /**
+   * The rows the builders reserve when a batch starts. They are a full batch's rows divided
+   * by a power of two and rounded up, rather than estimated for the bound, so that doubling
+   * reaches a full batch instead of doubling once more for its last few rows.
+   */
+  private[rapids] def initialRows(
+      batchSizeBytes: Long,
+      sampleBytes: Long,
+      sampleRows: Long): Int = {
+    val batchRows = GpuBatchUtils.estimateRowCount(batchSizeBytes, sampleBytes, sampleRows)
+    var fraction = 1L
+    while (batchSizeBytes.toDouble / fraction > maxInitialReservationBytes) {
+      fraction *= 2
+    }
+    ((batchRows + fraction - 1) / fraction).toInt
   }
 }
 

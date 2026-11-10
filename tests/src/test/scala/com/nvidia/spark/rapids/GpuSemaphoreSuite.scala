@@ -16,6 +16,10 @@
 
 package com.nvidia.spark.rapids
 
+import scala.collection.mutable.ArrayBuffer
+
+import com.nvidia.spark.rapids.Arm.withResource
+import com.nvidia.spark.rapids.spill.SpillFramework
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito._
 import org.scalatest.BeforeAndAfterEach
@@ -23,11 +27,6 @@ import org.scalatest.concurrent.{TimeLimitedTests, TimeLimits}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.time.{Seconds, Span}
 import org.scalatestplus.mockito.MockitoSugar
-
-import scala.collection.mutable.ArrayBuffer
-
-import com.nvidia.spark.rapids.Arm.withResource
-import com.nvidia.spark.rapids.spill.SpillFramework
 
 import org.apache.spark.{SparkConf, TaskContext}
 import org.apache.spark.sql.SparkSession

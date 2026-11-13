@@ -670,8 +670,10 @@ object RmmRapidsRetryIterator extends Logging {
 
     // this is true if an OOM was injected (only for tests)
     private var injectedOOM = false
-    // this is true if the OOM was cleared after it was injected (only for tests)
-    private var injectedOOMCleared = false
+    // this is true while this iterator owns the OOM injected into its thread (only for tests)
+    private var ownsInjectedOOM = false
+    // null unless a test enabled OomInjectionStats
+    private val injectionCallSite = OomInjectionStats.callSite()
 
     override def hasNext: Boolean = !closed && attemptIter.hasNext
 
@@ -683,16 +685,21 @@ object RmmRapidsRetryIterator extends Logging {
     }
 
     private def clearInjectedOOMIfNeeded(): Unit = {
-      if (injectedOOM && !injectedOOMCleared) {
+      if (ownsInjectedOOM) {
+        ownsInjectedOOM = false
+        val state = injectedOOMState.get()
+        if (state != null && (state.owner eq this)) {
+          injectedOOMState.remove()
+        }
+        OomInjectionStats.cleared(this)
         val threadId = RmmSpark.getCurrentThreadId
-        // if for some reason we don't throw, or we throw something that isn't a GpuRetryOOM
-        // or CpuRetryOOM
-        // we want to remove the retry we registered before we leave the withRetry block.
+        // The block may have made fewer matching allocations than the injection expected, so
+        // remove what is left of it, of either kind, before we leave the withRetry block.
         // If the thread is in an UNKNOWN state, then it is already cleared.
         if (RmmSpark.getStateOf(threadId) != RmmSparkThreadState.UNKNOWN) {
           RmmSpark.forceRetryOOM(threadId, 0)
+          RmmSpark.forceSplitAndRetryOOM(threadId, 0)
         }
-        injectedOOMCleared = true
       }
     }
 
@@ -728,7 +735,9 @@ object RmmRapidsRetryIterator extends Logging {
         try {
           // call the user's function
           RapidsConf.testRetryOOMInjectionMode() match {
-            case mode if !injectedOOM && mode.numOoms > 0 =>
+            // The JNI holds one injection per thread, so a nested block arming its own would
+            // silently replace the one that an outer block is still waiting for.
+            case mode if !injectedOOM && mode.numOoms > 0 && injectedOOMState.get() == null =>
               injectedOOM = true
               // forceRetryOOM requires a prior association. A TaskContext alone is insufficient
               // because a helper thread can carry one before its pool association is installed.
@@ -737,6 +746,16 @@ object RmmRapidsRetryIterator extends Logging {
                 RmmSpark.isThreadWorkingOnTaskAsPoolThread ||
                   TaskRegistryTracker.isCurrentThreadRegisteredAsDedicatedTaskThread
               if (threadAssociated) {
+                if (mode.spillFirst) {
+                  // A resident input needs no allocation to be materialized, so the injection
+                  // could never reach the unspill path. Spill before arming, otherwise the
+                  // spill's own allocations would consume the injection.
+                  SpillFramework.stores.deviceStore.spill(Long.MaxValue)
+                  SpillFramework.stores.hostStore.spill(Long.MaxValue)
+                }
+                ownsInjectedOOM = true
+                injectedOOMState.set(new InjectedOOMState(this, mode.numOoms))
+                OomInjectionStats.armed(this, injectionCallSite)
                 if (mode.withSplit) {
                   RmmSpark.forceSplitAndRetryOOM(RmmSpark.getCurrentThreadId,
                     mode.numOoms,
@@ -749,16 +768,20 @@ object RmmRapidsRetryIterator extends Logging {
                     mode.skipCount)
                 }
               } else {
+                OomInjectionStats.unassociated(injectionCallSite)
                 log.warn("thread not registered with RmmSpark, cannot inject OOM. See " +
                   "https://github.com/NVIDIA/spark-rapids/issues/13098")
               }
+            case mode if !injectedOOM && mode.numOoms > 0 =>
+              OomInjectionStats.deferred(injectionCallSite)
             case _ => ()
           }
           result = Some(attemptIter.next())
-          clearInjectedOOMIfNeeded()
         } catch {
           case ex: Throwable =>
             log.info("got a throwable in RmmRapidsRetryIterator.next():", ex)
+            OomInjectionStats.caught(this, ex)
+            consumeInjectedOOM(ex)
             // handle a retry as the top-level exception
             val (topLevelIsRetry, topLevelIsSplit, isGpuOom) = isRetryOrSplitAndRetry(ex)
             if (topLevelIsSplit) {
@@ -792,8 +815,6 @@ object RmmRapidsRetryIterator extends Logging {
               }
             }
 
-            clearInjectedOOMIfNeeded()
-
             // make sure we add any prior exceptions to this one as causes
             if (lastException != null) {
               ex.addSuppressed(lastException)
@@ -822,6 +843,9 @@ object RmmRapidsRetryIterator extends Logging {
       result.get
     } finally {
       RetryStateTracker.clearCurThreadRetrying()
+      // Only cleared on the way out, so that every retry of this call sees what is left of
+      // the injection, e.g. num_ooms > 1.
+      clearInjectedOOMIfNeeded()
     }
   }
 
@@ -957,6 +981,29 @@ object RmmRapidsRetryIterator extends Logging {
   var preSplitPrinted = false
 
   val threadCountBlockedUntilReady: AtomicInteger = new AtomicInteger(0)
+
+  // The OOMs injected into a thread and the retry block that armed them, only set in tests
+  private final class InjectedOOMState(val owner: AnyRef, var remaining: Int) {
+    var lastCaught: Throwable = _
+  }
+  private val injectedOOMState = new ThreadLocal[InjectedOOMState]()
+
+  // Once the pending injection is spent, e.g. while its block retries, nested blocks may inject
+  // their own. Misses only keep nested blocks waiting until the arming block exits.
+  private def consumeInjectedOOM(t: Throwable): Unit = {
+    val state = injectedOOMState.get()
+    if (state != null) {
+      val injected = OomInjectionStats.findInjected(t)
+      // an outer block sees the same exception again when an inner block rethrows it
+      if (injected != null && (injected ne state.lastCaught)) {
+        state.lastCaught = injected
+        state.remaining -= 1
+        if (state.remaining <= 0) {
+          injectedOOMState.remove()
+        }
+      }
+    }
+  }
 
   private def preSplitLogging(): Unit = synchronized { // use synchronized to keep neat
     if (!preSplitPrinted || PRE_SPLIT_PRINT_ALL) {

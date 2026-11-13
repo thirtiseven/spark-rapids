@@ -442,6 +442,14 @@ The randomness used when the mode is `random` is controlled by the `SPARK_RAPIDS
 environment variable. If unset, the launcher script assigns the current timestamp and prints the seed at
 startup so that the run can be reproduced.
 
+A mode can carry the injection settings of `spark.rapids.sql.test.injectRetryOOM` after a colon, for
+example `--test_oom_injection_mode=always:num_ooms=2,spill=true`. `spill=true` spills everything spillable
+before injecting, so that retry blocks which only materialize spilled inputs can see the injected OOM.
+
+To see whether the injected OOMs actually fired, and in which retry blocks, add
+`--oom_injection_stats=<path>`. It prints a summary and writes per call site and per test counts to the
+JSON file. It only covers executors running in the driver JVM, i.e. local mode.
+
 ### Running with non-UTC time zone
 For the new added cases, we should check non-UTC time zone is working, or the non-UTC nightly CIs will fail.
 The non-UTC nightly CIs are verifing all cases with non-UTC time zone.

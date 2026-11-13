@@ -70,7 +70,8 @@ object RapidsConf extends Logging with RapidsConfEntries {
     numOoms = 0,
     skipCount = 0,
     oomInjectionFilter = OomInjectionType.CPU_OR_GPU,
-    withSplit = false)
+    withSplit = false,
+    spillFirst = false)
 
   // A java property that is set to true when we are running in tests.
   // We will use this property to check for oom injection configs in SQLConf, and to turn on
@@ -101,6 +102,8 @@ object RapidsConf extends Logging with RapidsConfEntries {
    * injecting an OOM at the skip+1st allocation.
    * *split* maps to withSplit (default false), determining whether to inject
    * *SplitAndRetryOOM instead of plain *RetryOOM exceptions
+   * "spill" maps to spillFirst (default false), whether to spill everything spillable
+   * before injecting, so that materializing a spilled input can hit the injected OOM
    *
    * For backwards compatibility support existing binary configuration
    *   "false", disabled, i.e. oomCount=0, skipCount=0, injectionType=None
@@ -116,7 +119,8 @@ object RapidsConf extends Logging with RapidsConfEntries {
         case "false" => noInjection
         case "true" =>
           OomInjectionConf(numOoms = 1, skipCount = 0,
-            oomInjectionFilter = OomInjectionType.CPU_OR_GPU, withSplit = false)
+            oomInjectionFilter = OomInjectionType.CPU_OR_GPU, withSplit = false,
+            spillFirst = false)
         case injectConfStr =>
           val injectConfMap = injectConfStr.split(',').map(_.split('=')).collect {
             case Array(k, v) => k -> v
@@ -128,11 +132,13 @@ object RapidsConf extends Logging with RapidsConfEntries {
             .toUpperCase()
           val oomFilter = OomInjectionType.valueOf(oomFilterStr)
           val withSplit = injectConfMap.getOrElse("split", false.toString)
+          val spillFirst = injectConfMap.getOrElse("spill", false.toString)
           val ret = OomInjectionConf(
             numOoms = numOoms.toInt,
             skipCount = skipCount.toInt,
             oomInjectionFilter = oomFilter,
-            withSplit = withSplit.toBoolean
+            withSplit = withSplit.toBoolean,
+            spillFirst = spillFirst.toBoolean
           )
           logDebug(s"Parsed ${ret} from ${injectConfStr} via injectConfMap=${injectConfMap}");
           ret
@@ -1241,5 +1247,6 @@ case class OomInjectionConf(
   numOoms: Int,
   skipCount: Int,
   withSplit: Boolean,
-  oomInjectionFilter: OomInjectionType
+  oomInjectionFilter: OomInjectionType,
+  spillFirst: Boolean
 )

@@ -21,10 +21,13 @@ import java.lang.reflect.Field
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.util.Try
+import scala.util.control.NonFatal
 
 import com.nvidia.spark.rapids._
 import org.apache.hadoop.fs.Path
 
+import org.apache.spark.SPARK_VERSION
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
@@ -329,9 +332,28 @@ class DeltaProbeImpl extends DeltaProbe {
     val hasDeltaJar = UnshimmedTrampolineUtil.classIsLoadable(cpuClassName) &&
         Try(ShimReflectionUtils.loadClass(cpuClassName)).isSuccess
     if (hasDeltaJar) {
-      DeltaRuntimeShim.getDeltaProvider
+      DeltaProbeImpl.providerOrNoDelta(DeltaRuntimeShim.getDeltaProvider)
     } else {
       NoDeltaProvider
+    }
+  }
+}
+
+object DeltaProbeImpl extends Logging {
+  /**
+   * The provider is resolved while planning every query, so a Delta Lake runtime without a
+   * usable shim must only disable Delta acceleration instead of failing queries that do not
+   * touch Delta. LinkageError is included because an incompatible Delta jar surfaces as
+   * NoClassDefFoundError when the shim is linked.
+   */
+  private[delta] def providerOrNoDelta(provider: => DeltaProvider): DeltaProvider = {
+    try {
+      provider
+    } catch {
+      case e: Throwable if NonFatal(e) || e.isInstanceOf[LinkageError] =>
+        logWarning("Disabling GPU acceleration for Delta Lake " +
+          s"${Try(_root_.io.delta.VERSION).getOrElse("unknown")} on Spark $SPARK_VERSION", e)
+        NoDeltaProvider
     }
   }
 }

@@ -150,6 +150,22 @@ object DeltaRuntimeShim {
     }
   }
 
+  /**
+   * Spark 3.5.3+ builds bundle only the Delta 3.3 shim, which links against classes that older
+   * Delta releases lack (e.g. LoggingShims), so the Delta version on the classpath must be
+   * checked before the shim is loaded.
+   */
+  private[rapids] def getDelta33ShimClassName(
+      deltaVersion: String,
+      sparkVersion: String): String = {
+    if (deltaVersion.startsWith("3.3.")) {
+      "org.apache.spark.sql.delta.rapids.delta33x.Delta33xRuntimeShim"
+    } else {
+      throw new IllegalStateException(
+        s"Unsupported Delta Lake $deltaVersion and Spark $sparkVersion combination")
+    }
+  }
+
   private def getPreDelta42ShimClassName: String = {
     if (VersionUtils.cmpSparkVersion(3, 2, 0) < 0) {
       throw new IllegalStateException("Delta Lake is not supported on Spark < 3.2.x")
@@ -170,7 +186,7 @@ object DeltaRuntimeShim {
       "org.apache.spark.sql.delta.rapids.delta24x.Delta24xRuntimeShim"
     } else if (VersionUtils.cmpSparkVersion(3, 5, 2) > 0 &&
                VersionUtils.cmpSparkVersion(4, 0, 0) < 0) {
-      "org.apache.spark.sql.delta.rapids.delta33x.Delta33xRuntimeShim"
+      getDelta33ShimClassName(io.delta.VERSION, SPARK_VERSION)
     } else if (VersionUtils.cmpSparkVersion(4, 0, 0) >= 0 &&
                VersionUtils.cmpSparkVersion(4, 1, 0) < 0) {
       "org.apache.spark.sql.delta.rapids.delta40x.Delta40xRuntimeShim"

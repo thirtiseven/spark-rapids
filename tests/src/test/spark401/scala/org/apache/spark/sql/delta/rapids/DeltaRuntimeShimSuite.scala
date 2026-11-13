@@ -95,6 +95,20 @@ class DeltaRuntimeShimSuite extends SparkQueryCompareTestSuite {
     }
   }
 
+  test("Delta 3.3 runtime shim selection requires Delta 3.3") {
+    Seq("3.3.0", "3.3.3").foreach { deltaVersion =>
+      assert(DeltaRuntimeShim.getDelta33ShimClassName(deltaVersion, "3.5.3").contains("delta33x"))
+    }
+    // Dataproc Serverless 2.3 ships Delta 3.2.1 with Spark 3.5.3
+    Seq("3.2.1", "3.1.0", "4.0.0").foreach { deltaVersion =>
+      val error = intercept[IllegalStateException] {
+        DeltaRuntimeShim.getDelta33ShimClassName(deltaVersion, "3.5.3")
+      }
+      assert(error.getMessage.contains(deltaVersion))
+      assert(error.getMessage.contains("3.5.3"))
+    }
+  }
+
   test("existing Delta versions use the pre-4.2 runtime shim selection") {
     Seq("2.1.0", "3.3.3", "4.0.0", "4.1.0").foreach { deltaVersion =>
       assert(DeltaRuntimeShim.getDelta42ShimClassName(deltaVersion, "4.0.1").isEmpty)

@@ -26,7 +26,8 @@ import warnings
 # import as a plugin to do a lazy per-pytest-session initialization
 #
 pytest_plugins = [
-    'spark_init_internal'
+    'spark_init_internal',
+    'oom_injection_stats'
 ]
 
 _approximate_float_args = None

@@ -57,6 +57,10 @@ def pytest_addoption(parser):
         help="in what way, if any, should the tests inject OOMs at test time. Valid options are: random, always, or never"
     )
     parser.addoption(
+        "--oom_injection_stats", action='store', default=None,
+        help="write to this path, per retry block call site, how many injected OOMs were armed and whether they fired. Local mode only"
+    )
+    parser.addoption(
         "--force_parquet_testing_tests", action="store_true", default=False,
         help="if true forces parquet-testing tests to fail if input data cannot be found"
     )

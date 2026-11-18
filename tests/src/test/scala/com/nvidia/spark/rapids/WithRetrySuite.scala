@@ -162,6 +162,92 @@ class WithRetrySuite
     }
   }
 
+  private def withInjectedOOM[T](injection: String)(body: => T): T = {
+    val sqlConf = new SQLConf()
+    sqlConf.setConfString(RapidsConf.TEST_RETRY_OOM_INJECTION_MODE.key, injection)
+    SQLConf.withExistingConf(sqlConf)(body)
+  }
+
+  private def allocateGpu(): Unit = withResource(DeviceMemoryBuffer.allocate(1))(_ => ())
+
+  test("OOM injection of an outer block survives a nested block that does not allocate") {
+    runOnNewTaskThread(104L) {
+      TaskRegistryTracker.registerDedicatedThreadForRetry()
+      var outerAttempts = 0
+      withInjectedOOM("type=GPU") {
+        withRetryNoSplit {
+          outerAttempts += 1
+          withRetryNoSplit(())
+          allocateGpu()
+        }
+      }
+      assertResult(2)(outerAttempts)
+    }
+  }
+
+  test("a nested block injects its own OOM once the outer injection is spent") {
+    runOnNewTaskThread(108L) {
+      TaskRegistryTracker.registerDedicatedThreadForRetry()
+      var outerAttempts = 0
+      var innerAttempts = 0
+      withInjectedOOM("type=GPU") {
+        withRetryNoSplit {
+          outerAttempts += 1
+          allocateGpu()
+          withRetryNoSplit {
+            innerAttempts += 1
+            allocateGpu()
+          }
+        }
+      }
+      // the first outer attempt fails before reaching the nested block
+      assertResult(2)(outerAttempts)
+      assertResult(2)(innerAttempts)
+    }
+  }
+
+  test("OOM injection throws num_ooms times within one retry block") {
+    runOnNewTaskThread(105L) {
+      TaskRegistryTracker.registerDedicatedThreadForRetry()
+      var attempts = 0
+      withInjectedOOM("num_ooms=3,type=GPU") {
+        withRetryNoSplit {
+          attempts += 1
+          allocateGpu()
+        }
+      }
+      assertResult(4)(attempts)
+    }
+  }
+
+  test("an injected split OOM that did not fire is cleared with its retry block") {
+    runOnNewTaskThread(106L) {
+      TaskRegistryTracker.registerDedicatedThreadForRetry()
+      withInjectedOOM("split=true,type=GPU") {
+        withRetryNoSplit(())
+      }
+      allocateGpu()
+    }
+  }
+
+  test("OOM injection with spill=true reaches a block that only materializes its input") {
+    val taskAttemptId = 107L
+    runOnNewTaskThread(taskAttemptId) {
+      // Unspilling acquires the semaphore for the TaskContext, which needs a SparkEnv. A pool
+      // thread association still enables the injection without one.
+      TrampolineUtil.unsetTaskContext()
+      RmmSpark.poolThreadWorkingOnTask(taskAttemptId)
+      var attempts = 0
+      withInjectedOOM("spill=true,type=GPU") {
+        withRetryNoSplit(buildBatch) { attempt =>
+          attempts += 1
+          withResource(attempt.getColumnarBatch())(_ => ())
+        }
+      }
+      assertResult(2)(attempts)
+    }
+  }
+
   test("withRetry closes input on failure") {
     val myItems = Seq(buildBatch, buildBatch)
     assertThrows[IllegalStateException] {

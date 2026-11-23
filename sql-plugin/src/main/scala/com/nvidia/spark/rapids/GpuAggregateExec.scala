@@ -2068,6 +2068,8 @@ case class GpuHashAggregateExec(
     AST_JIT_PROGRAM_BUILD_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT program build attempts"),
     AST_JIT_PROGRAM_CACHE_HITS -> createMetric(DEBUG_LEVEL, "AST JIT bound program cache hits"),
     AST_JIT_PROGRAM_BUILD_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT program build time"),
+    AST_JIT_PRECOMPILE_WAIT_TIME ->
+      createNanoTimingMetric(DEBUG_LEVEL, "AST JIT precompile wait time"),
     AST_JIT_EVAL_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT group evaluation attempts"),
     AST_JIT_EVAL_ROWS -> createMetric(DEBUG_LEVEL, "AST JIT group input rows including retries"),
     AST_JIT_EVAL_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT group evaluation time")
@@ -2125,10 +2127,22 @@ case class GpuHashAggregateExec(
 
     val boundGroupExprs = GpuBindReferences.bindGpuReferencesTiered(groupingExprs,
       inputAttrs, conf, allMetrics, enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf))
+    val precompileAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf) &&
+      RapidsConf.PROJECT_AST_JIT_PRECOMPILE.get(conf)
+    val precompileSpeculative = RapidsConf.PROJECT_AST_JIT_PRECOMPILE_SPECULATIVE.get(conf)
+    val precompileThreads = RapidsConf.PROJECT_AST_JIT_PRECOMPILE_THREADS.get(conf)
+    val multiOutputAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT_MULTI_OUTPUT.get(conf)
 
     rdd.mapPartitions { cbIter =>
       val postBoundReferences = GpuAggFinalPassIterator.setupReferences(groupingExprs,
         aggregateExprs, aggregateAttrs, resultExprs, modeInfo, conf, allMetrics)
+      if (precompileAstJit) {
+        val tiersToPrecompile = boundGroupExprs.exprTiers ++
+          postBoundReferences.boundFinalProjections.map(_.exprTiers).getOrElse(Seq.empty) ++
+          postBoundReferences.boundResultReferences.exprTiers
+        GpuAstJitPrecompiler.submit(tiersToPrecompile, multiOutputAstJit,
+          precompileSpeculative, precompileThreads)
+      }
 
       new DynamicGpuPartialAggregateIterator(cbIter, inputAttrs, groupingExprs,
         boundGroupExprs, aggregateExprs, aggregateAttrs, resultExprs, modeInfo,

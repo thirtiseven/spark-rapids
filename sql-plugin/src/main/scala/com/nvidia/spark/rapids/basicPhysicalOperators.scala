@@ -890,6 +890,8 @@ case class GpuProjectExec(
     AST_JIT_PROGRAM_BUILD_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT program build attempts"),
     AST_JIT_PROGRAM_CACHE_HITS -> createMetric(DEBUG_LEVEL, "AST JIT bound program cache hits"),
     AST_JIT_PROGRAM_BUILD_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT program build time"),
+    AST_JIT_PRECOMPILE_WAIT_TIME ->
+      createNanoTimingMetric(DEBUG_LEVEL, "AST JIT precompile wait time"),
     AST_JIT_EVAL_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT group evaluation attempts"),
     AST_JIT_EVAL_ROWS -> createMetric(DEBUG_LEVEL, "AST JIT group input rows including retries"),
     AST_JIT_EVAL_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT group evaluation time"),
@@ -909,6 +911,11 @@ case class GpuProjectExec(
       enableAst = RapidsConf.ENABLE_PROJECT_AST.get(conf),
       enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf))
     val localEnablePreSplit = enablePreSplit
+    val precompileAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf) &&
+      RapidsConf.PROJECT_AST_JIT_PRECOMPILE.get(conf)
+    val precompileSpeculative = RapidsConf.PROJECT_AST_JIT_PRECOMPILE_SPECULATIVE.get(conf)
+    val precompileThreads = RapidsConf.PROJECT_AST_JIT_PRECOMPILE_THREADS.get(conf)
+    val multiOutputAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT_MULTI_OUTPUT.get(conf)
 
     val rdd = child.executeColumnar()
     // Use mapPartitionsWithIndex (not mapPartitions) so that when a downstream
@@ -918,6 +925,10 @@ case class GpuProjectExec(
     // per parent partition so their values stay stable across coalesce/union
     // (SPARK-14393, #14156).
     rdd.mapPartitionsWithIndex { (partIndex, iter) =>
+      if (precompileAstJit) {
+        GpuAstJitPrecompiler.submit(boundProjectList.exprTiers, multiOutputAstJit,
+          precompileSpeculative, precompileThreads)
+      }
       GpuNondeterministic.initializeAll(boundProjectList.exprTiers.flatten, partIndex)
       val maybeSplitIter = if (localEnablePreSplit) {
         new PreProjectSplitIterator(iter, boundProjectList, opTime, numPreSplit)
@@ -1376,6 +1387,8 @@ case class GpuFilterExec(
     AST_JIT_PROGRAM_BUILD_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT program build attempts"),
     AST_JIT_PROGRAM_CACHE_HITS -> createMetric(DEBUG_LEVEL, "AST JIT bound program cache hits"),
     AST_JIT_PROGRAM_BUILD_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT program build time"),
+    AST_JIT_PRECOMPILE_WAIT_TIME ->
+      createNanoTimingMetric(DEBUG_LEVEL, "AST JIT precompile wait time"),
     AST_JIT_EVAL_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT group evaluation attempts"),
     AST_JIT_EVAL_ROWS -> createMetric(DEBUG_LEVEL, "AST JIT group input rows including retries"),
     AST_JIT_EVAL_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT group evaluation time"))
@@ -1416,6 +1429,11 @@ case class GpuFilterExec(
     val rdd = child.executeColumnar()
     val boundCondition = GpuBindReferences.bindGpuReferencesTiered(Seq(condition), child.output,
       conf, allMetrics, enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf))
+    val precompileAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf) &&
+      RapidsConf.PROJECT_AST_JIT_PRECOMPILE.get(conf)
+    val precompileSpeculative = RapidsConf.PROJECT_AST_JIT_PRECOMPILE_SPECULATIVE.get(conf)
+    val precompileThreads = RapidsConf.PROJECT_AST_JIT_PRECOMPILE_THREADS.get(conf)
+    val multiOutputAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT_MULTI_OUTPUT.get(conf)
     // Mirrors GpuProjectExec: mapPartitionsWithIndex (not flatMap) so that
     // when a downstream coalesce/union wraps this RDD, our lambda fires once
     // per parent partition with that parent's index. GpuNondeterministic
@@ -1423,6 +1441,10 @@ case class GpuFilterExec(
     // per parent partition so their values stay stable across coalesce/union
     // (SPARK-14393, #14156).
     rdd.mapPartitionsWithIndex { (partIndex, iter) =>
+      if (precompileAstJit) {
+        GpuAstJitPrecompiler.submit(boundCondition.exprTiers, multiOutputAstJit,
+          precompileSpeculative, precompileThreads)
+      }
       GpuNondeterministic.initializeAll(boundCondition.exprTiers.flatten, partIndex)
       iter.flatMap { batch =>
         GpuFilter.filterAndClose(batch, boundCondition, numOutputRows,

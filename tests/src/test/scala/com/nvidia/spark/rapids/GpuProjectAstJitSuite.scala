@@ -1054,4 +1054,47 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
     assertResult(GpuAstJitExpression.BackendCounts(jit = 1, legacyAst = 1, regular = 1))(
       GpuAstJitExpression.countFinalBackends(Seq(Seq(jitNode, legacyNode, regularNode))))
   }
+
+  test("minGroupOps admission threshold filters small JIT groups and allows fused groups") {
+    val left = reference(0, IntegerType)
+    val right = reference(1, IntegerType)
+    val singleOp = alias(GpuAdd(left, right, failOnError = false)(), "s")
+    val twoOps = alias(GpuMultiply(
+      GpuAdd(left, right, failOnError = false)(), right, failOnError = false)(), "m")
+
+    val conf = projectConf()
+    conf.setConfString(RapidsConf.PROJECT_AST_JIT_MIN_GROUP_OPS.key, "2")
+    val singleTiered = bindProject(Seq(singleOp), Seq(left, right), conf)
+    assert(collectExpressions[GpuAstJitExpression](singleTiered.exprTiers.flatten).isEmpty)
+
+    // Multi-output group combining two 1-op roots reaches 2 unique ops and is admitted.
+    val secondSingle = alias(GpuSubtract(left, right, failOnError = false)(), "d")
+    val multiTiered = bindProject(Seq(singleOp, secondSingle), Seq(left, right), conf)
+    assertResult(2)(collectExpressions[GpuAstJitExpression](multiTiered.exprTiers.flatten).size)
+
+    val compoundTiered = bindProject(Seq(twoOps), Seq(left, right), conf)
+    assertResult(1)(collectExpressions[GpuAstJitExpression](compoundTiered.exprTiers.flatten).size)
+  }
+
+  test("AST JIT precompiler compiles a group and awaits cleanly") {
+    val left = reference(0, IntegerType)
+    val right = reference(1, IntegerType)
+    val expr = alias(GpuMultiply(
+      GpuAdd(left, right, failOnError = false)(), right, failOnError = false)(), "out")
+    val tiered = bindProject(Seq(expr), Seq(left, right), projectConf())
+    GpuAstJitPrecompiler.submit(tiered.exprTiers, multiOutputEnabled = true,
+      speculative = false, threads = 1)
+    withResource(gpuTable(
+        ColumnVector.fromBoxedInts(1, null, 3),
+        ColumnVector.fromBoxedInts(2, 4, 5))) { input =>
+      val jit = collectExpressions[GpuAstJitExpression](tiered.exprTiers.flatten).head
+      TestUtils.withMockTaskContext() {
+        val out = GpuAstJitExpression.computeColumns(Seq(jit), input)
+        withResource(out) { cb =>
+          assertResult(longs(6L, null, 40L))(
+            collectLongs(cb.column(0).asInstanceOf[GpuColumnVector].getBase))
+        }
+      }
+    }
+  }
 }

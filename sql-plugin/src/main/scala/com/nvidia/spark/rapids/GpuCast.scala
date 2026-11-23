@@ -1791,27 +1791,65 @@ case class GpuCast(
     case _ => s"CAST(${child.sql} AS ${dataType.sql})"
   }
 
-  // Integral widening is exact and cannot fail, so AST JIT can keep it inside a consumer's kernel
-  // instead of materializing the widened column.
+  private def isAstJitIdentityCast: Boolean =
+    child.dataType == dataType && GpuAstJitExpression.isSupportedDataType(dataType)
+
+  // Semantically-equivalent casts that cannot raise unmodeled errors in AST JIT:
+  // - integral widening (lossless in ANSI and non-ANSI)
+  // - non-ANSI integral narrowing (wraps like Spark/Java)
+  // - boolean <-> integral
+  // - integral/boolean/float/double/decimal -> float/double
+  // - same-scale decimal widening
   private def astJitCastOperator: Option[ast.JitOperator] = (child.dataType, dataType) match {
     case (ByteType, ShortType) => Some(ast.JitOperator.CAST_TO_INT16)
     case (ByteType | ShortType, IntegerType) => Some(ast.JitOperator.CAST_TO_INT32)
     case (ByteType | ShortType | IntegerType, LongType) => Some(ast.JitOperator.CAST_TO_INT64)
+    case (ShortType | IntegerType | LongType, ByteType) if !ansiMode =>
+      Some(ast.JitOperator.CAST_TO_INT8)
+    case (IntegerType | LongType, ShortType) if !ansiMode =>
+      Some(ast.JitOperator.CAST_TO_INT16)
+    case (LongType, IntegerType) if !ansiMode =>
+      Some(ast.JitOperator.CAST_TO_INT32)
+    case (BooleanType, ByteType) => Some(ast.JitOperator.CAST_TO_INT8)
+    case (BooleanType, ShortType) => Some(ast.JitOperator.CAST_TO_INT16)
+    case (BooleanType, IntegerType) => Some(ast.JitOperator.CAST_TO_INT32)
+    case (BooleanType, LongType) => Some(ast.JitOperator.CAST_TO_INT64)
+    case (ByteType | ShortType | IntegerType | LongType, BooleanType) =>
+      Some(ast.JitOperator.CAST_TO_BOOL8)
+    case (BooleanType | ByteType | ShortType | IntegerType | LongType | DoubleType |
+          _: DecimalType, FloatType) =>
+      Some(ast.JitOperator.CAST_TO_FLOAT32)
+    case (BooleanType | ByteType | ShortType | IntegerType | LongType | FloatType |
+          _: DecimalType, DoubleType) =>
+      Some(ast.JitOperator.CAST_TO_FLOAT64)
+    case (from: DecimalType, to: DecimalType) if from.scale == to.scale &&
+        to.precision >= from.precision =>
+      if (to.precision <= Decimal.MAX_INT_DIGITS) {
+        Some(ast.JitOperator.CAST_TO_DECIMAL32)
+      } else if (to.precision <= Decimal.MAX_LONG_DIGITS) {
+        Some(ast.JitOperator.CAST_TO_DECIMAL64)
+      } else {
+        Some(ast.JitOperator.CAST_TO_DECIMAL128)
+      }
     case _ => None
   }
 
-  override def selfSupportsAstJit: Boolean = astJitCastOperator.isDefined
+  override def selfSupportsAstJit: Boolean = isAstJitIdentityCast || astJitCastOperator.isDefined
 
-  override def selfIsAstJitOperator: Boolean = selfSupportsAstJit
+  override def selfIsAstJitOperator: Boolean = astJitCastOperator.isDefined
 
   // A cast alone is not worth compiling.
   override def selfTriggersAstJit: Boolean = false
 
   override def convertToAst(numFirstTableColumns: Int): ast.AstExpression = {
-    val jitOp = astJitCastOperator.getOrElse(
-      throw new IllegalStateException(s"$this is not supported by AST"))
-    new ast.JitOperation(jitOp,
-      child.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns))
+    val childAst = child.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns)
+    if (isAstJitIdentityCast) {
+      childAst
+    } else {
+      val jitOp = astJitCastOperator.getOrElse(
+        throw new IllegalStateException(s"$this is not supported by AST"))
+      new ast.JitOperation(jitOp, childAst)
+    }
   }
 
   override def doColumnar(input: GpuColumnVector): ColumnVector = {

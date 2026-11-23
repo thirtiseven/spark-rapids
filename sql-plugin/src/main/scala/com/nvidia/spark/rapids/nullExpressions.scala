@@ -119,6 +119,22 @@ case class GpuCoalesce(children: Seq[Expression]) extends GpuExpression
 
   // Coalesce is foldable if all children are foldable.
   override def foldable: Boolean = children.forall(_.foldable)
+
+  override def selfSupportsAstJit: Boolean =
+    children.nonEmpty && GpuAstJitExpression.isSupportedDataType(dataType) &&
+      children.forall { child =>
+        child.dataType == dataType && (child match {
+          case gpu: GpuExpression => !gpu.hasSideEffects
+          case _ => true
+        })
+      }
+
+  override def selfIsAstJitOperator: Boolean = selfSupportsAstJit && children.size >= 2
+
+  override def convertToAst(numFirstTableColumns: Int): ast.AstExpression = {
+    children.map(_.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns))
+        .reduceRight((a, b) => new ast.JitOperation(ast.JitOperator.COALESCE, a, b))
+  }
 }
 
 /*
@@ -136,6 +152,11 @@ case class GpuIsNull(child: Expression) extends GpuUnaryExpression with Predicat
 
   override def selfConvertsToAst: Boolean = true
 
+  override def selfSupportsAstJit: Boolean =
+    GpuAstJitExpression.isSupportedDataType(child.dataType)
+
+  override def selfIsAstJitOperator: Boolean = selfSupportsAstJit
+
   override def convertToAst(numFirstTableColumns: Int): ast.AstExpression = {
     new ast.UnaryOperation(ast.UnaryOperator.IS_NULL,
       child.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns))
@@ -151,6 +172,11 @@ case class GpuIsNotNull(child: Expression) extends GpuUnaryExpression with Predi
     input.getBase.isNotNull
 
   override def selfConvertsToAst: Boolean = true
+
+  override def selfSupportsAstJit: Boolean =
+    GpuAstJitExpression.isSupportedDataType(child.dataType)
+
+  override def selfIsAstJitOperator: Boolean = selfSupportsAstJit
 
   override def convertToAst(numFirstTableColumns: Int): ast.AstExpression = {
     new ast.UnaryOperation(ast.UnaryOperator.NOT,

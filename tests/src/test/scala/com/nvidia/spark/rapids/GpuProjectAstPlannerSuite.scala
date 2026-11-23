@@ -25,7 +25,7 @@ import org.apache.spark.sql.catalyst.expressions.{Abs, Add, Alias, And, Attribut
   BitwiseXor, BoundReference, EqualTo, Expression, GreaterThan, GreaterThanOrEqual, Greatest,
   LessThan, Literal, Multiply, Or, StringInstr, Subtract}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.rapids.{GpuAdd, GpuAnd, GpuBitwiseXor, GpuContains, GpuEqualTo,
+import org.apache.spark.sql.rapids.{GpuAdd, GpuAnd, GpuContains, GpuEqualTo,
   GpuGreatest, GpuMultiply, GpuOr, GpuSubtract}
 import org.apache.spark.sql.types.{FloatType, LongType, StringType}
 
@@ -273,7 +273,8 @@ class GpuProjectAstPlannerSuite extends AnyFunSuite {
   test("both backends preserve a complete interpreted AST instead of splitting for JIT") {
     val sqlConf = conf(legacy = true, jit = true)
     SQLConf.withExistingConf(sqlConf) {
-      val expression = convert(Alias(BitwiseXor(Add(a, b), c), "result")(), sqlConf)
+      val sum = convert(Add(a, b), sqlConf)
+      val expression = GpuAlias(ProjectAstTestUtils.legacyOnlyBinary(sum, c), "result")()
       val tiers = bind(Seq(expression), sqlConf).exprTiers
       assertResult(1)(tiers.size)
       assertResult(1)(collectExpressions[GpuProjectAstExpression](tiers.flatten).size)
@@ -324,17 +325,17 @@ class GpuProjectAstPlannerSuite extends AnyFunSuite {
     test(s"maximal cross-backend sharing: reverse=$reverse, compound remainder=$compound") {
       val sqlConf = conf(legacy = true, jit = true)
       SQLConf.withExistingConf(sqlConf) {
-        val shared = Multiply(Add(a, b), c)
-        val right = if (compound) Subtract(c, d) else d
+        val shared = convert(Multiply(Add(a, b), c), sqlConf)
+        val right = if (compound) convert(Subtract(c, d), sqlConf) else d
         val expressions = Seq(
-          convert(Alias(BitwiseXor(shared, right), "legacy")(), sqlConf),
-          convert(Alias(shared, "jit")(), sqlConf))
+          GpuAlias(ProjectAstTestUtils.legacyOnlyBinary(shared, right), "legacy")(),
+          GpuAlias(shared, "jit")())
         val ordered = if (reverse) expressions.reverse else expressions
         val tiers = bind(ordered, sqlConf).exprTiers
         assertResult(2)(tiers.size)
         assertResult(Seq(1, 0))(tiers.map(collectExpressions[GpuAstJitExpression](_).size))
         assertResult(Seq(0, 1))(tiers.map(collectExpressions[GpuProjectAstExpression](_).size))
-        assertResult(1)(collectExpressions[GpuBitwiseXor](tiers.last).size)
+        assertResult(1)(collectExpressions[TestLegacyOnlyBinary](tiers.last).size)
         assertResult(1)(collectExpressions[GpuAdd](tiers.flatten).size)
         assert(collectExpressions[GpuAdd](tiers.last).isEmpty)
         assertResult(ordered.map(_.asInstanceOf[GpuAlias].exprId))(

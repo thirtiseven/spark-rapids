@@ -39,6 +39,8 @@ case class GpuNot(child: Expression) extends CudfUnaryExpression
 
   override def unaryOp: UnaryOp = UnaryOp.NOT
 
+  override protected def astJitCompatible: Boolean = child.dataType == BooleanType
+
   override def convertToAst(numFirstTableColumns: Int): ast.AstExpression = {
     child match {
       case c: GpuEqualTo =>
@@ -123,6 +125,13 @@ case class GpuAnd(left: Expression, right: Expression) extends CudfBinaryPredica
   override def binaryOp: BinaryOp = BinaryOp.NULL_LOGICAL_AND
   override def astOperator: Option[BinaryOperator] = Some(ast.BinaryOperator.NULL_LOGICAL_AND)
 
+  // cuDF row_ir evaluates both operands eagerly, so keep side-effecting RHS on the regular path.
+  override protected def astJitCompatible: Boolean =
+    left.dataType == BooleanType && right.dataType == BooleanType && (right match {
+      case gpu: GpuExpression => !gpu.hasSideEffects
+      case _ => true
+    })
+
   override def shortCircuitVal: Boolean = false
 
   override def shouldShortCircuit(col: GpuColumnVector): Boolean =
@@ -140,6 +149,13 @@ case class GpuOr(left: Expression, right: Expression) extends CudfBinaryPredicat
 
   override def binaryOp: BinaryOp = BinaryOp.NULL_LOGICAL_OR
   override def astOperator: Option[BinaryOperator] = Some(ast.BinaryOperator.NULL_LOGICAL_OR)
+
+  // cuDF row_ir evaluates both operands eagerly, so keep side-effecting RHS on the regular path.
+  override protected def astJitCompatible: Boolean =
+    left.dataType == BooleanType && right.dataType == BooleanType && (right match {
+      case gpu: GpuExpression => !gpu.hasSideEffects
+      case _ => true
+    })
 
   override def shortCircuitVal: Boolean = true
 

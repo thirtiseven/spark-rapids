@@ -28,12 +28,14 @@ import org.apache.spark.TaskContext
 import org.apache.spark.sql.catalyst.expressions.{Abs, Attribute, AttributeReference, BoundReference,
   Expression, NamedExpression}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.rapids.{GpuAbs, GpuAdd, GpuBitwiseAnd, GpuGreatest, GpuMultiply,
-  GpuSubtract, GpuUnaryMinus, GpuUnaryPositive}
+import org.apache.spark.sql.rapids.{GpuAbs, GpuAdd, GpuAnd, GpuBitwiseAnd, GpuBitwiseNot,
+  GpuBitwiseOr, GpuBitwiseXor, GpuGreatest, GpuMultiply, GpuNot, GpuOr, GpuShiftLeft,
+  GpuShiftRight, GpuShiftRightUnsigned, GpuSubtract, GpuUnaryMinus, GpuUnaryPositive}
 import org.apache.spark.sql.rapids.metrics.source.MockTaskContext
-import org.apache.spark.sql.types.{ArrayType, BinaryType, ByteType, DataType, DateType,
+import org.apache.spark.sql.types.{ArrayType, BinaryType, BooleanType, ByteType, DataType, DateType,
   Decimal, DecimalType, DoubleType, FloatType, IntegerType, LongType, ShortType, StringType,
   TimestampType}
+import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.TaskCompletionListener
 
 class GpuProjectAstJitSuite extends AnyFunSuite {
@@ -165,9 +167,9 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
     val third = reference(2, IntegerType)
     val fourth = reference(3, IntegerType)
     val shared = GpuAdd(left, right, failOnError = false)()
-    // [AST((left+right)&third) AS legacy, greatest(left+right, fourth) AS regular]
+    // [AST(legacyOnly(left+right, third)) AS legacy, greatest(left+right, fourth) AS regular]
     val expressions = Seq(
-      GpuProjectAstExpression.wrap(alias(GpuBitwiseAnd(shared, third), "legacy")),
+      GpuProjectAstExpression.wrap(alias(TestLegacyOnlyBinary(shared, third), "legacy")),
       alias(GpuGreatest(Seq(shared, fourth)), "regular"))
 
     val tiered = bindProject(
@@ -176,13 +178,13 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
     // The regular consumer materializes left+right anyway, so the legacy root reuses it.
     // after wave planning:
     // tier 0: [AST_JIT(left+right) AS t1]
-    // tier 1: [AST(t1&third) AS legacy, greatest(t1, fourth) AS regular]
+    // tier 1: [AST(legacyOnly(t1, third)) AS legacy, greatest(t1, fourth) AS regular]
     val jitExpressionTiers = tiered.exprTiers.map(collectExpressions[GpuAstJitExpression])
     assertResult(Seq(1, 0))(jitExpressionTiers.map(_.size))
     assert(jitExpressionTiers.head.head.child.isInstanceOf[GpuAdd])
     val legacyTiers = tiered.exprTiers.map(collectExpressions[GpuProjectAstExpression])
     assertResult(Seq(0, 1))(legacyTiers.map(_.size))
-    assertResult(1)(collectExpressions[GpuBitwiseAnd](tiered.exprTiers.last).size)
+    assertResult(1)(collectExpressions[TestLegacyOnlyBinary](tiered.exprTiers.last).size)
     assert(collectExpressions[GpuAdd](tiered.exprTiers.last).isEmpty)
     val waveExprId = tiered.exprTiers.head.collectFirst {
       case alias: GpuAlias if GpuAstJitExpression.extractTopLevel(alias).isDefined => alias.exprId
@@ -1093,6 +1095,170 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
         withResource(out) { cb =>
           assertResult(longs(6L, null, 40L))(
             collectLongs(cb.column(0).asInstanceOf[GpuColumnVector].getBase))
+        }
+      }
+    }
+  }
+
+  private def collectStrings(cv: ColumnVector): Seq[Option[String]] = {
+    withResource(cv.copyToHost()) { host =>
+      (0L until host.getRowCount).map { i =>
+        if (host.isNull(i)) None else Some(host.getJavaString(i))
+      }
+    }
+  }
+
+  private def collectBools(cv: ColumnVector): Seq[Option[Boolean]] = {
+    withResource(cv.copyToHost()) { host =>
+      (0L until host.getRowCount).map { i =>
+        if (host.isNull(i)) None else Some(host.getBoolean(i))
+      }
+    }
+  }
+
+  test("AST JIT bitwise and shift ops match regular GPU path on negative and out-of-range shifts") {
+    withResource(gpuTable(
+        ColumnVector.fromBoxedInts(0, -1, Int.MinValue, Int.MaxValue, 42, null),
+        ColumnVector.fromBoxedInts(0, 1, 31, 32, -1, 5))) { input =>
+      val l = boundRef(0, IntegerType)
+      val r = boundRef(1, IntegerType)
+      val exprs = Seq(
+        GpuBitwiseAnd(l, r),
+        GpuBitwiseOr(l, r),
+        GpuBitwiseXor(l, r),
+        GpuBitwiseNot(l),
+        GpuShiftLeft(l, r),
+        GpuShiftRight(l, r),
+        GpuShiftRightUnsigned(l, r))
+      val jit = jitOnly(exprs, input)
+      withResource(GpuColumnVector.from(input, Array[DataType](IntegerType, IntegerType))) { b =>
+        exprs.zip(jit).foreach { case (e, jitVals) =>
+          val reg = withResource(e.columnarEval(b))(c => collectLongs(c.getBase))
+          assertResult(reg, e)(jitVals)
+        }
+      }
+    }
+
+    withResource(gpuTable(
+        ColumnVector.fromBoxedLongs(0L, -1L, Long.MinValue, Long.MaxValue, null),
+        ColumnVector.fromBoxedInts(0, 1, 63, 64, -1))) { input =>
+      val l = boundRef(0, LongType)
+      val r = boundRef(1, IntegerType)
+      val exprs = Seq(
+        GpuShiftLeft(l, r),
+        GpuShiftRight(l, r),
+        GpuShiftRightUnsigned(l, r))
+      val jit = jitOnly(exprs, input)
+      withResource(GpuColumnVector.from(input, Array[DataType](LongType, IntegerType))) { b =>
+        exprs.zip(jit).foreach { case (e, jitVals) =>
+          val reg = withResource(e.columnarEval(b))(c => collectLongs(c.getBase))
+          assertResult(reg, e)(jitVals)
+        }
+      }
+    }
+  }
+
+  test("AST JIT logical AND, OR, NOT match Spark 3-valued Kleene null logic") {
+    val T = java.lang.Boolean.TRUE
+    val F = java.lang.Boolean.FALSE
+    val N: java.lang.Boolean = null
+    withResource(gpuTable(
+        ColumnVector.fromBoxedBooleans(T, T, T, F, F, F, N, N, N),
+        ColumnVector.fromBoxedBooleans(T, F, N, T, F, N, T, F, N))) { input =>
+      val l = boundRef(0, BooleanType)
+      val r = boundRef(1, BooleanType)
+      val exprs: Seq[GpuExpression] = Seq(GpuAnd(l, r), GpuOr(l, r), GpuNot(l))
+      val jits = exprs.map(e => GpuAstJitExpression(e))
+      withResource(GpuColumnVector.from(input, Array[DataType](BooleanType, BooleanType))) { b =>
+        TestUtils.withMockTaskContext() {
+          withResource(GpuAstJitExpression.computeColumns(jits, input)) { out =>
+            exprs.zipWithIndex.foreach { case (e, idx) =>
+              val reg = withResource(e.columnarEval(b))(c => collectBools(c.getBase))
+              val got = collectBools(out.column(idx).asInstanceOf[GpuColumnVector].getBase)
+              assertResult(reg, e)(got)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("AST JIT IS NULL, IS NOT NULL, and COALESCE work across int, string, and decimal") {
+    // String columns + null/non-null string literals + mixed non-null/nullable columns
+    withResource(gpuTable(
+        ColumnVector.fromStrings(null, "a", null, ""),
+        ColumnVector.fromStrings("x", "y", null, "z"))) { input =>
+      val s0 = boundRef(0, StringType)
+      val s1 = boundRef(1, StringType)
+      val exprs: Seq[GpuExpression] = Seq(
+        GpuIsNull(s0),
+        GpuIsNotNull(s0),
+        GpuCoalesce(Seq(s0, s1, GpuLiteral(UTF8String.fromString("fallback"), StringType))),
+        GpuCoalesce(Seq(s0, GpuLiteral(null, StringType), s1)))
+      assert(exprs.forall(GpuAstJitExpression.canUseAstJit))
+      val jits = exprs.map(e => GpuAstJitExpression(e))
+      withResource(GpuColumnVector.from(input, Array[DataType](StringType, StringType))) { b =>
+        TestUtils.withMockTaskContext() {
+          withResource(GpuAstJitExpression.computeColumns(jits, input)) { out =>
+            assertResult(Seq(Some(true), Some(false), Some(true), Some(false)))(
+              collectBools(out.column(0).asInstanceOf[GpuColumnVector].getBase))
+            assertResult(Seq(Some(false), Some(true), Some(false), Some(true)))(
+              collectBools(out.column(1).asInstanceOf[GpuColumnVector].getBase))
+            assertResult(Seq(Some("x"), Some("a"), Some("fallback"), Some("")))(
+              collectStrings(out.column(2).asInstanceOf[GpuColumnVector].getBase))
+            assertResult(Seq(Some("x"), Some("a"), None, Some("")))(
+              collectStrings(out.column(3).asInstanceOf[GpuColumnVector].getBase))
+          }
+        }
+      }
+    }
+
+    // Mixed non-null + nullable column coalesce (tests cuDF optional vs non-optional lowering)
+    withResource(gpuTable(
+        ColumnVector.fromBoxedInts(null, 2, null, 4),
+        ColumnVector.fromInts(10, 20, 30, 40))) { input =>
+      val c0 = boundRef(0, IntegerType)
+      val c1 = GpuBoundReference(1, IntegerType, nullable = false)(
+        reference(1, IntegerType).exprId, "c1")
+      val exprs = Seq(
+        GpuCoalesce(Seq(c0, c1)),
+        GpuCoalesce(Seq(c1, c0)),
+        GpuCoalesce(Seq(c0, GpuLiteral(99, IntegerType))))
+      assertResult(Seq(
+        longs(10L, 2L, 30L, 4L),
+        longs(10L, 20L, 30L, 40L),
+        longs(99L, 2L, 99L, 4L)))(jitOnly(exprs, input))
+    }
+
+    // Decimal32 + Decimal128 IS NULL / COALESCE
+    val dec32 = DecimalType(9, 2)
+    val dec128 = DecimalType(25, 2)
+    withResource(gpuTable(
+        ColumnVector.decimalFromBoxedInts(-2, null, 123, null),
+        withResource(ColumnVector.decimalFromBoxedLongs(-2, 500L, null, 999L)) { c =>
+          c.castTo(DType.create(DType.DTypeEnum.DECIMAL128, -2))
+        })) { input =>
+      val d0 = boundRef(0, dec32)
+      val d1 = boundRef(1, dec128)
+      val exprs: Seq[GpuExpression] = Seq(
+        GpuIsNull(d0),
+        GpuIsNotNull(d1),
+        GpuCoalesce(Seq(d0, GpuLiteral(Decimal(777, 9, 2), dec32))),
+        GpuCoalesce(Seq(d1, GpuLiteral(Decimal(888, 25, 2), dec128))))
+      val jits = exprs.map(e => GpuAstJitExpression(e))
+      TestUtils.withMockTaskContext() {
+        withResource(GpuAstJitExpression.computeColumns(jits, input)) { out =>
+          assertResult(Seq(Some(true), Some(false), Some(true)))(
+            collectBools(out.column(0).asInstanceOf[GpuColumnVector].getBase))
+          assertResult(Seq(Some(true), Some(false), Some(true)))(
+            collectBools(out.column(1).asInstanceOf[GpuColumnVector].getBase))
+          withResource(out.column(2).asInstanceOf[GpuColumnVector].getBase.copyToHost()) { h =>
+            assertResult(Seq(777, 123, 777))((0 until 3).map(i => h.getInt(i.toLong)))
+          }
+          withResource(out.column(3).asInstanceOf[GpuColumnVector].getBase.copyToHost()) { h =>
+            assertResult(Seq(500L, 888L, 999L))(
+              (0 until 3).map(i => h.getBigDecimal(i.toLong).unscaledValue().longValue()))
+          }
         }
       }
     }

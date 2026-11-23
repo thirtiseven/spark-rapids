@@ -473,8 +473,9 @@ class GpuProjectAstPlannerSuite extends AnyFunSuite {
         val branch = convert(Add(a, b), sqlConf)
         val expression = GpuAlias(GpuIf(GpuLiteral(false), branch, GpuLiteral(1L)), "result")()
         val tiers = bind(Seq(expression), sqlConf).exprTiers
-        // ANSI addition can overflow for a row that IF does not select.
-        assertResult(if (ansi) 1 else 2)(tiers.size)
+        // Non-ANSI IF fuses into one AST JIT tier; ANSI addition can overflow for a skipped row,
+        // so both IF and the addition stay on the regular GPU path in one tier.
+        assertResult(1)(tiers.size)
         assertResult(if (ansi) 0 else 1)(
           collectExpressions[GpuAstJitExpression](tiers.flatten).size)
         assertResult(1)(collectExpressions[GpuAdd](tiers.flatten).size)

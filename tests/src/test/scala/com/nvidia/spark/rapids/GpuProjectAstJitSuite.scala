@@ -1367,4 +1367,77 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
         GpuEqualTo(l, r), GpuEqualNullSafe(l, r), GpuLessThan(l, r), GpuGreaterThanOrEqual(l, r)))
     }
   }
+
+  test("AST JIT If and CaseWhen handle null predicates, missing else, strings, and decimals") {
+    // Side-effecting branches (ANSI overflow) must remain excluded from AST JIT.
+    val ansiAdd = GpuAdd(boundRef(0, IntegerType), boundRef(1, IntegerType), failOnError = true)()
+    assert(!GpuAstJitExpression.canUseAstJit(
+      GpuIf(GpuGreaterThan(boundRef(0, IntegerType), GpuLiteral(0, IntegerType)),
+        ansiAdd, GpuLiteral(0, IntegerType))))
+    assert(!GpuAstJitExpression.canUseAstJit(
+      GpuCaseWhen(Seq((GpuGreaterThan(boundRef(0, IntegerType), GpuLiteral(0, IntegerType)),
+        ansiAdd)), Some(GpuLiteral(0, IntegerType)))))
+
+    // Integer If + multi-branch CaseWhen (with and without explicit ELSE) + null predicates
+    withResource(gpuTable(
+        ColumnVector.fromBoxedInts(-1, 0, 1, 2, 5, null),
+        ColumnVector.fromBoxedInts(10, 20, 30, null, 50, 60))) { input =>
+      val x = boundRef(0, IntegerType)
+      val y = boundRef(1, IntegerType)
+      val ifExpr = GpuIf(
+        GpuGreaterThan(x, GpuLiteral(0, IntegerType)),
+        GpuAdd(x, y, failOnError = false)(),
+        GpuSubtract(y, GpuLiteral(1, IntegerType), failOnError = false)())
+      val caseWithElse = GpuCaseWhen(Seq(
+        (GpuEqualTo(x, GpuLiteral(0, IntegerType)), GpuLiteral(100, IntegerType)),
+        (GpuEqualTo(x, GpuLiteral(1, IntegerType)), y),
+        (GpuGreaterThan(x, GpuLiteral(1, IntegerType)), GpuMultiply(x, GpuLiteral(2, IntegerType),
+          failOnError = false)())),
+        Some(GpuLiteral(-99, IntegerType)))
+      val caseNoElse = GpuCaseWhen(Seq(
+        (GpuEqualTo(x, GpuLiteral(1, IntegerType)), GpuLiteral(11, IntegerType)),
+        (GpuEqualTo(x, GpuLiteral(5, IntegerType)), y)),
+        None)
+      val exprs: Seq[GpuExpression] = Seq(ifExpr, caseWithElse, caseNoElse)
+      assert(exprs.forall(GpuAstJitExpression.canUseAstJit))
+      val jit = jitOnly(exprs, input)
+      withResource(GpuColumnVector.from(input, Array[DataType](IntegerType, IntegerType))) { b =>
+        exprs.zip(jit).foreach { case (e, jitVals) =>
+          val reg = withResource(e.columnarEval(b))(c => collectLongs(c.getBase))
+          assertResult(reg, e)(jitVals)
+        }
+      }
+    }
+
+    // String output CaseWhen (like TPC-DS q2 / q59 day-name bucketing) + String IF with null else
+    withResource(gpuTable(
+        ColumnVector.fromStrings("Sunday", "Monday", "Friday", null, "Other"),
+        ColumnVector.fromStrings("s0", "s1", null, "s3", "s4"))) { input =>
+      val day = boundRef(0, StringType)
+      val s = boundRef(1, StringType)
+      val strCase = GpuCaseWhen(Seq(
+        (GpuEqualTo(day, GpuLiteral(UTF8String.fromString("Sunday"), StringType)),
+          GpuLiteral(UTF8String.fromString("SUN"), StringType)),
+        (GpuEqualTo(day, GpuLiteral(UTF8String.fromString("Monday"), StringType)), s),
+        (GpuEqualTo(day, GpuLiteral(UTF8String.fromString("Friday"), StringType)),
+          GpuLiteral(UTF8String.fromString("FRI"), StringType))),
+        None)
+      val strIf = GpuIf(
+        GpuIsNotNull(day), day, GpuLiteral(UTF8String.fromString("MISSING"), StringType))
+      val exprs: Seq[GpuExpression] = Seq(strCase, strIf)
+      assert(exprs.forall(GpuAstJitExpression.canUseAstJit))
+      val jits = exprs.map(e => GpuAstJitExpression(e))
+      withResource(GpuColumnVector.from(input, Array[DataType](StringType, StringType))) { b =>
+        TestUtils.withMockTaskContext() {
+          withResource(GpuAstJitExpression.computeColumns(jits, input)) { out =>
+            exprs.zipWithIndex.foreach { case (e, idx) =>
+              val reg = withResource(e.columnarEval(b))(c => collectStrings(c.getBase))
+              val got = collectStrings(out.column(idx).asInstanceOf[GpuColumnVector].getBase)
+              assertResult(reg, e)(got)
+            }
+          }
+        }
+      }
+    }
+  }
 }

@@ -115,15 +115,17 @@ object GpuBroadcastHashJoinExecBase {
   /**
    * Binds a build-side projection that the executor's hash-build cache keeps for rebuilds, which
    * can run in a later task. It has no metrics, since it can outlive the task that creates it.
-   * It also leaves both Project AST backends disabled, which drops the wrappers in the Project
-   * list, because Project AST evaluators release their native state when the task that compiled
-   * them completes, even if another task is still evaluating.
+   * AST and AST JIT wrappers are retained and evaluated with invocation-scoped evaluators via
+   * `GpuTieredProject.withScopedAstEvaluators`.
    */
   private[execution] def bindCachedBuildSideProjection(
       projectList: Seq[NamedExpression],
       input: Seq[Attribute],
       conf: SQLConf): GpuTieredProject =
-    GpuBindReferences.bindGpuReferencesTieredNoMetrics(projectList, input, conf)
+    GpuBindReferences.bindGpuReferencesTieredNoMetrics(
+      projectList, input, conf,
+      enableAst = RapidsConf.ENABLE_PROJECT_AST.get(conf),
+      enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf))
 }
 
 abstract class GpuBroadcastHashJoinExecBase(
@@ -203,14 +205,22 @@ abstract class GpuBroadcastHashJoinExecBase(
   @transient private lazy val buildSidePostProjects = splitBroadcastPlan(buildPlan)._2.reverse
 
   private def makeBuildSidePostProjection(
-      bindProject: GpuProjectExec => GpuTieredProject):
+      bindProject: GpuProjectExec => GpuTieredProject,
+      scopedAst: Boolean = false):
       Option[ColumnarBatch => ColumnarBatch] = {
     if (buildSidePostProjects.nonEmpty) {
       val boundProjects = buildSidePostProjects.map(bindProject)
       Some((batch: ColumnarBatch) => boundProjects.foldLeft(batch) {
         case (currentBatch, boundProject) =>
-          boundProject.projectAndCloseWithRetrySingleBatch(
-            SpillableColumnarBatch(currentBatch, SpillPriorities.ACTIVE_ON_DECK_PRIORITY))
+          val spillable = SpillableColumnarBatch(
+            currentBatch, SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
+          if (scopedAst) {
+            boundProject.withScopedAstEvaluators { scoped =>
+              scoped.projectAndCloseWithRetrySingleBatch(spillable)
+            }
+          } else {
+            boundProject.projectAndCloseWithRetrySingleBatch(spillable)
+          }
       })
     } else {
       None
@@ -232,10 +242,10 @@ abstract class GpuBroadcastHashJoinExecBase(
   }
 
   private def cachedBuildSidePostProjection: Option[ColumnarBatch => ColumnarBatch] = {
-    makeBuildSidePostProjection { project =>
-      GpuBroadcastHashJoinExecBase.bindCachedBuildSideProjection(
-        project.projectList, project.child.output, conf)
-    }
+    makeBuildSidePostProjection(
+      project => GpuBroadcastHashJoinExecBase.bindCachedBuildSideProjection(
+        project.projectList, project.child.output, conf),
+      scopedAst = true)
   }
 
   protected def buildSidePostProjectionKey: Seq[Seq[Expression]] = {

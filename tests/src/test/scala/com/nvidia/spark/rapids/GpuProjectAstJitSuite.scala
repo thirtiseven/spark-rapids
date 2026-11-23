@@ -995,4 +995,22 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
       assertResult(Seq(longs(3L, null, -3L)))(jitOnly(Seq(wrapped), input))
     }
   }
+
+  test("AST JIT wraps bare non-aliased expressions for Filter, Agg, Expand, and Join keys") {
+    val left = reference(0, IntegerType)
+    val right = reference(1, IntegerType)
+    val bare = GpuMultiply(
+      GpuAdd(left, right, failOnError = false)(),
+      right,
+      failOnError = false)()
+
+    val conf = projectConf()
+    val bound = bindProject(Seq(bare), Seq(left, right), conf)
+    assert(collectExpressions[GpuAstJitExpression](bound.exprTiers.flatten).size == 1)
+
+    val wrappedKeys = GpuProjectAstPlanner.wrapOutputs(
+      Seq(GpuAdd(boundRef(0, IntegerType), boundRef(1, IntegerType), failOnError = false)()),
+      conf, enableAst = false, enableAstJit = true)
+    assert(wrappedKeys.head.isInstanceOf[GpuAstJitExpression])
+  }
 }

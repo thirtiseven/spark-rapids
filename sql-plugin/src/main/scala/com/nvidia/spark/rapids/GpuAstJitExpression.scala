@@ -107,6 +107,9 @@ object GpuAstJitExpression {
         case GpuAlias(child: GpuExpression, _) if
             !child.isInstanceOf[GpuProjectAstExpression] =>
           astJitChild(child).map(index -> _)
+        case child: GpuExpression if !child.isInstanceOf[GpuAlias] &&
+            !child.isInstanceOf[GpuProjectAstExpression] =>
+          astJitChild(child).map(index -> _)
         case _ => None
       }
     }
@@ -122,6 +125,8 @@ object GpuAstJitExpression {
       (expression, childrenByIndex.get(index), groupIds.get(index)) match {
         case (alias: GpuAlias, Some(child), Some(groupId)) =>
           GpuProjectAstExpressionBase.replaceChild(alias, GpuAstJitExpression(child, groupId))
+        case (_: GpuExpression, Some(child), Some(groupId)) =>
+          GpuAstJitExpression(child, groupId)
         case _ => expression
       }
     }
@@ -235,8 +240,13 @@ object GpuAstJitExpression {
   }
 }
 
-case class GpuAstJitExpression(child: GpuExpression, groupId: Int = 0)
+case class GpuAstJitExpression(
+    child: GpuExpression,
+    groupId: Int = 0,
+    closeOnTaskCompletion: Boolean = true)
     extends GpuProjectAstExpressionBase {
+
+  override protected def registerTaskCleanup: Boolean = closeOnTaskCompletion
 
   @transient private[this] var jitProgram: AstJitProgram = _
   @transient private[this] var jitProgramGroup: GpuAstJitExpression.JitProgramGroup = _
@@ -295,8 +305,14 @@ case class GpuAstJitExpression(child: GpuExpression, groupId: Int = 0)
       val compiledExpressions = group.expressions.map(_.getCompiledExpression).toArray
       programBuildAttempts += 1
       // A program build may hit the native kernel cache without invoking NVRTC.
-      val replacement = programBuildTime.ns {
-        withCompileMetrics { compileJitProgram(table, compiledExpressions) }
+      val replacement = try {
+        programBuildTime.ns {
+          withCompileMetrics { compileJitProgram(table, compiledExpressions) }
+        }
+      } finally {
+        if (!closeOnTaskCompletion) {
+          group.expressions.foreach(_.closeCompiledExpression())
+        }
       }
       val previous = jitProgram
       jitProgram = replacement

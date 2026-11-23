@@ -38,11 +38,21 @@ trait GpuProjectAstExpressionBase
   protected def compileNvtxId: NvtxId
   protected def computeNvtxId: NvtxId
   protected def compileAst(ast: AstExpression): CompiledExpression = ast.compile()
+  protected def registerTaskCleanup: Boolean = true
 
   @transient private[this] var compiledExpression: CompiledExpression = _
   private[this] var opTime: GpuMetric = NoopMetric
 
   protected def releaseAdditionalResources(): Seq[AutoCloseable] = Seq.empty
+
+  private[rapids] final def closeCompiledExpression(): Unit = {
+    val current = synchronized {
+      val c = compiledExpression
+      compiledExpression = null
+      c
+    }
+    Option(current).foreach(_.safeClose())
+  }
 
   override final def dataType: DataType = child.dataType
 
@@ -90,16 +100,18 @@ trait GpuProjectAstExpressionBase
         compileAst(child.convertToAst(Int.MaxValue))
       }
       closeOnExcept(compiled) { _ =>
-        var completed = false
-        Option(TaskContext.get()).foreach { taskContext =>
-          onTaskCompletion(taskContext) {
-            completed = true
-            close()
+        if (registerTaskCleanup) {
+          var completed = false
+          Option(TaskContext.get()).foreach { taskContext =>
+            onTaskCompletion(taskContext) {
+              completed = true
+              close()
+            }
           }
-        }
-        if (completed) {
-          throw new IllegalStateException(
-            "Task completed while registering compiled expression cleanup callback")
+          if (completed) {
+            throw new IllegalStateException(
+              "Task completed while registering compiled expression cleanup callback")
+          }
         }
         compiledExpression = compiled
       }
@@ -160,8 +172,12 @@ object GpuProjectAstExpression {
   }
 }
 
-case class GpuProjectAstExpression(child: GpuExpression)
+case class GpuProjectAstExpression(
+    child: GpuExpression,
+    closeOnTaskCompletion: Boolean = true)
     extends GpuProjectAstExpressionBase {
+
+  override protected def registerTaskCleanup: Boolean = closeOnTaskCompletion
 
   override protected def compileNvtxId: NvtxId = NvtxRegistry.COMPILE_ASTS
 

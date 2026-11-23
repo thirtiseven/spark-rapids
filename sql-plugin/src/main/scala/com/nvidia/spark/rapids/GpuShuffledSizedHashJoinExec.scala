@@ -38,6 +38,7 @@ import org.apache.spark.sql.catalyst.plans.physical.{Distribution, Partitioning,
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.adaptive.ShuffleQueryStageExec
 import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.{GpuHashExpression, GpuMurmur3Hash}
 import org.apache.spark.sql.rapids.execution._
 import org.apache.spark.sql.types.DataType
@@ -127,8 +128,22 @@ object GpuShuffledSizedHashJoinExec {
         metrics: Map[String, GpuMetric]): BoundJoinExprs = {
       val leftTypes = leftOutput.map(_.dataType).toArray
       val rightTypes = rightOutput.map(_.dataType).toArray
-      val boundLeftKeys = GpuBindReferences.bindGpuReferences(leftKeys, leftOutput, metrics)
-      val boundRightKeys = GpuBindReferences.bindGpuReferences(rightKeys, rightOutput, metrics)
+      val sqlConf = SQLConf.get
+      val enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(sqlConf)
+      def bindKeys(keys: Seq[Expression], output: Seq[Attribute]): Seq[GpuExpression] = {
+        val bound = GpuBindReferences.bindGpuReferences(keys, output, metrics)
+        if (enableAstJit) {
+          val wrapped = GpuProjectAstPlanner.wrapOutputs(
+            bound, sqlConf, enableAst = false, enableAstJit = true)
+              .map(_.asInstanceOf[GpuExpression])
+          GpuMetric.injectMetrics(wrapped, metrics)
+          wrapped
+        } else {
+          bound
+        }
+      }
+      val boundLeftKeys = bindKeys(leftKeys, leftOutput)
+      val boundRightKeys = bindKeys(rightKeys, rightOutput)
       
       val (boundBuildKeys, buildTypes, buildOutput, boundStreamKeys, streamTypes, streamOutput) =
         buildSide match {

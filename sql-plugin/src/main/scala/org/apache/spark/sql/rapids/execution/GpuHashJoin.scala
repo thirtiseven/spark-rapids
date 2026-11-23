@@ -2765,12 +2765,28 @@ trait GpuHashJoin extends GpuJoinExec {
     GpuHashJoin.compareNullsEqual(joinType, buildKeys)
 
   protected lazy val (boundBuildKeys, boundStreamKeys) = {
-    val lkeys = GpuBindReferences.bindGpuReferences(leftKeys, left.output, allMetrics)
-    val rkeys = GpuBindReferences.bindGpuReferences(rightKeys, right.output, allMetrics)
+    val enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf)
+    val lkeys = bindJoinKeys(leftKeys, left.output, enableAstJit)
+    val rkeys = bindJoinKeys(rightKeys, right.output, enableAstJit)
 
     buildSide match {
       case GpuBuildLeft => (lkeys, rkeys)
       case GpuBuildRight => (rkeys, lkeys)
+    }
+  }
+
+  private def bindJoinKeys(
+      keys: Seq[Expression],
+      input: Seq[Attribute],
+      enableAstJit: Boolean): Seq[GpuExpression] = {
+    val bound = GpuBindReferences.bindGpuReferences(keys, input, allMetrics)
+    if (enableAstJit) {
+      val wrapped = GpuProjectAstPlanner.wrapOutputs(
+        bound, conf, enableAst = false, enableAstJit = true).map(_.asInstanceOf[GpuExpression])
+      GpuMetric.injectMetrics(wrapped, allMetrics)
+      wrapped
+    } else {
+      bound
     }
   }
 

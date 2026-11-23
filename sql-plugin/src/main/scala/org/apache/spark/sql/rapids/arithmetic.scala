@@ -1159,6 +1159,26 @@ abstract class GpuIntegralDivideParent(
   override def binaryOp: BinaryOp = BinaryOp.DIV
 
   override def sqlOperator: String = "div"
+
+  override def selfSupportsAstJit: Boolean =
+    !failOnError && !checkDivideOverflow &&
+      left.dataType == LongType && right.dataType == LongType
+
+  override def convertToAst(numFirstTableColumns: Int): ast.AstExpression = {
+    val lhs = left.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns)
+    val rhs = right.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns)
+    val safeDiv = new ast.JitOperation(
+      ast.JitOperator.DIV_OVERFLOW, ast.JitErrorPolicy.NULLIFY, lhs, rhs)
+    val isMinDivNegOne = new ast.BinaryOperation(
+      ast.BinaryOperator.NULL_LOGICAL_AND,
+      new ast.BinaryOperation(ast.BinaryOperator.EQUAL, lhs, ast.Literal.ofLong(Long.MinValue)),
+      new ast.BinaryOperation(ast.BinaryOperator.EQUAL, rhs, ast.Literal.ofLong(-1L)))
+    new ast.JitOperation(
+      ast.JitOperator.IF_ELSE,
+      ast.Literal.ofLong(Long.MinValue),
+      safeDiv,
+      isMinDivNegOne)
+  }
 }
 
 abstract class GpuRemainderBase(left: Expression, right: Expression)
@@ -1168,6 +1188,17 @@ abstract class GpuRemainderBase(left: Expression, right: Expression)
   override def symbol: String = "%"
 
   override def binaryOp: BinaryOp = BinaryOp.MOD
+
+  override def selfSupportsAstJit: Boolean =
+    !failOnError && left.dataType == right.dataType && dataType.isInstanceOf[IntegralType]
+
+  override def convertToAst(numFirstTableColumns: Int): ast.AstExpression = {
+    new ast.JitOperation(
+      ast.JitOperator.MOD_OVERFLOW,
+      ast.JitErrorPolicy.NULLIFY,
+      left.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns),
+      right.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns))
+  }
 }
 
 abstract class GpuPmodBase(left: Expression, right: Expression)

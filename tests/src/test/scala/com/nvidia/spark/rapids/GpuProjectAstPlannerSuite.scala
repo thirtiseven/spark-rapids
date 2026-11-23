@@ -23,7 +23,7 @@ import org.apache.spark.SparkConf
 import org.apache.spark.serializer.JavaSerializer
 import org.apache.spark.sql.catalyst.expressions.{Abs, Add, Alias, And, AttributeReference,
   BitwiseXor, BoundReference, EqualTo, Expression, GreaterThan, GreaterThanOrEqual, Greatest,
-  LessThan, Literal, Multiply, Or, StringInstr, Subtract}
+  LessThan, Literal, Multiply, Or, Pmod, StringInstr, Subtract}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.{GpuAdd, GpuAnd, GpuContains, GpuEqualTo,
   GpuGreatest, GpuMultiply, GpuOr, GpuSubtract}
@@ -181,7 +181,7 @@ class GpuProjectAstPlannerSuite extends AnyFunSuite {
         Literal(java.sql.Timestamp.valueOf("2020-01-01 00:00:00")),
         // Operators without an AST form.
         GreaterThan(StringInstr(str, Literal("b")), Literal(0)), Greatest(Seq(a, b)),
-        Remainder(a, b), Literal(Decimal(1), DecimalType(10, 0)))
+        Pmod(a, b), Literal(Decimal(1), DecimalType(10, 0)))
       // The probe the planner used before this capability existed; tests keep the two in sync.
       def convertsWithBoundChildren(expression: GpuExpression): Boolean = {
         val references = expression.children.zipWithIndex.map { case (child, ordinal) =>

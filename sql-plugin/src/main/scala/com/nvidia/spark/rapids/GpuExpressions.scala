@@ -440,12 +440,12 @@ trait CudfBinaryExpression extends GpuBinaryExpression {
   def castOutputAtEnd: Boolean = false
   def astOperator: Option[ast.BinaryOperator] = None
 
-  override final def selfSupportsAstJit: Boolean = astOperator.isDefined && astJitCompatible
+  override def selfSupportsAstJit: Boolean = astOperator.isDefined && astJitCompatible
 
   /** Whether this operator's execution modes and types work with AST JIT. */
   protected def astJitCompatible: Boolean = false
 
-  override final def selfIsAstJitOperator: Boolean = selfSupportsAstJit
+  override def selfIsAstJitOperator: Boolean = selfSupportsAstJit
 
   def outputType(l: BinaryOperable, r: BinaryOperable): DType = {
     val over = outputTypeOverride

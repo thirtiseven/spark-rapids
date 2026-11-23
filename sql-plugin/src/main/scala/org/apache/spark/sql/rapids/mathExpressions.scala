@@ -45,6 +45,7 @@ abstract class GpuUnaryMathExpression(name: String) extends GpuUnaryExpression
 case class GpuAcos(child: Expression) extends CudfUnaryMathExpression("ACOS") {
   override def unaryOp: UnaryOp = UnaryOp.ARCCOS
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuToDegrees(child: Expression) extends GpuUnaryMathExpression("DEGREES") {
@@ -110,6 +111,7 @@ case class GpuUnhex(child: Expression) extends GpuUnaryExpression with Serializa
 
 case class GpuAcoshImproved(child: Expression) extends CudfUnaryMathExpression("ACOSH") {
   override def unaryOp: UnaryOp = UnaryOp.ARCCOSH
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuAcoshCompat(child: Expression) extends GpuUnaryMathExpression("ACOSH") {
@@ -156,10 +158,12 @@ case class GpuAcoshCompat(child: Expression) extends GpuUnaryMathExpression("ACO
 case class GpuAsin(child: Expression) extends CudfUnaryMathExpression("ASIN") {
   override def unaryOp: UnaryOp = UnaryOp.ARCSIN
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuAsinhImproved(child: Expression) extends CudfUnaryMathExpression("ASINH") {
   override def unaryOp: UnaryOp = UnaryOp.ARCSINH
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuAsinhCompat(child: Expression) extends GpuUnaryMathExpression("ASINH") {
@@ -203,11 +207,13 @@ case class GpuAsinhCompat(child: Expression) extends GpuUnaryMathExpression("ASI
 case class GpuAtan(child: Expression) extends CudfUnaryMathExpression("ATAN") {
   override def unaryOp: UnaryOp = UnaryOp.ARCTAN
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuAtanh(child: Expression) extends CudfUnaryMathExpression("ATANH") {
   override def unaryOp: UnaryOp = UnaryOp.ARCTANH
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 object GpuFloorCeil {
@@ -269,11 +275,13 @@ case class GpuCeil(child: Expression, outputType: DataType)
 case class GpuCos(child: Expression) extends CudfUnaryMathExpression("COS") {
   override def unaryOp: UnaryOp = UnaryOp.COS
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuExp(child: Expression) extends CudfUnaryMathExpression("EXP") {
   override def unaryOp: UnaryOp = UnaryOp.EXP
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuExpm1(child: Expression) extends CudfUnaryMathExpression("EXPM1") {
@@ -425,6 +433,7 @@ case class GpuLogarithm(left: Expression, right: Expression)
 case class GpuSin(child: Expression) extends CudfUnaryMathExpression("SIN") {
   override def unaryOp: UnaryOp = UnaryOp.SIN
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuSignum(child: Expression) extends GpuUnaryMathExpression("SIGNUM") {
@@ -445,31 +454,37 @@ case class GpuSignum(child: Expression) extends GpuUnaryMathExpression("SIGNUM")
 case class GpuTanh(child: Expression) extends CudfUnaryMathExpression("TANH") {
   override def unaryOp: UnaryOp = UnaryOp.TANH
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuCosh(child: Expression) extends CudfUnaryMathExpression("COSH") {
   override def unaryOp: UnaryOp = UnaryOp.COSH
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuSinh(child: Expression) extends CudfUnaryMathExpression("SINH") {
   override def unaryOp: UnaryOp = UnaryOp.SINH
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuSqrt(child: Expression) extends CudfUnaryMathExpression("SQRT") {
   override def unaryOp: UnaryOp = UnaryOp.SQRT
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuCbrt(child: Expression) extends CudfUnaryMathExpression("CBRT") {
   override def unaryOp: UnaryOp = UnaryOp.CBRT
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuTan(child: Expression) extends CudfUnaryMathExpression("TAN") {
   override def unaryOp: UnaryOp = UnaryOp.TAN
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 case class GpuCot(child: Expression) extends GpuUnaryMathExpression("COT") {
@@ -876,11 +891,14 @@ case class GpuPow(left: Expression, right: Expression)
   override def binaryOp: BinaryOp = BinaryOp.POW
   override def astOperator: Option[BinaryOperator] = Some(ast.BinaryOperator.POW)
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean =
+    left.dataType == DoubleType && right.dataType == DoubleType
 }
 
 case class GpuRint(child: Expression) extends CudfUnaryMathExpression("ROUND") {
   override def unaryOp: UnaryOp = UnaryOp.RINT
   override def outputTypeOverride: DType = DType.FLOAT64
+  override protected def astJitCompatible: Boolean = child.dataType == DoubleType
 }
 
 object RoundingErrorUtil {

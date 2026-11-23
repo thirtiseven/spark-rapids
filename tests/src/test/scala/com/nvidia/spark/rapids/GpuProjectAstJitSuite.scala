@@ -28,11 +28,13 @@ import org.apache.spark.TaskContext
 import org.apache.spark.sql.catalyst.expressions.{Abs, Attribute, AttributeReference, BoundReference,
   Expression, NamedExpression}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.rapids.{GpuAbs, GpuAdd, GpuAnd, GpuBitwiseAnd, GpuBitwiseNot,
-  GpuBitwiseOr, GpuBitwiseXor, GpuEqualNullSafe, GpuEqualTo, GpuGreaterThan,
-  GpuGreaterThanOrEqual, GpuGreatest, GpuLessThan, GpuLessThanOrEqual, GpuMultiply, GpuNot,
-  GpuOr, GpuShiftLeft, GpuShiftRight, GpuShiftRightUnsigned, GpuSubtract, GpuUnaryMinus,
-  GpuUnaryPositive}
+import org.apache.spark.sql.rapids.{GpuAbs, GpuAcos, GpuAcoshImproved, GpuAdd, GpuAnd, GpuAsin,
+  GpuAsinhImproved, GpuAtan, GpuAtanh, GpuBitwiseAnd, GpuBitwiseNot, GpuBitwiseOr,
+  GpuBitwiseXor, GpuCbrt, GpuCos, GpuCosh, GpuEqualNullSafe, GpuEqualTo, GpuExp,
+  GpuGreaterThan, GpuGreaterThanOrEqual, GpuGreatest, GpuIntegralDivide, GpuLessThan,
+  GpuLessThanOrEqual, GpuMultiply, GpuNot, GpuOr, GpuPow, GpuRemainder, GpuRint, GpuShiftLeft,
+  GpuShiftRight, GpuShiftRightUnsigned, GpuSin, GpuSinh, GpuSqrt, GpuSubtract, GpuTan, GpuTanh,
+  GpuUnaryMinus, GpuUnaryPositive}
 import org.apache.spark.sql.rapids.metrics.source.MockTaskContext
 import org.apache.spark.sql.types.{ArrayType, BinaryType, BooleanType, ByteType, DataType, DateType,
   Decimal, DecimalType, DoubleType, FloatType, IntegerType, LongType, ShortType, StringType,
@@ -534,18 +536,20 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
     }
   }
 
-  test("project AST JIT inlines integral widening casts but does not compile one alone") {
+  test("project AST JIT inlines supported casts but excludes standalone and ANSI narrowing casts") {
     val narrow = reference(0, IntegerType)
     val wide = reference(1, LongType)
     val widened = GpuCast(narrow, LongType)()
-    val narrowed = GpuCast(wide, IntegerType)()
+    val narrowed = GpuCast(wide, IntegerType, ansiMode = false)()
+    val ansiNarrowed = GpuCast(wide, IntegerType, ansiMode = true)()
     val expressions = Seq(
       alias(GpuAdd(widened, wide, failOnError = false)(), "widened_sum"),
       alias(widened, "widened"),
-      alias(GpuAdd(narrowed, narrow, failOnError = false)(), "narrowed_sum"))
+      alias(GpuAdd(narrowed, narrow, failOnError = false)(), "narrowed_sum"),
+      alias(GpuAdd(ansiNarrowed, narrow, failOnError = false)(), "ansi_narrowed_sum"))
 
     val wrapped = wrapOutputs(expressions)
-    assertResult(Seq(true, false, false))(
+    assertResult(Seq(true, false, true, false))(
       wrapped.map(GpuAstJitExpression.extractTopLevel(_).isDefined))
   }
 
@@ -1433,6 +1437,162 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
             exprs.zipWithIndex.foreach { case (e, idx) =>
               val reg = withResource(e.columnarEval(b))(c => collectStrings(c.getBase))
               val got = collectStrings(out.column(idx).asInstanceOf[GpuColumnVector].getBase)
+              assertResult(reg, e)(got)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private def collectDoubles(cv: ColumnVector): Seq[Option[Long]] = {
+    withResource(cv.copyToHost()) { host =>
+      (0L until host.getRowCount).map { i =>
+        if (host.isNull(i)) {
+          None
+        } else {
+          val v = host.getDouble(i)
+          // Canonicalize NaN bit patterns like Spark.
+          Some(if (v.isNaN) java.lang.Double.doubleToLongBits(Double.NaN)
+            else java.lang.Double.doubleToRawLongBits(v))
+        }
+      }
+    }
+  }
+
+  test("AST JIT casts inline narrowing, bool, float/double, and decimal casts accurately") {
+    // ANSI narrowing cast must remain excluded.
+    assert(!GpuCast(boundRef(0, LongType), IntegerType, ansiMode = true)().selfSupportsAstJit)
+    // Float -> Int cast must remain excluded.
+    assert(!GpuCast(boundRef(0, DoubleType), IntegerType, ansiMode = false)().selfSupportsAstJit)
+
+    // Non-ANSI narrowing + bool <-> int inside a JIT trigger expression
+    withResource(gpuTable(
+        ColumnVector.fromBoxedLongs(0L, 128L, -129L, Int.MaxValue.toLong + 1L, null),
+        ColumnVector.fromBoxedInts(1, 0, -5, 10, null))) { input =>
+      val l = boundRef(0, LongType)
+      val i = boundRef(1, IntegerType)
+      val narrowByte = GpuAdd(
+        GpuCast(l, ByteType, ansiMode = false)(), GpuLiteral(0.toByte, ByteType),
+        failOnError = false)()
+      val narrowInt = GpuAdd(
+        GpuCast(l, IntegerType, ansiMode = false)(), i, failOnError = false)()
+      val toBool = GpuNot(GpuCast(i, BooleanType, ansiMode = false)())
+      val fromBool = GpuAdd(
+        GpuCast(toBool, IntegerType, ansiMode = false)(), i, failOnError = false)()
+      assert(Seq(narrowByte, narrowInt, toBool, fromBool).forall(GpuAstJitExpression.canUseAstJit))
+      withResource(GpuColumnVector.from(input, Array[DataType](LongType, IntegerType))) { b =>
+        val intExprs = Seq(narrowByte, narrowInt, fromBool)
+        val jitInts = jitOnly(intExprs, input)
+        intExprs.zip(jitInts).foreach { case (e, got) =>
+          val reg = withResource(e.columnarEval(b))(c => collectLongs(c.getBase))
+          assertResult(reg, e)(got)
+        }
+        TestUtils.withMockTaskContext() {
+          withResource(GpuAstJitExpression.computeColumns(
+              Seq(GpuAstJitExpression(toBool)), input)) { out =>
+            val reg = withResource(toBool.columnarEval(b))(c => collectBools(c.getBase))
+            val got = collectBools(out.column(0).asInstanceOf[GpuColumnVector].getBase)
+            assertResult(reg)(got)
+          }
+        }
+      }
+    }
+
+    // Decimal -> Double and same-scale Decimal widening
+    val dec32 = DecimalType(9, 2)
+    val dec64 = DecimalType(18, 2)
+    val dec128 = DecimalType(25, 2)
+    withResource(gpuTable(
+        ColumnVector.decimalFromBoxedInts(-2, -12345, 0, 99999, null),
+        ColumnVector.fromBoxedInts(1, 2, 3, 4))) { input =>
+      val d0 = boundRef(0, dec32)
+      val toDouble = GpuSqrt(GpuCast(d0, DoubleType, ansiMode = false)())
+      val widen64 = GpuCoalesce(Seq(
+        GpuCast(d0, dec64, ansiMode = false)(), GpuLiteral(Decimal(100, 18, 2), dec64)))
+      val widen128 = GpuCoalesce(Seq(
+        GpuCast(d0, dec128, ansiMode = false)(), GpuLiteral(Decimal(100, 25, 2), dec128)))
+      assert(Seq(toDouble, widen64, widen128).forall(GpuAstJitExpression.canUseAstJit))
+      val jits = Seq(toDouble, widen64, widen128).map(e => GpuAstJitExpression(e))
+      withResource(GpuColumnVector.from(input, Array[DataType](dec32, IntegerType))) { b =>
+        TestUtils.withMockTaskContext() {
+          withResource(GpuAstJitExpression.computeColumns(jits, input)) { out =>
+            val regDbl = withResource(toDouble.columnarEval(b))(c => collectDoubles(c.getBase))
+            assertResult(regDbl)(
+              collectDoubles(out.column(0).asInstanceOf[GpuColumnVector].getBase))
+            withResource(out.column(1).asInstanceOf[GpuColumnVector].getBase.copyToHost()) { h =>
+              assertResult(Seq(-12345L, 0L, 99999L, 100L))(
+                (0 until 4).map(i => h.getLong(i.toLong)))
+            }
+            withResource(out.column(2).asInstanceOf[GpuColumnVector].getBase.copyToHost()) { h =>
+              assertResult(Seq(-12345L, 0L, 99999L, 100L))(
+                (0 until 4).map(i => h.getBigDecimal(i.toLong).unscaledValue().longValue()))
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("AST JIT non-ANSI integral remainder and integral divide handle zero, MIN/-1, non-null") {
+    // Nullable inputs
+    withResource(gpuTable(
+        ColumnVector.fromBoxedLongs(10L, -10L, Long.MinValue, 5L, null),
+        ColumnVector.fromBoxedLongs(3L, 3L, -1L, 0L, 2L))) { input =>
+      val l = boundRef(0, LongType)
+      val r = boundRef(1, LongType)
+      val exprs: Seq[GpuExpression] = Seq(
+        GpuRemainder(l, r, failOnError = false),
+        GpuIntegralDivide(l, r, failOnError = false)())
+      assert(exprs.forall(GpuAstJitExpression.canUseAstJit))
+      val jit = jitOnly(exprs, input)
+      withResource(GpuColumnVector.from(input, Array[DataType](LongType, LongType))) { b =>
+        exprs.zip(jit).foreach { case (e, got) =>
+          val reg = withResource(e.columnarEval(b))(c => collectLongs(c.getBase))
+          assertResult(reg, e)(got)
+        }
+      }
+    }
+
+    // Non-nullable inputs (no validity mask) — probes cuDF NULLIFY on non-nullable tables!
+    withResource(gpuTable(
+        ColumnVector.fromLongs(10L, -10L, Long.MinValue, 5L),
+        ColumnVector.fromLongs(3L, 3L, -1L, 0L))) { input =>
+      val l = GpuBoundReference(0, LongType, nullable = false)(reference(0, LongType).exprId, "l")
+      val r = GpuBoundReference(1, LongType, nullable = false)(reference(1, LongType).exprId, "r")
+      val exprs: Seq[GpuExpression] = Seq(
+        GpuRemainder(l, r, failOnError = false),
+        GpuIntegralDivide(l, r, failOnError = false)())
+      val jit = jitOnly(exprs, input)
+      withResource(GpuColumnVector.from(input, Array[DataType](LongType, LongType))) { b =>
+        exprs.zip(jit).foreach { case (e, got) =>
+          val reg = withResource(e.columnarEval(b))(c => collectLongs(c.getBase))
+          assertResult(reg, e)(got)
+        }
+      }
+    }
+  }
+
+  test("AST JIT math functions match regular GPU across special double values") {
+    withResource(gpuTable(
+        ColumnVector.fromBoxedDoubles(0.0, -0.0, 0.5, -0.5, 1.0, 2.0, -2.0,
+          Double.NaN, Double.PositiveInfinity, Double.NegativeInfinity, null),
+        ColumnVector.fromBoxedDoubles(2.0, 0.5, 3.0, 2.0, 0.0, -1.0, 2.0,
+          1.0, 2.0, 0.5, 1.0))) { input =>
+      val x = boundRef(0, DoubleType)
+      val y = boundRef(1, DoubleType)
+      val exprs: Seq[GpuExpression] = Seq(
+        GpuSqrt(x), GpuCbrt(x), GpuExp(x), GpuSin(x), GpuCos(x), GpuTan(x),
+        GpuSinh(x), GpuCosh(x), GpuTanh(x), GpuAsin(x), GpuAcos(x), GpuAtan(x),
+        GpuAtanh(x), GpuAcoshImproved(x), GpuAsinhImproved(x), GpuRint(x), GpuPow(x, y))
+      assert(exprs.forall(GpuAstJitExpression.canUseAstJit))
+      val jits = exprs.map(e => GpuAstJitExpression(e))
+      withResource(GpuColumnVector.from(input, Array[DataType](DoubleType, DoubleType))) { b =>
+        TestUtils.withMockTaskContext() {
+          withResource(GpuAstJitExpression.computeColumns(jits, input)) { out =>
+            exprs.zipWithIndex.foreach { case (e, idx) =>
+              val reg = withResource(e.columnarEval(b))(c => collectDoubles(c.getBase))
+              val got = collectDoubles(out.column(idx).asInstanceOf[GpuColumnVector].getBase)
               assertResult(reg, e)(got)
             }
           }

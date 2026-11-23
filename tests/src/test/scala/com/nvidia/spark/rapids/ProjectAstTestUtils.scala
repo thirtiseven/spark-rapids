@@ -18,9 +18,32 @@ package com.nvidia.spark.rapids
 
 import scala.reflect.ClassTag
 
+import ai.rapids.cudf.{ast, BinaryOp}
+
 import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.types.DataType
+
+/**
+ * Test-only GPU expression that supports interpreted AST but intentionally opts out of AST JIT,
+ * so cross-backend planner tests keep exercising legacy-vs-JIT arbitration as real operators gain
+ * JIT support.
+ */
+case class TestLegacyOnlyBinary(left: Expression, right: Expression)
+    extends CudfBinaryExpression {
+  override def dataType: DataType = left.dataType
+  override def binaryOp: BinaryOp = BinaryOp.ADD
+  override def astOperator: Option[ast.BinaryOperator] = Some(ast.BinaryOperator.ADD)
+  override def selfConvertsToAst: Boolean = true
+  override protected def astJitCompatible: Boolean = false
+}
 
 object ProjectAstTestUtils {
+  def legacyOnlyBinary(left: Expression, right: Expression): TestLegacyOnlyBinary = {
+    val expr = TestLegacyOnlyBinary(left, right)
+    GpuProjectAstPlanner.tagLegacySupport(expr, supported = true)
+    expr
+  }
+
   def collectExpressions[T <: Expression : ClassTag](
       expressions: Seq[Expression]): Seq[T] = {
     expressions.flatMap(_.collect {

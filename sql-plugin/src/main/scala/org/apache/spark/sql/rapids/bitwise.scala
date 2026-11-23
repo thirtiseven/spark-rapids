@@ -61,6 +61,26 @@ object ShiftHelper {
 trait GpuShiftBase extends GpuBinaryExpression with ImplicitCastInputTypes {
   def shiftOp: BinaryOp
 
+  protected def astJitShiftSupported: Boolean =
+    (left.dataType == IntegerType || left.dataType == LongType) && right.dataType == IntegerType
+
+  override def selfSupportsAstJit: Boolean = astJitShiftSupported
+
+  override def selfIsAstJitOperator: Boolean = selfSupportsAstJit
+
+  protected def maskedDistanceAst(numFirstTableColumns: Int): ast.AstExpression = {
+    val mask = if (left.dataType == IntegerType) 0x1F else 0x3F
+    val masked = new ast.BinaryOperation(
+      ast.BinaryOperator.BITWISE_AND,
+      right.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns),
+      ast.Literal.ofInt(mask))
+    if (left.dataType == LongType) {
+      new ast.JitOperation(ast.JitOperator.CAST_TO_INT64, masked)
+    } else {
+      masked
+    }
+  }
+
   override def doColumnar(lhs: GpuColumnVector, rhs: GpuColumnVector): ColumnVector = {
     val lBase = lhs.getBase
     withResource(ShiftHelper.fixupDistanceNoClose(lBase.getType, rhs.getBase)) { distance =>
@@ -95,6 +115,13 @@ case class GpuShiftLeft(left: Expression, right: Expression) extends GpuShiftBas
   override def shiftOp: BinaryOp = BinaryOp.SHIFT_LEFT
 
   override def dataType: DataType = left.dataType
+
+  override def convertToAst(numFirstTableColumns: Int): ast.AstExpression = {
+    new ast.JitOperation(
+      ast.JitOperator.BITWISE_SHIFT_LEFT,
+      left.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns),
+      maskedDistanceAst(numFirstTableColumns))
+  }
 }
 
 case class GpuShiftRight(left: Expression, right: Expression) extends GpuShiftBase {
@@ -105,6 +132,12 @@ case class GpuShiftRight(left: Expression, right: Expression) extends GpuShiftBa
 
   override def dataType: DataType = left.dataType
 
+  override def convertToAst(numFirstTableColumns: Int): ast.AstExpression = {
+    new ast.JitOperation(
+      ast.JitOperator.BITWISE_SHIFT_RIGHT,
+      left.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns),
+      maskedDistanceAst(numFirstTableColumns))
+  }
 }
 
 case class GpuShiftRightUnsigned(left: Expression, right: Expression) extends GpuShiftBase {
@@ -114,6 +147,28 @@ case class GpuShiftRightUnsigned(left: Expression, right: Expression) extends Gp
   override def shiftOp: BinaryOp = BinaryOp.SHIFT_RIGHT_UNSIGNED
 
   override def dataType: DataType = left.dataType
+
+  override def convertToAst(numFirstTableColumns: Int): ast.AstExpression = {
+    val lhsAst = left.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns)
+    val mask = if (left.dataType == IntegerType) 0x1F else 0x3F
+    val maskedInt = new ast.BinaryOperation(
+      ast.BinaryOperator.BITWISE_AND,
+      right.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns),
+      ast.Literal.ofInt(mask))
+    if (left.dataType == IntegerType) {
+      val shifted = new ast.JitOperation(
+        ast.JitOperator.BITWISE_SHIFT_RIGHT,
+        new ast.JitOperation(ast.JitOperator.CAST_TO_UINT32, lhsAst),
+        new ast.JitOperation(ast.JitOperator.CAST_TO_UINT32, maskedInt))
+      new ast.JitOperation(ast.JitOperator.CAST_TO_INT32, shifted)
+    } else {
+      val shifted = new ast.JitOperation(
+        ast.JitOperator.BITWISE_SHIFT_RIGHT,
+        new ast.JitOperation(ast.JitOperator.CAST_TO_UINT64, lhsAst),
+        new ast.JitOperation(ast.JitOperator.CAST_TO_UINT64, maskedInt))
+      new ast.JitOperation(ast.JitOperator.CAST_TO_INT64, shifted)
+    }
+  }
 }
 
 case class GpuBitwiseAnd(left: Expression, right: Expression) extends CudfBinaryArithmetic {
@@ -123,6 +178,9 @@ case class GpuBitwiseAnd(left: Expression, right: Expression) extends CudfBinary
 
   override def binaryOp: BinaryOp = BinaryOp.BITWISE_AND
   override def astOperator: Option[BinaryOperator] = Some(ast.BinaryOperator.BITWISE_AND)
+
+  override protected def astJitCompatible: Boolean =
+    left.dataType == right.dataType && dataType.isInstanceOf[IntegralType]
 
   override val failOnError: Boolean = false
 }
@@ -135,6 +193,9 @@ case class GpuBitwiseOr(left: Expression, right: Expression) extends CudfBinaryA
   override def binaryOp: BinaryOp = BinaryOp.BITWISE_OR
   override def astOperator: Option[BinaryOperator] = Some(ast.BinaryOperator.BITWISE_OR)
 
+  override protected def astJitCompatible: Boolean =
+    left.dataType == right.dataType && dataType.isInstanceOf[IntegralType]
+
   override val failOnError: Boolean = false
 }
 
@@ -146,6 +207,9 @@ case class GpuBitwiseXor(left: Expression, right: Expression) extends CudfBinary
   override def binaryOp: BinaryOp = BinaryOp.BITWISE_XOR
   override def astOperator: Option[BinaryOperator] = Some(ast.BinaryOperator.BITWISE_XOR)
 
+  override protected def astJitCompatible: Boolean =
+    left.dataType == right.dataType && dataType.isInstanceOf[IntegralType]
+
   override val failOnError: Boolean = false
 }
 
@@ -153,6 +217,8 @@ case class GpuBitwiseNot(child: Expression) extends CudfUnaryExpression with Exp
   override def inputTypes: Seq[AbstractDataType] = Seq(IntegralType)
 
   override def unaryOp: UnaryOp = UnaryOp.BIT_INVERT
+
+  override protected def astJitCompatible: Boolean = dataType.isInstanceOf[IntegralType]
 
   override def dataType: DataType = child.dataType
 

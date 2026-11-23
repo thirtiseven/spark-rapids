@@ -29,7 +29,7 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference,
   NamedExpression}
 import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, Inner, JoinType, LeftSemi}
 import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan}
-import org.apache.spark.sql.rapids.{GpuAdd, GpuBitwiseXor, GpuGreaterThan, GpuMultiply}
+import org.apache.spark.sql.rapids.{GpuAdd, GpuGreaterThan, GpuGreatest, GpuMultiply}
 import org.apache.spark.sql.types.{BooleanType, IntegerType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -70,8 +70,8 @@ class GpuBroadcastNestedLoopJoinRetrySuite extends RmmSparkRetrySuiteBase {
     val shared = GpuMultiply(
       GpuAdd(x, y, failOnError = false)(), z, failOnError = false)()
     List(
-      GpuAlias(GpuBitwiseXor(shared, x), "shared_xor_x")(),
-      GpuAlias(GpuBitwiseXor(shared, y), "shared_xor_y")(),
+      GpuAlias(GpuGreatest(Seq(shared, x)), "shared_max_x")(),
+      GpuAlias(GpuGreatest(Seq(shared, y)), "shared_max_y")(),
       x,
       y,
       z)
@@ -137,8 +137,8 @@ class GpuBroadcastNestedLoopJoinRetrySuite extends RmmSparkRetrySuiteBase {
       withResource(projectBuildSide(retryInput)) { output =>
         assertResult(3)(output.numRows())
         assertResult(5)(output.numCols())
-        assertResult(Seq(11, 23, 39))(collectInts(output, 0))
-        assertResult(Seq(14, 16, 34))(collectInts(output, 1))
+        assertResult(Seq(10, 21, 36))(collectInts(output, 0))
+        assertResult(Seq(10, 21, 36))(collectInts(output, 1))
       }
       assert(RmmSpark.getAndResetNumRetryThrow(taskId) > 0)
       assertResult(0)(RmmSpark.getAndResetNumSplitRetryThrow(taskId))

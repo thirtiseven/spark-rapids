@@ -14,7 +14,8 @@
 
 import pytest
 
-from asserts import assert_cpu_and_gpu_are_equal_collect_with_capture, assert_gpu_and_cpu_are_equal_collect
+from asserts import assert_cpu_and_gpu_are_equal_collect_with_capture, \
+    assert_gpu_and_cpu_are_equal_collect, assert_gpu_and_cpu_error
 from conftest import is_dataproc_serverless_runtime
 from data_gen import *
 from marks import approximate_float, datagen_overrides, ignore_order, disable_ansi_mode
@@ -515,15 +516,13 @@ def test_jit_mixed_project_expressions(data_gen, tiered_project_enabled):
 @pytest.mark.parametrize('data_gen', [int_gen, long_gen], ids=idfn)
 @disable_ansi_mode
 def test_jit_and_legacy_ast_mixed_project_expressions(data_gen):
-    assert_cpu_and_gpu_are_equal_collect_with_capture(
-        lambda spark: binary_op_df(spark, data_gen).select(
+    def make_df(spark):
+        return gen_df(spark, [('a', data_gen), ('b', data_gen), ('d', double_gen)]).select(
             (f.col('a') + f.col('b')).alias('jit'),
-            (f.col('a') * f.col('a')).bitwiseXOR(f.col('b')).alias('legacy'),
-            (f.col('a') + f.col('b')).bitwiseXOR(
-                f.col('a') * f.col('b')).alias('mixed')),
-        exist_classes=(
-            r"GpuProject.*AST_JIT.*AS jit.*AST\(.*AS legacy.*"
-            r"AST\(.*AS mixed,GpuProjectAstExpression"),
+            ((f.col('d') + f.lit(1.0)) * f.col('d')).alias('legacy'))
+    assert_cpu_and_gpu_are_equal_collect_with_capture(
+        make_df,
+        exist_classes=r"GpuProject.*AST_JIT.*AS jit.*AST\(.*AS legacy,GpuProjectAstExpression",
         non_exist_classes=r"AS legacy.*AST_JIT",
         conf=_project_ast_jit_and_legacy_enabled_conf)
 
@@ -550,14 +549,13 @@ def test_project_ast_keeps_skipped_side_effects(expr, backend):
 
 @_xfail_ast_jit_on_dataproc_serverless
 @pytest.mark.parametrize('data_gen', [int_gen, long_gen], ids=idfn)
-# Both legacy roots share a + b with the JIT output; the second also has a JIT-capable sibling.
-@pytest.mark.parametrize('legacy_expr', ['(a + b) ^ a', '(a + b) ^ (a * b)'], ids=idfn)
 @disable_ansi_mode
-def test_cross_backend_shared_subtree(data_gen, legacy_expr):
+def test_cross_backend_shared_subtree(data_gen):
+    # Both roots now run on AST JIT and share a + b in one multi-output program.
     assert_cpu_and_gpu_are_equal_collect_with_capture(
         lambda spark: binary_op_df(spark, data_gen).selectExpr(
-            f'{legacy_expr} as legacy', '(a + b) * b as jit'),
-        exist_classes=r'GpuProject.*AST\(.*AS legacy.*AST_JIT.*AS jit',
+            '(a + b) ^ a as xor_out', '(a + b) * b as mul_out'),
+        exist_classes=r'GpuProject.*AST_JIT.*AS xor_out.*AST_JIT.*AS mul_out',
         conf=_project_ast_jit_and_legacy_enabled_conf)
 
 
@@ -689,3 +687,104 @@ def test_ast_region_with_rewritten_contains_operand():
     # Only bind-time tiering makes AND an AST region over an earlier contains tier, and the plan
     # string shows only complete AST outputs, so compare results.
     assert_gpu_and_cpu_are_equal_collect(project, conf=_project_ast_enabled_conf)
+
+
+@_xfail_ast_jit_on_dataproc_serverless
+@approximate_float
+@disable_ansi_mode
+def test_ast_jit_extended_operators_e2e():
+    def make_query(spark):
+        df = gen_df(spark, [
+            ('a', int_gen),
+            ('b', int_gen),
+            ('l', long_gen),
+            ('s', StringGen('[a-d]{0,3}')),
+            ('d', DecimalGen(precision=9, scale=2)),
+            ('dt', date_gen),
+            ('ts', timestamp_gen),
+            ('x', double_gen),
+        ])
+        return df.selectExpr(
+            '(a & b) | (a ^ ~b) AS bit_out',
+            'shiftleft(a, b) + shiftright(a, b) + shiftrightunsigned(a, b) AS shift_out',
+            '((a > b) AND (b IS NOT NULL)) OR (a <=> b) AS logic_cmp',
+            'coalesce(s, CASE WHEN a > 0 THEN "pos" WHEN a = 0 THEN "zero" END, "neg") AS str_case',
+            'IF(d >= CAST(0.00 AS DECIMAL(9,2)), CAST(d AS DECIMAL(18,2)), CAST(0.00 AS DECIMAL(18,2))) AS dec_if',
+            'a IN (0, 1, -1, NULL) AS in_out',
+            'CAST(l AS INT) + CAST(a != 0 AS INT) AS cast_out',
+            'l % CAST(b AS BIGINT) AS rem_out',
+            'l DIV CAST(b AS BIGINT) AS div_out',
+            'sqrt(x) AS sqrt_out',
+            'dt >= DATE "2000-01-01" AND ts IS NOT NULL AS dt_cmp')
+
+    assert_gpu_and_cpu_are_equal_collect(make_query, conf=_project_ast_jit_enabled_conf)
+
+
+@_xfail_ast_jit_on_dataproc_serverless
+@ignore_order(local=True)
+@disable_ansi_mode
+def test_ast_jit_all_execs_filter_agg_expand_join():
+    def make_query(spark):
+        left = gen_df(spark, [
+            ('k', IntegerGen(min_val=0, max_val=20)),
+            ('a', IntegerGen(min_val=-100, max_val=100)),
+            ('b', IntegerGen(min_val=-100, max_val=100)),
+            ('s', StringGen('[a-c]{1,2}')),
+        ], length=200)
+        right = gen_df(spark, [
+            ('rk', IntegerGen(min_val=0, max_val=20)),
+            ('ra', IntegerGen(min_val=-100, max_val=100)),
+        ], length=50, seed=42)
+        # Filter -> BroadcastHashJoin (with build-side projection & computed keys) -> HashAgg
+        filtered = left.filter('(a + b) > 0 AND (k IN (1, 2, 3, 4, 5, 10) OR s = "a")')
+        build = right.selectExpr('rk', '(ra * 2 + 1) AS ra2')
+        joined = filtered.join(
+            f.broadcast(build),
+            (filtered['k'] + 1) == (build['rk'] + 1),
+            'inner')
+        return joined.groupBy((f.col('k') + f.lit(10)).alias('gk')).agg(
+            f.sum(f.expr('CASE WHEN a > b THEN a * 2 ELSE b + 1 END')).alias('s1'),
+            f.sum(f.col('ra2')).alias('s2')).selectExpr('gk', 's1 + s2 AS total')
+
+    conf = copy_and_update(_project_ast_jit_enabled_conf, {
+        'spark.rapids.sql.join.hashTable.reuse': 'true',
+        'spark.rapids.sql.projectAstJit.precompile.enabled': 'true',
+    })
+    assert_gpu_and_cpu_are_equal_collect(make_query, conf=conf)
+
+    # Also exercise ShuffledHashJoin keys and Expand (ROLLUP) with AST JIT enabled.
+    def make_shuffle_and_expand(spark):
+        left = gen_df(spark, [
+            ('k', IntegerGen(min_val=0, max_val=10)),
+            ('v', IntegerGen(min_val=-50, max_val=50)),
+        ], length=100)
+        right = gen_df(spark, [
+            ('rk', IntegerGen(min_val=0, max_val=10)),
+            ('rv', IntegerGen(min_val=-50, max_val=50)),
+        ], length=100, seed=99)
+        joined = left.join(right, (left['k'] + 2) == (right['rk'] + 2), 'inner')
+        return joined.rollup('k', 'rk').agg(f.sum(f.col('v') * f.col('rv')).alias('sv'))
+
+    shj_conf = copy_and_update(_project_ast_jit_enabled_conf, {
+        'spark.sql.autoBroadcastJoinThreshold': '-1',
+    })
+    assert_gpu_and_cpu_are_equal_collect(make_shuffle_and_expand, conf=shj_conf)
+
+
+@_xfail_ast_jit_on_dataproc_serverless
+def test_ast_jit_ansi_arithmetic_in_range_and_overflow():
+    in_range_gen = IntegerGen(min_val=-1000, max_val=1000, special_cases=[])
+    conf = copy_and_update(ansi_enabled_conf, _project_ast_jit_enabled_conf)
+    assert_cpu_and_gpu_are_equal_collect_with_capture(
+        lambda spark: binary_op_df(spark, in_range_gen).selectExpr(
+            '(a + b) * (a - b) AS p', 'abs(-a) AS u'),
+        exist_classes=r'GpuProject.*AST_JIT.*AS p.*AST_JIT.*AS u',
+        conf=conf)
+
+    # Overflow must fall back to regular GPU and raise the same Spark ArithmeticException as CPU.
+    assert_gpu_and_cpu_error(
+        lambda spark: spark.createDataFrame([(2147483647, 1)], 'a int, b int')
+            .selectExpr('a + b AS s').collect(),
+        conf=conf,
+        error_message='overflow')
+

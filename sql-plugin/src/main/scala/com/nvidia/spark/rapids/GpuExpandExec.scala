@@ -107,10 +107,11 @@ case class GpuExpandExec(
     var projectionsForBind = projections
     var attributesForBind = child.output
     var preprojectIter = identity[Iterator[ColumnarBatch]] _
+    val enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf)
     if (preprojectEnabled) {
       // Tiered projection is enabled, check if pre-projection is needed.
       val boundPreprojections = GpuBindReferences.bindGpuReferencesTiered(
-        preprojectionList, child.output, conf, metricsMap)
+        preprojectionList, child.output, conf, metricsMap, enableAstJit = enableAstJit)
       if (boundPreprojections.exprTiers.size > 1) {
         logDebug("GPU expanding with pre-projection.")
         projectionsForBind = preprojectedProjections
@@ -127,7 +128,8 @@ case class GpuExpandExec(
     }
 
     val boundProjections = projectionsForBind.map { pl =>
-      GpuBindReferences.bindGpuReferencesTiered(pl, attributesForBind, conf, metricsMap)
+      GpuBindReferences.bindGpuReferencesTiered(
+        pl, attributesForBind, conf, metricsMap, enableAstJit = enableAstJit)
     }
 
     child.executeColumnar().mapPartitions { it =>

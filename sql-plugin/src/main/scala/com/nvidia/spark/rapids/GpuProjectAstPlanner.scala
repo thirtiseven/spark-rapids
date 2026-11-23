@@ -33,7 +33,7 @@ import org.apache.spark.sql.types.DataType
  * Expressions on the same dependency frontier remain in the same physical tier so JIT can evaluate
  * their roots together. Values referenced across frontiers become tier outputs.
  */
-private[rapids] object GpuProjectAstPlanner {
+object GpuProjectAstPlanner {
   private sealed trait Backend
   private case object AstJit extends Backend
   private case object AstInterpreted extends Backend
@@ -151,6 +151,10 @@ private[rapids] object GpuProjectAstPlanner {
           if enableAst && canUseLegacy(child) && !isSimpleArithmetic(child) &&
             !planner.backendOf(child).contains(AstJit) =>
         GpuProjectAstExpression.wrap(alias)
+      case child: GpuExpression
+          if !child.isInstanceOf[GpuAlias] && enableAst && canUseLegacy(child) &&
+            !isSimpleArithmetic(child) && !planner.backendOf(child).contains(AstJit) =>
+        GpuProjectAstExpression(child)
       case other => other
     }
     if (enableAstJit) GpuAstJitExpression.wrapTierExpressions(legacy, conf) else legacy

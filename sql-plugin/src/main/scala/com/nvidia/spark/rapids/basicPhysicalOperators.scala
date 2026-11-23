@@ -977,6 +977,34 @@ case class GpuProjectExec(
   }
 
   /**
+   * Executes with fresh AST/AST JIT evaluators owned by this invocation instead of registering
+   * task-completion cleanup, so projections retained across tasks (e.g. cached broadcast builds)
+   * can safely evaluate and close native state without racing task completion.
+   */
+  def withScopedAstEvaluators[T](f: GpuTieredProject => T): T = {
+    val scopedEvaluators = scala.collection.mutable.ArrayBuffer.empty[GpuProjectAstExpressionBase]
+    val clonedTiers = exprTiers.map { tier =>
+      tier.map { expr =>
+        expr.transformDown {
+          case jit: GpuAstJitExpression =>
+            val fresh = jit.copy(closeOnTaskCompletion = false)
+            scopedEvaluators += fresh
+            fresh
+          case legacy: GpuProjectAstExpression =>
+            val fresh = legacy.copy(closeOnTaskCompletion = false)
+            scopedEvaluators += fresh
+            fresh
+        }.asInstanceOf[GpuExpression]
+      }
+    }
+    try {
+      f(GpuTieredProject(clonedTiers))
+    } finally {
+      scopedEvaluators.safeClose()
+    }
+  }
+
+  /**
    * Is everything retryable. This can help with reliability in the common case.
    */
   lazy val areAllRetryable = !exprTiers.exists { tier =>
@@ -1343,8 +1371,14 @@ case class GpuFilterExec(
     OP_TIME_LEGACY -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_OP_TIME_LEGACY),
     CPU_BRIDGE_PROCESSING_TIME -> createNanoTimingMetric(DEBUG_LEVEL, 
       DESCRIPTION_CPU_BRIDGE_PROCESSING_TIME),
-    CPU_BRIDGE_WAIT_TIME -> createNanoTimingMetric(DEBUG_LEVEL, 
-      DESCRIPTION_CPU_BRIDGE_WAIT_TIME))
+    CPU_BRIDGE_WAIT_TIME -> createNanoTimingMetric(DEBUG_LEVEL,
+      DESCRIPTION_CPU_BRIDGE_WAIT_TIME),
+    AST_JIT_PROGRAM_BUILD_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT program build attempts"),
+    AST_JIT_PROGRAM_CACHE_HITS -> createMetric(DEBUG_LEVEL, "AST JIT bound program cache hits"),
+    AST_JIT_PROGRAM_BUILD_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT program build time"),
+    AST_JIT_EVAL_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT group evaluation attempts"),
+    AST_JIT_EVAL_ROWS -> createMetric(DEBUG_LEVEL, "AST JIT group input rows including retries"),
+    AST_JIT_EVAL_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT group evaluation time"))
 
   // Split out all the IsNotNulls from condition.
   private val (notNullPreds, _) = splitConjunctivePredicates(condition).partition {
@@ -1381,7 +1415,7 @@ case class GpuFilterExec(
     val opTime = gpuLongMetric(OP_TIME_LEGACY)
     val rdd = child.executeColumnar()
     val boundCondition = GpuBindReferences.bindGpuReferencesTiered(Seq(condition), child.output,
-      conf, allMetrics)
+      conf, allMetrics, enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf))
     // Mirrors GpuProjectExec: mapPartitionsWithIndex (not flatMap) so that
     // when a downstream coalesce/union wraps this RDD, our lambda fires once
     // per parent partition with that parent's index. GpuNondeterministic

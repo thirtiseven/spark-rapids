@@ -16,21 +16,23 @@
 
 package org.apache.spark.sql.rapids.execution
 
+import ai.rapids.cudf.{ColumnVector, Table}
 import com.nvidia.spark.rapids._
+import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.ProjectAstTestUtils.collectExpressions
 import org.scalatest.funsuite.AnyFunSuite
 
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, NamedExpression}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.{GpuAdd, GpuMultiply, GpuSubtract}
-import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.sql.types.{DataType, IntegerType}
 
 class GpuBroadcastHashJoinPostProjectionSuite extends AnyFunSuite {
   private val x = AttributeReference("x", IntegerType)()
   private val y = AttributeReference("y", IntegerType)()
 
   for (tiered <- Seq(true, false)) {
-    test(s"cached build-side projection does not keep Project AST evaluators: tiered=$tiered") {
+    test(s"cached build-side projection supports scoped Project AST and AST JIT: tiered=$tiered") {
       val conf = new SQLConf
       conf.setConfString(RapidsConf.ENABLE_TIERED_PROJECT.key, tiered.toString)
       conf.setConfString(RapidsConf.ENABLE_PROJECT_AST.key, "true")
@@ -50,8 +52,33 @@ class GpuBroadcastHashJoinPostProjectionSuite extends AnyFunSuite {
           projectList, Seq(x, y), conf)
 
         assert(collectExpressions[GpuProjectAstExpressionBase](perTask.exprTiers.flatten).nonEmpty)
-        assert(collectExpressions[GpuProjectAstExpressionBase](cached.exprTiers.flatten).isEmpty)
+        assert(collectExpressions[GpuProjectAstExpressionBase](cached.exprTiers.flatten).nonEmpty)
         assertResult(projectList.size)(cached.exprTiers.last.size)
+
+        // Verify multiple independent scoped invocations succeed and clean up without TaskContext.
+        for (_ <- 0 until 2) {
+          val batch = withResource(ColumnVector.fromInts(1, 2, 3)) { c0 =>
+            withResource(ColumnVector.fromInts(4, 5, 6)) { c1 =>
+              withResource(new Table(c0, c1)) { tbl =>
+                GpuColumnVector.from(tbl, Array[DataType](IntegerType, IntegerType))
+              }
+            }
+          }
+          val out = withResource(batch) { cb =>
+            cached.withScopedAstEvaluators { scoped =>
+              val scopedJits = collectExpressions[GpuAstJitExpression](scoped.exprTiers.flatten)
+              assert(scopedJits.forall(!_.closeOnTaskCompletion))
+              scoped.project(cb)
+            }
+          }
+          withResource(out) { cb =>
+            assertResult(3)(cb.numCols())
+            assertResult(3)(cb.numRows())
+            withResource(cb.column(0).asInstanceOf[GpuColumnVector].getBase.copyToHost()) { h =>
+              assertResult(Seq(20, 35, 54))((0 until 3).map(i => h.getInt(i.toLong)))
+            }
+          }
+        }
       }
     }
   }

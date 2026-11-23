@@ -445,13 +445,15 @@ class AggHelper(
   } else {
     inputAttributes
   }
+  private val enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf)
   val preStepBound =
-    GpuBindReferences.bindGpuReferencesTiered(preStep.toList, preStepAttributes.toList, 
-      conf, metrics)
+    GpuBindReferences.bindGpuReferencesTiered(preStep.toList, preStepAttributes.toList,
+      conf, metrics, enableAstJit = enableAstJit)
 
   // a bound expression that is applied after the cuDF aggregate
   private val postStepBound =
-    GpuBindReferences.bindGpuReferencesTiered(postStep.toList, postStepAttr.toList, conf, metrics)
+    GpuBindReferences.bindGpuReferencesTiered(postStep.toList, postStepAttr.toList, conf, metrics,
+      enableAstJit = enableAstJit)
 
   /**
    * Apply the "pre" step: preMerge for merge, or pass-through in the update case
@@ -770,8 +772,8 @@ object GpuAggFirstPassIterator {
 //     (GpuAverage => CudfSum/CudfCount)
 //  * boundResultReferences: project the result expressions Spark expects in the output.
 case class BoundExpressionsModeAggregates(
-    boundFinalProjections: Option[Seq[GpuExpression]],
-    boundResultReferences: Seq[Expression])
+    boundFinalProjections: Option[GpuTieredProject],
+    boundResultReferences: GpuTieredProject)
 
 object GpuAggFinalPassIterator {
 
@@ -790,7 +792,9 @@ object GpuAggFinalPassIterator {
       aggregateAttributes: Seq[Attribute],
       resultExpressions: Seq[NamedExpression],
       modeInfo: AggregateModeInfo,
+      conf: SQLConf,
       metrics: Map[String, GpuMetric]): BoundExpressionsModeAggregates = {
+    val enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf)
     val groupingAttributes = groupingExpressions.map(_.toAttribute)
     val aggBufferAttributes = groupingAttributes ++
       aggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)
@@ -798,7 +802,8 @@ object GpuAggFinalPassIterator {
     val boundFinalProjections = if (modeInfo.hasFinalMode || modeInfo.hasCompleteMode) {
       val finalProjections = groupingAttributes ++
         aggregateExpressions.map(_.aggregateFunction.evaluateExpression)
-      Some(GpuBindReferences.bindGpuReferences(finalProjections, aggBufferAttributes, metrics))
+      Some(GpuBindReferences.bindGpuReferencesTiered(finalProjections, aggBufferAttributes,
+        conf, metrics, enableAstJit = enableAstJit))
     } else {
       None
     }
@@ -814,12 +819,14 @@ object GpuAggFinalPassIterator {
     // - Final or Complete mode: we use resultExpressions to pick out the correct columns that
     //   finalReferences has pre-processed for us
     val boundResultReferences = if (modeInfo.hasPartialMode || modeInfo.hasPartialMergeMode) {
-      GpuBindReferences.bindGpuReferences(resultExpressions,
-        resultExpressions.map(_.toAttribute), metrics)
+      GpuBindReferences.bindGpuReferencesTiered(resultExpressions,
+        resultExpressions.map(_.toAttribute), conf, metrics, enableAstJit = enableAstJit)
     } else if (modeInfo.hasFinalMode || modeInfo.hasCompleteMode) {
-      GpuBindReferences.bindGpuReferences(resultExpressions, finalAttributes, metrics)
+      GpuBindReferences.bindGpuReferencesTiered(resultExpressions, finalAttributes,
+        conf, metrics, enableAstJit = enableAstJit)
     } else {
-      GpuBindReferences.bindGpuReferences(resultExpressions, groupingAttributes, metrics)
+      GpuBindReferences.bindGpuReferencesTiered(resultExpressions, groupingAttributes,
+        conf, metrics, enableAstJit = enableAstJit)
     }
     BoundExpressionsModeAggregates(
       boundFinalProjections,
@@ -831,8 +838,8 @@ object GpuAggFinalPassIterator {
       metrics: GpuHashAggregateMetrics): ColumnarBatch = {
     // Perform the last project to get the correct shape that Spark expects. Note this may
     // add things like literals that were not part of the aggregate into the batch.
-    closeOnExcept(GpuProjectExec.projectAndCloseWithRetrySingleBatch(finalBatch,
-      boundExpressions.boundResultReferences)) { ret =>
+    closeOnExcept(boundExpressions.boundResultReferences
+        .projectAndCloseWithRetrySingleBatch(finalBatch)) { ret =>
       metrics.numOutputRows += ret.numRows()
       metrics.numOutputBatches += 1
       ret
@@ -847,8 +854,8 @@ object GpuAggFinalPassIterator {
     cbIter.map { batch =>
       NvtxIdWithMetrics(NvtxRegistry.FINALIZE_AGG, aggTime, opTime) {
         val finalBatch = boundExpressions.boundFinalProjections.map { exprs =>
-          GpuProjectExec.projectAndCloseWithRetrySingleBatch(
-            SpillableColumnarBatch(batch, SpillPriorities.ACTIVE_BATCHING_PRIORITY), exprs)
+          exprs.projectAndCloseWithRetrySingleBatch(
+            SpillableColumnarBatch(batch, SpillPriorities.ACTIVE_BATCHING_PRIORITY))
         }.getOrElse(batch)
         val finalSCB =
           SpillableColumnarBatch(finalBatch, SpillPriorities.ACTIVE_BATCHING_PRIORITY)
@@ -866,7 +873,7 @@ object GpuAggFinalPassIterator {
       NvtxIdWithMetrics(NvtxRegistry.FINALIZE_AGG, aggTime, opTime) {
         val finalBatch = boundExpressions.boundFinalProjections.map { exprs =>
           SpillableColumnarBatch(
-            GpuProjectExec.projectAndCloseWithRetrySingleBatch(sb, exprs),
+            exprs.projectAndCloseWithRetrySingleBatch(sb),
             SpillPriorities.ACTIVE_BATCHING_PRIORITY)
         }.getOrElse(sb)
         reorderFinalBatch(finalBatch, boundExpressions, metrics)
@@ -2054,10 +2061,16 @@ case class GpuHashAggregateExec(
     "NUM_PRE_SPLITS" -> createMetric(DEBUG_LEVEL, "num pre splits"),
     "NUM_TASKS_SINGLE_PASS" -> createMetric(MODERATE_LEVEL, "number of single pass tasks"),
     "HEURISTIC_TIME" -> createNanoTimingMetric(DEBUG_LEVEL, "time in heuristic"),
-    CPU_BRIDGE_PROCESSING_TIME -> createNanoTimingMetric(DEBUG_LEVEL, 
+    CPU_BRIDGE_PROCESSING_TIME -> createNanoTimingMetric(DEBUG_LEVEL,
       DESCRIPTION_CPU_BRIDGE_PROCESSING_TIME),
-    CPU_BRIDGE_WAIT_TIME -> createNanoTimingMetric(DEBUG_LEVEL, 
-      DESCRIPTION_CPU_BRIDGE_WAIT_TIME)
+    CPU_BRIDGE_WAIT_TIME -> createNanoTimingMetric(DEBUG_LEVEL,
+      DESCRIPTION_CPU_BRIDGE_WAIT_TIME),
+    AST_JIT_PROGRAM_BUILD_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT program build attempts"),
+    AST_JIT_PROGRAM_CACHE_HITS -> createMetric(DEBUG_LEVEL, "AST JIT bound program cache hits"),
+    AST_JIT_PROGRAM_BUILD_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT program build time"),
+    AST_JIT_EVAL_ATTEMPTS -> createMetric(DEBUG_LEVEL, "AST JIT group evaluation attempts"),
+    AST_JIT_EVAL_ROWS -> createMetric(DEBUG_LEVEL, "AST JIT group input rows including retries"),
+    AST_JIT_EVAL_TIME -> createNanoTimingMetric(DEBUG_LEVEL, "AST JIT group evaluation time")
   )
 
   // requiredChildDistributions are CPU expressions, so remove it from the GPU expressions list
@@ -2111,11 +2124,11 @@ case class GpuHashAggregateExec(
     val localEstimatedPreProcessGrowth = estimatedPreProcessGrowth
 
     val boundGroupExprs = GpuBindReferences.bindGpuReferencesTiered(groupingExprs,
-      inputAttrs, conf, allMetrics)
+      inputAttrs, conf, allMetrics, enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf))
 
     rdd.mapPartitions { cbIter =>
       val postBoundReferences = GpuAggFinalPassIterator.setupReferences(groupingExprs,
-        aggregateExprs, aggregateAttrs, resultExprs, modeInfo, allMetrics)
+        aggregateExprs, aggregateAttrs, resultExprs, modeInfo, conf, allMetrics)
 
       new DynamicGpuPartialAggregateIterator(cbIter, inputAttrs, groupingExprs,
         boundGroupExprs, aggregateExprs, aggregateAttrs, resultExprs, modeInfo,

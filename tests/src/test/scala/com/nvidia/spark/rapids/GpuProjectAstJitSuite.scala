@@ -511,15 +511,41 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
     GpuUnaryMinus(left, ansi),
     GpuAbs(left, ansi))
 
-  // Each operator checks the mode and type on its own, so cover every operator in both modes.
-  for ((dataType, ansi) <- Seq(
-      (ByteType, true), (LongType, true), (FloatType, false), (DoubleType, false))) {
-    test(s"project AST JIT excludes $dataType arithmetic with ansi=$ansi") {
-      val expressions = jitArithmetic(reference(0, dataType), reference(1, dataType), ansi)
+  // Float/Double arithmetic stays excluded pending cuDF FMA contraction fix (#24942 / #25470).
+  for (dataType <- Seq(FloatType, DoubleType)) {
+    test(s"project AST JIT excludes $dataType arithmetic") {
+      val expressions = jitArithmetic(reference(0, dataType), reference(1, dataType), ansi = false)
       val wrapped = wrapOutputs(expressions.zipWithIndex.map { case (e, i) => alias(e, s"o$i") })
 
       wrapped.zip(expressions).foreach { case (output, expression) =>
         assert(output.find(_.isInstanceOf[GpuAstJitExpression]).isEmpty, expression)
+      }
+    }
+  }
+
+  for (dataType <- Seq(ByteType, LongType)) {
+    test(s"project AST JIT honors projectAstJit.ansiEnabled for $dataType arithmetic") {
+      val disabledConf = projectConf()
+      disabledConf.setConfString(RapidsConf.PROJECT_AST_JIT_ANSI_ENABLED.key, "false")
+      SQLConf.withExistingConf(disabledConf) {
+        val expressions = jitArithmetic(reference(0, dataType), reference(1, dataType), ansi = true)
+        val wrapped = GpuProjectAstPlanner.wrapOutputs(
+          expressions.zipWithIndex.map { case (e, i) => alias(e, s"o$i") },
+          disabledConf, enableAst = false, enableAstJit = true)
+        wrapped.zip(expressions).foreach { case (output, expression) =>
+          assert(output.find(_.isInstanceOf[GpuAstJitExpression]).isEmpty, expression)
+        }
+      }
+      val enabledConf = projectConf()
+      enabledConf.setConfString(RapidsConf.PROJECT_AST_JIT_ANSI_ENABLED.key, "true")
+      SQLConf.withExistingConf(enabledConf) {
+        val expressions = jitArithmetic(reference(0, dataType), reference(1, dataType), ansi = true)
+        val wrapped = GpuProjectAstPlanner.wrapOutputs(
+          expressions.zipWithIndex.map { case (e, i) => alias(e, s"o$i") },
+          enabledConf, enableAst = false, enableAstJit = true)
+        wrapped.zip(expressions).foreach { case (output, expression) =>
+          assert(GpuAstJitExpression.extractTopLevel(output).exists(_.child == expression), output)
+        }
       }
     }
   }
@@ -1595,6 +1621,40 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
               val got = collectDoubles(out.column(idx).asInstanceOf[GpuColumnVector].getBase)
               assertResult(reg, e)(got)
             }
+          }
+        }
+      }
+    }
+  }
+
+  test("ANSI AST JIT integral arithmetic matches in-range and falls back for Spark overflow") {
+    // In-range and null rows match regular GPU
+    withResource(gpuTable(
+        ColumnVector.fromBoxedInts(10, -20, null, 0),
+        ColumnVector.fromBoxedInts(5, 7, Int.MaxValue, -1))) { input =>
+      val l = boundRef(0, IntegerType)
+      val r = boundRef(1, IntegerType)
+      val exprs = jitArithmetic(l, r, ansi = true)
+      assert(exprs.forall(GpuAstJitExpression.canUseAstJit))
+      val jit = jitOnly(exprs, input)
+      withResource(GpuColumnVector.from(input, Array[DataType](IntegerType, IntegerType))) { b =>
+        exprs.zip(jit).foreach { case (e, got) =>
+          val reg = withResource(e.columnarEval(b))(c => collectLongs(c.getBase))
+          assertResult(reg, e)(got)
+        }
+      }
+    }
+
+    // Overflow triggers cuDF evaluation error -> falls back to regular GPU to throw Spark error.
+    withResource(gpuTable(
+        ColumnVector.fromBoxedInts(1, Int.MaxValue),
+        ColumnVector.fromBoxedInts(2, 1))) { input =>
+      val add = GpuAdd(boundRef(0, IntegerType), boundRef(1, IntegerType), failOnError = true)()
+      val jit = GpuAstJitExpression(add)
+      withResource(GpuColumnVector.from(input, Array[DataType](IntegerType, IntegerType))) { b =>
+        TestUtils.withMockTaskContext() {
+          intercept[ArithmeticException] {
+            GpuAstJitExpression.computeColumns(Seq(jit), input, Some(b)).close()
           }
         }
       }

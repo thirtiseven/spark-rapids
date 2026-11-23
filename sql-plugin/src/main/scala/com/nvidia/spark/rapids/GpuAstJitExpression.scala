@@ -24,7 +24,8 @@ import java.util.function.BiConsumer
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
-import ai.rapids.cudf.{ColumnVector, DType, Scalar, Table}
+import ai.rapids.cudf.{ColumnVector, CudfColumnSizeOverflowException, CudfException, DType,
+  Scalar, Table}
 import ai.rapids.cudf.ast.{AstExpression, AstJitProgram, CompiledExpression}
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.GpuMetric._
@@ -39,7 +40,7 @@ import org.apache.spark.sql.types.{BooleanType, ByteType, DataType, DateType, De
   DoubleType, FloatType, IntegerType, LongType, ShortType, StringType, TimestampType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
-object GpuAstJitExpression {
+object GpuAstJitExpression extends Logging {
   /** Extracts an AST JIT wrapper after unwrapping any top-level aliases. */
   private[rapids] def extractTopLevel(expression: Expression): Option[GpuAstJitExpression] =
     GpuProjectAstExpressionBase.extractTopLevel(expression).collect {
@@ -206,15 +207,52 @@ object GpuAstJitExpression {
   private[rapids] def computeColumns(
       expressions: Seq[GpuAstJitExpression],
       table: Table): ColumnarBatch = {
+    computeColumns(expressions, table, None)
+  }
+
+  private[rapids] def computeColumns(
+      expressions: Seq[GpuAstJitExpression],
+      table: Table,
+      batch: Option[ColumnarBatch]): ColumnarBatch = {
     require(expressions.nonEmpty, "AST JIT requires at least one expression")
     val owner = expressions.head
-    val program = owner.getJitProgram(expressions, table)
-    owner.withComputeMetrics(table.getRowCount) {
-      withResource(program.computeTable(table)) { result =>
-        GpuColumnVector.from(result, expressions.map(_.dataType).toArray)
+    def runJit(): ColumnarBatch = {
+      val program = owner.getJitProgram(expressions, table)
+      owner.withComputeMetrics(table.getRowCount) {
+        withResource(program.computeTable(table)) { result =>
+          GpuColumnVector.from(result, expressions.map(_.dataType).toArray)
+        }
       }
     }
+    batch match {
+      case Some(cb) => withRegularFallback(expressions, cb)(runJit())
+      case None => runJit()
+    }
   }
+
+  private[rapids] def withRegularFallback(
+      expressions: Seq[GpuAstJitExpression],
+      batch: ColumnarBatch)(jit: => ColumnarBatch): ColumnarBatch = {
+    try {
+      jit
+    } catch {
+      case jitError: CudfException if !jitError.isInstanceOf[CudfColumnSizeOverflowException] =>
+        val regular = try {
+          val columns = expressions.safeMap(_.child.columnarEval(batch))
+          new ColumnarBatch(columns.toArray, batch.numRows())
+        } catch {
+          case regularError: Throwable =>
+            regularError.addSuppressed(jitError)
+            throw regularError
+        }
+        expressions.head.logFallbackOnce(jitError)
+        regular
+    }
+  }
+
+  private def logFallback(expression: GpuAstJitExpression, error: CudfException): Unit =
+    logWarning(s"AST JIT failed for $expression; evaluated it on the regular GPU path instead",
+      error)
 
   private def hasJitCandidate(expression: Expression): Boolean = expression.find {
     case gpuExpression: GpuExpression =>
@@ -342,6 +380,14 @@ case class GpuAstJitExpression(
   @transient private[this] var jitProgram: AstJitProgram = _
   @transient private[this] var jitProgramGroup: GpuAstJitExpression.JitProgramGroup = _
   @transient private[this] var jitProgramSchema: Vector[GpuAstJitExpression.JitInputColumn] = _
+  @volatile @transient private[this] var loggedFallback = false
+
+  private[rapids] def logFallbackOnce(error: CudfException): Unit = {
+    if (!loggedFallback) {
+      loggedFallback = true
+      GpuAstJitExpression.logFallback(this, error)
+    }
+  }
 
   private[this] var programBuildAttempts: GpuMetric = NoopMetric
   private[this] var programCacheHits: GpuMetric = NoopMetric

@@ -332,6 +332,13 @@ private[rapids] trait RapidsConfSqlEntries extends RapidsConfResourceEntries {
       .checkValue(_ > 0, "The minimum AST JIT group operation count must be greater than zero.")
       .createWithDefault(1)
 
+  val PROJECT_AST_JIT_ANSI_ENABLED =
+    conf("spark.rapids.sql.projectAstJit.ansiEnabled")
+      .doc("Enable checked ANSI integral arithmetic in AST JIT with regular-GPU error fallback.")
+      .internal()
+      .booleanConf
+      .createWithDefault(true)
+
   val PROJECT_AST_JIT_PRECOMPILE =
     conf("spark.rapids.sql.projectAstJit.precompile.enabled")
       .doc("Start compiling AST JIT kernels on executor threads when a task starts, so " +

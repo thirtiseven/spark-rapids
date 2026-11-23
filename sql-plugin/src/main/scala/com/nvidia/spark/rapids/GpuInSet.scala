@@ -16,7 +16,7 @@
 
 package com.nvidia.spark.rapids
 
-import ai.rapids.cudf.{ColumnVector, DType, Scalar}
+import ai.rapids.cudf.{ast, ColumnVector, DType, Scalar}
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 
 import org.apache.spark.sql.catalyst.expressions.{Expression, Literal, Predicate}
@@ -36,6 +36,25 @@ case class GpuInSet(
     case _ => false
   }
   private val legacyNullInEmptyBehavior: Boolean = GpuInSet.isLegacyNullInEmptyBehavior
+
+  override def selfSupportsAstJit: Boolean =
+    list.nonEmpty && list.size <= GpuInSet.MAX_AST_JIT_INSET_SIZE &&
+      !checkNaN && GpuAstJitExpression.isSupportedDataType(child.dataType)
+
+  override def selfIsAstJitOperator: Boolean = selfSupportsAstJit
+
+  override def convertToAst(numFirstTableColumns: Int): ast.AstExpression = {
+    val childAst = child.asInstanceOf[GpuExpression].convertToAst(numFirstTableColumns)
+    val comparisons = list.distinct.map { elem =>
+      new ast.BinaryOperation(
+        ast.BinaryOperator.EQUAL,
+        childAst,
+        GpuLiteral(elem, child.dataType).convertToAst(numFirstTableColumns))
+    }
+    comparisons.reduceLeft { (acc, cmp) =>
+      new ast.BinaryOperation(ast.BinaryOperator.NULL_LOGICAL_OR, acc, cmp)
+    }
+  }
 
   override def nullable: Boolean = child.nullable || hasNull
 
@@ -103,6 +122,8 @@ case class GpuInSet(
 }
 
 object GpuInSet {
+  private val MAX_AST_JIT_INSET_SIZE = 16
+
   private def isLegacyNullInEmptyBehavior: Boolean = {
     try {
       // Use reflection to determine if this conf is defined to avoid the

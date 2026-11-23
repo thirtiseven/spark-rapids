@@ -29,8 +29,10 @@ import org.apache.spark.sql.catalyst.expressions.{Abs, Attribute, AttributeRefer
   Expression, NamedExpression}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.{GpuAbs, GpuAdd, GpuAnd, GpuBitwiseAnd, GpuBitwiseNot,
-  GpuBitwiseOr, GpuBitwiseXor, GpuGreatest, GpuMultiply, GpuNot, GpuOr, GpuShiftLeft,
-  GpuShiftRight, GpuShiftRightUnsigned, GpuSubtract, GpuUnaryMinus, GpuUnaryPositive}
+  GpuBitwiseOr, GpuBitwiseXor, GpuEqualNullSafe, GpuEqualTo, GpuGreaterThan,
+  GpuGreaterThanOrEqual, GpuGreatest, GpuLessThan, GpuLessThanOrEqual, GpuMultiply, GpuNot,
+  GpuOr, GpuShiftLeft, GpuShiftRight, GpuShiftRightUnsigned, GpuSubtract, GpuUnaryMinus,
+  GpuUnaryPositive}
 import org.apache.spark.sql.rapids.metrics.source.MockTaskContext
 import org.apache.spark.sql.types.{ArrayType, BinaryType, BooleanType, ByteType, DataType, DateType,
   Decimal, DecimalType, DoubleType, FloatType, IntegerType, LongType, ShortType, StringType,
@@ -1261,6 +1263,108 @@ class GpuProjectAstJitSuite extends AnyFunSuite {
           }
         }
       }
+    }
+  }
+
+  test("AST JIT comparisons and InSet match regular GPU across non-float types") {
+    def checkBoolExprs(input: Table, types: Array[DataType], exprs: Seq[GpuExpression]): Unit = {
+      assert(exprs.forall(GpuAstJitExpression.canUseAstJit))
+      val jits = exprs.map(e => GpuAstJitExpression(e))
+      withResource(GpuColumnVector.from(input, types)) { b =>
+        TestUtils.withMockTaskContext() {
+          withResource(GpuAstJitExpression.computeColumns(jits, input)) { out =>
+            exprs.zipWithIndex.foreach { case (e, idx) =>
+              val reg = withResource(e.columnarEval(b))(c => collectBools(c.getBase))
+              val got = collectBools(out.column(idx).asInstanceOf[GpuColumnVector].getBase)
+              assertResult(reg, e)(got)
+            }
+          }
+        }
+      }
+    }
+
+    // Float/Double comparisons stay excluded due to Spark NaN total ordering.
+    assert(!GpuAstJitExpression.canUseAstJit(
+      GpuEqualTo(boundRef(0, DoubleType), boundRef(1, DoubleType))))
+    assert(!GpuAstJitExpression.canUseAstJit(
+      GpuLessThan(boundRef(0, FloatType), boundRef(1, FloatType))))
+    assert(!GpuAstJitExpression.canUseAstJit(
+      GpuEqualNullSafe(boundRef(0, DoubleType), boundRef(1, DoubleType))))
+
+    // Integral comparisons + InSet (with and without null)
+    withResource(gpuTable(
+        ColumnVector.fromBoxedInts(1, 2, 3, null, null),
+        ColumnVector.fromBoxedInts(1, 3, 2, 2, null))) { input =>
+      val l = boundRef(0, IntegerType)
+      val r = boundRef(1, IntegerType)
+      checkBoolExprs(input, Array[DataType](IntegerType, IntegerType), Seq(
+        GpuEqualTo(l, r),
+        GpuNot(GpuEqualTo(l, r)),
+        GpuEqualNullSafe(l, r),
+        GpuLessThan(l, r),
+        GpuLessThanOrEqual(l, r),
+        GpuGreaterThan(l, r),
+        GpuGreaterThanOrEqual(l, r),
+        GpuInSet(l, Seq(1, 3)),
+        GpuInSet(l, Seq(1, null))))
+    }
+
+    // String comparisons + InSet
+    withResource(gpuTable(
+        ColumnVector.fromStrings("a", "ab", "", null, null),
+        ColumnVector.fromStrings("a", "b", "", "a", null))) { input =>
+      val l = boundRef(0, StringType)
+      val r = boundRef(1, StringType)
+      checkBoolExprs(input, Array[DataType](StringType, StringType), Seq(
+        GpuEqualTo(l, r),
+        GpuNot(GpuEqualTo(l, r)),
+        GpuEqualNullSafe(l, r),
+        GpuLessThan(l, r),
+        GpuLessThanOrEqual(l, r),
+        GpuGreaterThan(l, r),
+        GpuGreaterThanOrEqual(l, r),
+        GpuInSet(l, Seq(UTF8String.fromString("a"), UTF8String.fromString(""))),
+        GpuInSet(l, Seq(UTF8String.fromString("a"), null))))
+    }
+
+    // Date and Timestamp comparisons
+    withResource(gpuTable(
+        ColumnVector.timestampDaysFromBoxedInts(100, 200, null, null),
+        ColumnVector.timestampDaysFromBoxedInts(100, 150, 100, null))) { input =>
+      val l = boundRef(0, DateType)
+      val r = boundRef(1, DateType)
+      checkBoolExprs(input, Array[DataType](DateType, DateType), Seq(
+        GpuEqualTo(l, r), GpuEqualNullSafe(l, r), GpuLessThan(l, r), GpuGreaterThanOrEqual(l, r)))
+    }
+    withResource(gpuTable(
+        ColumnVector.timestampMicroSecondsFromBoxedLongs(1000L, 2000L, null, null),
+        ColumnVector.timestampMicroSecondsFromBoxedLongs(1000L, 3000L, 1000L, null))) { input =>
+      val l = boundRef(0, TimestampType)
+      val r = boundRef(1, TimestampType)
+      checkBoolExprs(input, Array[DataType](TimestampType, TimestampType), Seq(
+        GpuEqualTo(l, r), GpuEqualNullSafe(l, r), GpuLessThan(l, r), GpuGreaterThan(l, r)))
+    }
+
+    // Decimal32 and Decimal128 comparisons
+    val dec32 = DecimalType(9, 2)
+    withResource(gpuTable(
+        ColumnVector.decimalFromBoxedInts(-2, -100, 100, null, null),
+        ColumnVector.decimalFromBoxedInts(-2, -100, 200, 100, null))) { input =>
+      val l = boundRef(0, dec32)
+      val r = boundRef(1, dec32)
+      checkBoolExprs(input, Array[DataType](dec32, dec32), Seq(
+        GpuEqualTo(l, r), GpuEqualNullSafe(l, r), GpuLessThan(l, r), GpuGreaterThanOrEqual(l, r)))
+    }
+    val dec128 = DecimalType(25, 2)
+    withResource(gpuTable(
+        withResource(ColumnVector.decimalFromBoxedLongs(-2, -100L, 100L, null, null))(
+          _.castTo(DType.create(DType.DTypeEnum.DECIMAL128, -2))),
+        withResource(ColumnVector.decimalFromBoxedLongs(-2, -100L, 200L, 100L, null))(
+          _.castTo(DType.create(DType.DTypeEnum.DECIMAL128, -2))))) { input =>
+      val l = boundRef(0, dec128)
+      val r = boundRef(1, dec128)
+      checkBoolExprs(input, Array[DataType](dec128, dec128), Seq(
+        GpuEqualTo(l, r), GpuEqualNullSafe(l, r), GpuLessThan(l, r), GpuGreaterThanOrEqual(l, r)))
     }
   }
 }

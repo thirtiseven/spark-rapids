@@ -180,6 +180,12 @@ abstract class CudfBinaryComparison extends CudfBinaryOperator with Predicate {
   def hasFloatingPointInputs: Boolean = left.dataType == FloatType || left.dataType == DoubleType ||
     right.dataType == FloatType || right.dataType == DoubleType
 
+  // Exclude Float/Double because Spark uses total ordering for NaN while cuDF AST uses IEEE NaN.
+  override protected def astJitCompatible: Boolean =
+    left.dataType == right.dataType &&
+      !hasFloatingPointInputs &&
+      GpuAstJitExpression.isSupportedDataType(left.dataType)
+
   def evaluateAndFixFloatingPointResult(
     result: => ColumnVector,
     lhsNanPredicate: => BinaryOperable with AutoCloseable,
@@ -223,6 +229,7 @@ case class GpuEqualTo(left: Expression, right: Expression) extends CudfBinaryCom
   override def symbol: String = "="
   override def outputTypeOverride: DType = DType.BOOL8
   override def binaryOp: BinaryOp = BinaryOp.EQUAL
+  override def astOperator: Option[BinaryOperator] = Some(ast.BinaryOperator.EQUAL)
 
   override def doColumnar(lhs: GpuColumnVector, rhs: GpuColumnVector): ColumnVector = {
     evaluateAndFixFloatingPointResult(super.doColumnar(lhs, rhs), lhs.getBase.isNan,
@@ -257,6 +264,10 @@ case class GpuEqualNullSafe(left: Expression, right: Expression) extends CudfBin
   override def nullable: Boolean = false
   override def outputTypeOverride: DType = DType.BOOL8
   override def binaryOp: BinaryOp = BinaryOp.NULL_EQUALS
+  override def astOperator: Option[BinaryOperator] = Some(ast.BinaryOperator.NULL_EQUAL)
+
+  override def selfConvertsToAst: Boolean =
+    !hasFloatingPointInputs && left.dataType == right.dataType
 
   override def doColumnar(lhs: GpuColumnVector, rhs: GpuColumnVector): ColumnVector = {
     evaluateAndFixFloatingPointResult(super.doColumnar(lhs, rhs), lhs.getBase.isNan,

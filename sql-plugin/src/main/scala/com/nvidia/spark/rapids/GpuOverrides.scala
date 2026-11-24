@@ -916,7 +916,11 @@ object GpuOverrides extends Logging {
       CSVScanRuleMeta),
     GpuOverrides.scan[JsonScan](
       "Json parsing",
-      JsonScanRuleMeta)).map(r => (r.getClassFor.asSubclass(classOf[Scan]), r)).toMap
+      JsonScanRuleMeta),
+    GpuOverrides.scan[com.nvidia.spark.rapids.lenc.LencScan](
+      "Lightweight GPU columnar (.lenc) scan",
+      com.nvidia.spark.rapids.lenc.LencScanRuleMeta))
+      .map(r => (r.getClassFor.asSubclass(classOf[Scan]), r)).toMap
 
   lazy val scans: Map[Class[_ <: Scan], ScanRule[_ <: Scan]] =
     commonScans ++ SparkShimImpl.getScans ++ ExternalSource.getScans

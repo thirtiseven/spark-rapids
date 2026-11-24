@@ -125,12 +125,9 @@ case class GpuAnd(left: Expression, right: Expression) extends CudfBinaryPredica
   override def binaryOp: BinaryOp = BinaryOp.NULL_LOGICAL_AND
   override def astOperator: Option[BinaryOperator] = Some(ast.BinaryOperator.NULL_LOGICAL_AND)
 
-  // cuDF row_ir evaluates both operands eagerly, so keep side-effecting RHS on the regular path.
+  // Lazy NULL_LOGICAL_AND/OR evaluation in cuDF row_ir (NVIDIA/cudf#24885) allows side-effecting RHS.
   override protected def astJitCompatible: Boolean =
-    left.dataType == BooleanType && right.dataType == BooleanType && (right match {
-      case gpu: GpuExpression => !gpu.hasSideEffects
-      case _ => true
-    })
+    left.dataType == BooleanType && right.dataType == BooleanType
 
   override def shortCircuitVal: Boolean = false
 
@@ -150,12 +147,9 @@ case class GpuOr(left: Expression, right: Expression) extends CudfBinaryPredicat
   override def binaryOp: BinaryOp = BinaryOp.NULL_LOGICAL_OR
   override def astOperator: Option[BinaryOperator] = Some(ast.BinaryOperator.NULL_LOGICAL_OR)
 
-  // cuDF row_ir evaluates both operands eagerly, so keep side-effecting RHS on the regular path.
+  // Lazy NULL_LOGICAL_AND/OR evaluation in cuDF row_ir (NVIDIA/cudf#24885) allows side-effecting RHS.
   override protected def astJitCompatible: Boolean =
-    left.dataType == BooleanType && right.dataType == BooleanType && (right match {
-      case gpu: GpuExpression => !gpu.hasSideEffects
-      case _ => true
-    })
+    left.dataType == BooleanType && right.dataType == BooleanType
 
   override def shortCircuitVal: Boolean = true
 

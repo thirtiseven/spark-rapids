@@ -314,13 +314,11 @@ case class GpuIf(
 
   override def sql: String = s"(IF(${predicateExpr.sql}, ${trueExpr.sql}, ${falseExpr.sql}))"
 
-  // cuDF row_ir evaluates both branches eagerly, so exclude branches with side effects.
+  // Lazy IF_ELSE evaluation in cuDF row_ir (NVIDIA/cudf#24885) allows side-effecting branches.
   override def selfSupportsAstJit: Boolean =
     GpuAstJitExpression.isSupportedDataType(dataType) &&
       predicateExpr.dataType == BooleanType &&
-      trueExpr.dataType == dataType && falseExpr.dataType == dataType &&
-      !GpuConditionalExpression.exprHasSideEffects(trueExpr) &&
-      !GpuConditionalExpression.exprHasSideEffects(falseExpr)
+      trueExpr.dataType == dataType && falseExpr.dataType == dataType
 
   override def selfIsAstJitOperator: Boolean = selfSupportsAstJit
 
@@ -363,18 +361,14 @@ case class GpuCaseWhen(
     isCaseWhenFusionSupportedType(inputTypesForMerging.head) &&
     (branches.map(_._2) ++ elseValue).forall(_.isInstanceOf[GpuLiteral])
 
-  // cuDF row_ir evaluates all branch conditions and values eagerly, so exclude any side effects.
+  // Lazy IF_ELSE evaluation in cuDF row_ir (NVIDIA/cudf#24885) allows side-effecting branches.
   override def selfSupportsAstJit: Boolean =
     branches.nonEmpty &&
       GpuAstJitExpression.isSupportedDataType(dataType) &&
       branches.forall { case (cond, value) =>
-        cond.dataType == BooleanType && value.dataType == dataType &&
-          !GpuConditionalExpression.exprHasSideEffects(cond) &&
-          !GpuConditionalExpression.exprHasSideEffects(value)
+        cond.dataType == BooleanType && value.dataType == dataType
       } &&
-      elseValue.forall { ev =>
-        ev.dataType == dataType && !GpuConditionalExpression.exprHasSideEffects(ev)
-      }
+      elseValue.forall(_.dataType == dataType)
 
   override def selfIsAstJitOperator: Boolean = selfSupportsAstJit
 

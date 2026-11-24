@@ -203,8 +203,9 @@ case class GpuUnaryMinus(child: Expression, failOnError: Boolean) extends GpuUna
   override def sql: String = s"(- ${child.sql})"
 
   override def selfSupportsAstJit: Boolean =
-    dataType.isInstanceOf[IntegralType] &&
-      (!failOnError || RapidsConf.PROJECT_AST_JIT_ANSI_ENABLED.get(SQLConf.get))
+    (dataType.isInstanceOf[IntegralType] || dataType == FloatType || dataType == DoubleType) &&
+      (!failOnError || !GpuAnsi.needBasicOpOverflowCheck(dataType) ||
+        RapidsConf.PROJECT_AST_JIT_ANSI_ENABLED.get(SQLConf.get))
 
   override def selfIsAstJitOperator: Boolean = selfSupportsAstJit
 
@@ -308,8 +309,9 @@ case class GpuAbs(child: Expression, failOnError: Boolean) extends CudfUnaryExpr
     !GpuTypeShims.isSupportedYearMonthType(dataType)
 
   override protected def astJitCompatible: Boolean =
-    dataType.isInstanceOf[IntegralType] &&
-      (!failOnError || RapidsConf.PROJECT_AST_JIT_ANSI_ENABLED.get(SQLConf.get))
+    (dataType.isInstanceOf[IntegralType] || dataType == FloatType || dataType == DoubleType) &&
+      (!failOnError || !GpuAnsi.needBasicOpOverflowCheck(dataType) ||
+        RapidsConf.PROJECT_AST_JIT_ANSI_ENABLED.get(SQLConf.get))
 
   override protected def astJitErrorOperator: Option[ast.JitOperator] =
     if (failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType)) {
@@ -360,8 +362,9 @@ abstract class GpuAddBase extends CudfBinaryArithmetic with Serializable {
     !GpuTypeShims.isSupportedYearMonthType(dataType) && !dataType.isInstanceOf[DecimalType]
 
   override protected def astJitCompatible: Boolean =
-    dataType.isInstanceOf[IntegralType] &&
-      (!failOnError || RapidsConf.PROJECT_AST_JIT_ANSI_ENABLED.get(SQLConf.get))
+    (dataType.isInstanceOf[IntegralType] || dataType == FloatType || dataType == DoubleType) &&
+      (!failOnError || !GpuAnsi.needBasicOpOverflowCheck(dataType) ||
+        RapidsConf.PROJECT_AST_JIT_ANSI_ENABLED.get(SQLConf.get))
 
   override protected def astJitErrorOperator: Option[ast.JitOperator] =
     if (failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType)) {
@@ -409,8 +412,9 @@ abstract class GpuSubtractBase extends CudfBinaryArithmetic with Serializable {
     !GpuTypeShims.isSupportedYearMonthType(dataType) && !dataType.isInstanceOf[DecimalType]
 
   override protected def astJitCompatible: Boolean =
-    dataType.isInstanceOf[IntegralType] &&
-      (!failOnError || RapidsConf.PROJECT_AST_JIT_ANSI_ENABLED.get(SQLConf.get))
+    (dataType.isInstanceOf[IntegralType] || dataType == FloatType || dataType == DoubleType) &&
+      (!failOnError || !GpuAnsi.needBasicOpOverflowCheck(dataType) ||
+        RapidsConf.PROJECT_AST_JIT_ANSI_ENABLED.get(SQLConf.get))
 
   override protected def astJitErrorOperator: Option[ast.JitOperator] =
     if (failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType)) {
@@ -789,8 +793,9 @@ case class GpuMultiply(
     !(failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType))
 
   override protected def astJitCompatible: Boolean =
-    dataType.isInstanceOf[IntegralType] &&
-      (!failOnError || RapidsConf.PROJECT_AST_JIT_ANSI_ENABLED.get(SQLConf.get))
+    (dataType.isInstanceOf[IntegralType] || dataType == FloatType || dataType == DoubleType) &&
+      (!failOnError || !GpuAnsi.needBasicOpOverflowCheck(dataType) ||
+        RapidsConf.PROJECT_AST_JIT_ANSI_ENABLED.get(SQLConf.get))
 
   override protected def astJitErrorOperator: Option[ast.JitOperator] =
     if (failOnError && GpuAnsi.needBasicOpOverflowCheck(dataType)) {

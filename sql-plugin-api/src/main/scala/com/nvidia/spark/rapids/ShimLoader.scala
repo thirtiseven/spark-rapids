@@ -387,4 +387,14 @@ object ShimLoader {
       "com.nvidia.spark.rapids.parquet.ParquetCachedBatchSerializer")
   }
 
+  def newLencDataSource(): org.apache.spark.sql.connector.catalog.TableProvider = {
+    ShimReflectionUtils.newInstanceOf(
+      "com.nvidia.spark.rapids.lenc.LencDataSourceImpl")
+  }
+
+  def newLencConverter(): java.util.function.Function[Array[String], java.lang.Long] = {
+    ShimReflectionUtils.newInstanceOf(
+      "com.nvidia.spark.rapids.lenc.LencConverterImpl")
+  }
+
 }

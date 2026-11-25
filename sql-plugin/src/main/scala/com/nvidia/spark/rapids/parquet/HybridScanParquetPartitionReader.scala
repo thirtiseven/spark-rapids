@@ -529,7 +529,8 @@ private[parquet] class HybridScanPipeline(context: HybridScanContext) extends Lo
     expected.zipWithIndex.foreach { case (field, i) =>
       val actual = table.getColumn(i).getType
       val wanted = GpuColumnVector.getNonNestedRapidsType(field.dataType)
-      if (!wanted.equals(actual)) {
+      val isDict32String = actual.equals(DType.DICTIONARY32) && wanted.equals(DType.STRING)
+      if (!wanted.equals(actual) && !isDict32String) {
         throw new IllegalStateException(
           s"Hybrid scan decoded column ${field.name} as $actual but the read schema wants " +
             s"${field.dataType.simpleString} ($wanted)")
@@ -702,10 +703,18 @@ object HybridScanPipeline extends Logging {
    * timestamps, which is what the parquet-mr path asks libcudf for as well.
    */
   private[parquet] def parquetOptions(columnNames: Array[String]): ParquetOptions = {
-    ParquetOptions.builder()
+    val builder = ParquetOptions.builder()
         .withTimeUnit(DType.TIMESTAMP_MICROSECONDS)
         .includeColumn(columnNames: _*)
-        .build()
+    val dict32Set = GpuDictionaryUtils.configuredDict32Cols(
+      org.apache.spark.sql.internal.SQLConf.get)
+    if (dict32Set.nonEmpty) {
+      val matching = columnNames.filter(dict32Set.contains)
+      if (matching.nonEmpty) {
+        builder.withDictionary32Columns(matching: _*)
+      }
+    }
+    builder.build()
   }
 
   /**

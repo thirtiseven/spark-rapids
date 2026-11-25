@@ -433,7 +433,16 @@ private class KudoSerializerInstance(
             for (i <- 0 until numColumns) {
               batch.column(i) match {
                 case gpu: GpuColumnVector =>
-                  val cpu = gpu.copyToHostAsync(Cuda.DEFAULT_STREAM)
+                  val src = if (gpu.getBase.getType == ai.rapids.cudf.DType.DICTIONARY32) {
+                    val dec = GpuColumnVector.from(
+                      com.nvidia.spark.rapids.jni.LencNative.decodeDictionary(gpu.getBase),
+                      gpu.dataType())
+                    toClose += dec
+                    dec
+                  } else {
+                    gpu
+                  }
+                  val cpu = src.copyToHostAsync(Cuda.DEFAULT_STREAM)
                   toClose += cpu
                   columns(i) = cpu.getBase
                 case cpu: RapidsHostColumnVector =>

@@ -125,6 +125,7 @@ case class GpuParquetScan(
   override def isSplitable(path: Path): Boolean = true
 
   override def createReaderFactory(): PartitionReaderFactory = observed {
+    GpuDictionaryUtils.updateDriverDict32Cols(sparkSession.sessionState.conf)
     val broadcastedConf = sparkSession.sparkContext.broadcast(
       new SerializableConfiguration(hadoopConf))
 
@@ -2597,6 +2598,15 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       clippedSchema.getFields.asScala.exists(_.getName.contains("."))
     if (!hasDottedName) {
       builder.includeColumn(includeColumns: _*)
+    }
+    val dict32Set = GpuDictionaryUtils.configuredDict32Cols(SQLConf.get)
+    if (dict32Set.nonEmpty) {
+      val matching = readDataSchema.fields
+        .filter(f => f.dataType == StringType && dict32Set.contains(f.name))
+        .map(_.name)
+      if (matching.nonEmpty) {
+        builder.withDictionary32Columns(matching: _*)
+      }
     }
     builder.build()
   }

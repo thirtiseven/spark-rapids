@@ -318,8 +318,10 @@ class ColumnarToRowIterator(batches: Iterator[ColumnarBatch],
         cb = withRetryNoSplit(sDevCb) { _ =>
           withResource(sDevCb.getColumnarBatch()) { devCb =>
             NvtxIdWithMetrics(NvtxRegistry.COLUMNAR_TO_ROW_BATCH, opTime) {
-              new ColumnarBatch(GpuColumnVector.extractColumns(devCb).safeMap(toHost),
-                devCb.numRows())
+              GpuDictionaryUtils.withDecodedBatch(devCb) { decodedCb =>
+                new ColumnarBatch(GpuColumnVector.extractColumns(decodedCb).safeMap(toHost),
+                  decodedCb.numRows())
+              }
             }
           }
         }

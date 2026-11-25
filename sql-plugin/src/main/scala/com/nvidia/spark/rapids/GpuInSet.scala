@@ -65,7 +65,21 @@ case class GpuInSet(
         ColumnVector.fromScalar(falseS, haystack.getRowCount.toInt)
       }
     } else {
-      val ret = withResource(buildNeedles)(haystack.getBase.contains)
+      val ret = if (haystack.getBase.getType == DType.DICTIONARY32 &&
+          child.dataType == org.apache.spark.sql.types.StringType) {
+        val lits = list.collect { case s: org.apache.spark.unsafe.types.UTF8String =>
+          s.toString
+        }.distinct.toArray
+        withResource(
+          com.nvidia.spark.rapids.jni.LencNative.remapDictionaryToCanonical(
+            haystack.getBase, lits)) { remapped =>
+          withResource(Scalar.fromInt(0)) { zero =>
+            remapped.greaterOrEqualTo(zero)
+          }
+        }
+      } else {
+        withResource(buildNeedles)(haystack.getBase.contains)
+      }
       if (hasNull) {
         // replace all the "false" rows (excluding rows for "NaN") with "null"s
         // to follow the CPU behavior.
@@ -122,7 +136,7 @@ case class GpuInSet(
 }
 
 object GpuInSet {
-  private val MAX_AST_JIT_INSET_SIZE = 16
+  private val MAX_AST_JIT_INSET_SIZE = 64
 
   private def isLegacyNullInEmptyBehavior: Boolean = {
     try {

@@ -800,6 +800,9 @@ public class GpuColumnVector extends GpuColumnVectorBase {
       return hasVariantPhysicalLayout(cv);
     }
     if (!dt.isNestedType()) {
+      if (dt.equals(DType.DICTIONARY32) && colType instanceof StringType) {
+        return true;
+      }
       return getNonNestedRapidsType(colType).equals(dt);
     }
     if (colType instanceof MapType) {

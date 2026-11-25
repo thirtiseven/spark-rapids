@@ -72,13 +72,13 @@ trait GpuProjectAstExpressionBase
     toClose.safeClose()
   }
 
-  override final def columnarEval(batch: ColumnarBatch): GpuColumnVector = {
+  override def columnarEval(batch: ColumnarBatch): GpuColumnVector = {
     withResource(GpuProjectAstExpressionBase.tableFromBatch(batch)) { table =>
       computeColumn(table)
     }
   }
 
-  private[rapids] final def computeColumn(table: Table): GpuColumnVector = {
+  private[rapids] def computeColumn(table: Table): GpuColumnVector = {
     val compiled = getCompiledExpression
     withComputeMetrics(table.getRowCount) {
       closeOnExcept(compiled.computeColumn(table)) { result =>

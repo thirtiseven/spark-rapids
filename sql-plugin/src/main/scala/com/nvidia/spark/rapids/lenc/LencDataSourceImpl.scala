@@ -197,10 +197,21 @@ case class GpuLencScan(
       case None =>
         (-1, requiredSchema.fieldNames.map(nameToIdx))
     }
+    val dict32Set = GpuDictionaryUtils.updateDriverDict32Cols(
+      org.apache.spark.sql.internal.SQLConf.get)
+    val dict32Mask: Array[Byte] = if (fusedKind >= 0 || dict32Set.isEmpty) {
+      null
+    } else {
+      val mask = requiredSchema.fields.map { f =>
+        if (f.dataType == StringType && dict32Set.contains(f.name)) 1.toByte else 0.toByte
+      }
+      if (mask.exists(_ != 0)) mask else null
+    }
     GpuLencPartitionReaderFactory(
       requiredSchema,
       projectedIndices,
       fusedKind,
+      dict32Mask,
       metrics)
   }
 }
@@ -209,6 +220,7 @@ case class GpuLencPartitionReaderFactory(
     readSchema: StructType,
     projectedIndices: Array[Int],
     fusedKind: Int,
+    dict32Mask: Array[Byte],
     metrics: Map[String, GpuMetric]) extends PartitionReaderFactory {
 
   override def supportColumnarReads(partition: InputPartition): Boolean = true
@@ -218,7 +230,8 @@ case class GpuLencPartitionReaderFactory(
 
   override def createColumnarReader(partition: InputPartition): PartitionReader[ColumnarBatch] = {
     val lp = partition.asInstanceOf[LencInputPartition]
-    new GpuLencPartitionReader(lp.filePaths, readSchema, projectedIndices, fusedKind, metrics)
+    new GpuLencPartitionReader(
+      lp.filePaths, readSchema, projectedIndices, fusedKind, dict32Mask, metrics)
   }
 }
 
@@ -227,6 +240,7 @@ class GpuLencPartitionReader(
     readSchema: StructType,
     projectedIndices: Array[Int],
     fusedKind: Int,
+    dict32Mask: Array[Byte],
     metrics: Map[String, GpuMetric]) extends PartitionReader[ColumnarBatch] {
 
   private var idx: Int = 0
@@ -269,7 +283,7 @@ class GpuLencPartitionReader(
             if (fusedKind >= 0) {
               plan.decodeAndEvalFused(hb, fusedKind, 0L)
             } else {
-              plan.decodeFromHost(hb, null)
+              plan.decodeFromHost(hb, dict32Mask)
             }
           }
           withResource(table) { t =>

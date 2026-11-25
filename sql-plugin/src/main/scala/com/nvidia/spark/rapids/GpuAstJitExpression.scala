@@ -217,10 +217,42 @@ object GpuAstJitExpression extends Logging {
     require(expressions.nonEmpty, "AST JIT requires at least one expression")
     val owner = expressions.head
     def runJit(): ColumnarBatch = {
-      val program = owner.getJitProgram(expressions, table)
-      owner.withComputeMetrics(table.getRowCount) {
-        withResource(program.computeTable(table)) { result =>
-          GpuColumnVector.from(result, expressions.map(_.dataType).toArray)
+      val group = JitProgramGroup(expressions)
+      withResource(GpuDictAwareAstJit.prepare(expressions, group.referencedOrdinals, table)) { prep =>
+        val evalTable = prep.evalTable
+        val rewritten = prep.rewrittenChildren
+        val usePool = GpuDictionaryUtils.programPoolEnabled()
+        if (usePool || prep.ownsTable) {
+          val schemaCols = group.referencedOrdinals.map { ord =>
+            val col = evalTable.getColumn(ord)
+            GpuAstJitProgramPool.SchemaCol(ord, col.getType, col.hasValidityVector)
+          }
+          val poolKey = GpuAstJitProgramPool.PoolKey(rewritten, schemaCols)
+          val (outBatch, hit) = GpuAstJitProgramPool.withProgram(poolKey, {
+            owner.recordBuildAttempt()
+            owner.withBuildMetrics {
+              withResource(rewritten.safeMap(_.convertToAst(Int.MaxValue).compileJit())) { compiled =>
+                AstJitProgram.compile(evalTable, compiled: _*)
+              }
+            }
+          }) { program =>
+            owner.withComputeMetrics(evalTable.getRowCount) {
+              withResource(program.computeTable(evalTable)) { result =>
+                GpuColumnVector.from(result, expressions.map(_.dataType).toArray)
+              }
+            }
+          }
+          if (hit) {
+            owner.recordCacheHit()
+          }
+          outBatch
+        } else {
+          val program = owner.getJitProgram(expressions, evalTable)
+          owner.withComputeMetrics(evalTable.getRowCount) {
+            withResource(program.computeTable(evalTable)) { result =>
+              GpuColumnVector.from(result, expressions.map(_.dataType).toArray)
+            }
+          }
         }
       }
     }
@@ -238,8 +270,10 @@ object GpuAstJitExpression extends Logging {
     } catch {
       case jitError: CudfException if !jitError.isInstanceOf[CudfColumnSizeOverflowException] =>
         val regular = try {
-          val columns = expressions.safeMap(_.child.columnarEval(batch))
-          new ColumnarBatch(columns.toArray, batch.numRows())
+          GpuDictionaryUtils.withDecodedBatch(batch) { decodedBatch =>
+            val columns = expressions.safeMap(_.child.columnarEval(decodedBatch))
+            new ColumnarBatch(columns.toArray, decodedBatch.numRows())
+          }
         } catch {
           case regularError: Throwable =>
             regularError.addSuppressed(jitError)
@@ -406,6 +440,32 @@ case class GpuAstJitExpression(
     evalAttempts = metrics.getOrElse(AST_JIT_EVAL_ATTEMPTS, NoopMetric)
     evalRows = metrics.getOrElse(AST_JIT_EVAL_ROWS, NoopMetric)
     evalTime = metrics.getOrElse(AST_JIT_EVAL_TIME, NoopMetric)
+  }
+
+  private[rapids] def recordBuildAttempt(): Unit = {
+    programBuildAttempts += 1
+  }
+
+  private[rapids] def recordCacheHit(): Unit = {
+    programCacheHits += 1
+  }
+
+  private[rapids] def withBuildMetrics[T](body: => T): T = {
+    programBuildTime.ns { withCompileMetrics(body) }
+  }
+
+  override def columnarEval(batch: ColumnarBatch): GpuColumnVector = {
+    withResource(GpuProjectAstExpressionBase.tableFromBatch(batch)) { table =>
+      withResource(GpuAstJitExpression.computeColumns(Seq(this), table, Some(batch))) { out =>
+        out.column(0).asInstanceOf[GpuColumnVector].incRefCount()
+      }
+    }
+  }
+
+  override private[rapids] def computeColumn(table: Table): GpuColumnVector = {
+    withResource(GpuAstJitExpression.computeColumns(Seq(this), table, None)) { out =>
+      out.column(0).asInstanceOf[GpuColumnVector].incRefCount()
+    }
   }
 
   override private[rapids] def withComputeMetrics[T](rows: Long)(body: => T): T = {

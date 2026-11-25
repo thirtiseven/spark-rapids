@@ -486,7 +486,9 @@ case class GpuAstJitExpression(
   protected def compileJitProgram(
       table: Table,
       expressions: Array[CompiledExpression]): AstJitProgram = {
-    AstJitProgram.compile(table, expressions: _*)
+    val p = AstJitProgram.compile(table, expressions: _*)
+    p.noWarnLeakExpected()
+    p
   }
 
   private[rapids] def getJitProgram(

@@ -16,7 +16,6 @@
 
 package org.apache.spark.sql.rapids
 
-import com.nvidia.spark.ParquetCachedBatchSerializer
 import com.nvidia.spark.rapids.{DataFromReplacementRule, ExecChecks, GpuExec, GpuMetric, RapidsConf, RapidsMeta, SparkPlanMeta}
 import com.nvidia.spark.rapids.shims.{InMemoryTableScanExecLikeShim, ShimLeafExecNode}
 
@@ -56,8 +55,8 @@ class InMemoryTableScanMeta(
       willNotWorkOnGpu(msgFormat.format(stringifyTypeAttributeMap(unsupportedTypes)))
     }
     if (!imts.relation.cacheBuilder.serializer
-        .isInstanceOf[com.nvidia.spark.ParquetCachedBatchSerializer]) {
-      willNotWorkOnGpu("ParquetCachedBatchSerializer is not being used")
+        .isInstanceOf[com.nvidia.spark.GpuCachedBatchSerializer]) {
+      willNotWorkOnGpu("GpuCachedBatchSerializer is not being used")
       if (SQLConf.get.getConf(StaticSQLConf.SPARK_CACHE_SERIALIZER)
           .equals("com.nvidia.spark.ParquetCachedBatchSerializer")) {
         throw new IllegalStateException("Cache serializer failed to load! " +
@@ -101,7 +100,7 @@ case class GpuInMemoryTableScanExec(
   private lazy val columnarInputRDD: RDD[ColumnarBatch] = {
     val numOutputRows = gpuLongMetric(GpuMetric.NUM_OUTPUT_ROWS)
     val buffers = filteredCachedBatches()
-    relation.cacheBuilder.serializer.asInstanceOf[ParquetCachedBatchSerializer]
+    relation.cacheBuilder.serializer.asInstanceOf[com.nvidia.spark.GpuCachedBatchSerializer]
       .gpuConvertCachedBatchToColumnarBatch(
         buffers,
         relation.output,

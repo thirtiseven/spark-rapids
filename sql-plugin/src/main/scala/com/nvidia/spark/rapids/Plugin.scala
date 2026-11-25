@@ -815,13 +815,12 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
     // as other hooks will close some resources.
 
     if (MemoryCleaner.configuredDefaultShutdownHook) {
-      // Shutdown hooks are executed concurrently in JVM, and there is no execution order guarantee.
-      // See the doc of `Runtime.addShutdownHook`.
-      // Here we should wait Spark hooks to be done, or a false leak will be detected.
-      // See issue: https://github.com/NVIDIA/spark-rapids/issues/5854
-      //
-      // Here use `Spark ShutdownHookManager` to manage hooks with priority.
-      // 20 priority is small enough, will run after Spark hooks.
+      // Clear executor-level AstJitProgram pool at priority 30 BEFORE MemoryCleaner's leak check (20).
+      TrampolineUtil.addShutdownHook(30, new Runnable {
+        override def run(): Unit = {
+          GpuAstJitProgramPool.clear()
+        }
+      })
       TrampolineUtil.addShutdownHook(20, MemoryCleaner.removeDefaultShutdownHook())
     }
   }

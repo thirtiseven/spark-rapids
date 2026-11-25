@@ -387,6 +387,11 @@ object ShimLoader {
       "com.nvidia.spark.rapids.parquet.ParquetCachedBatchSerializer")
   }
 
+  def newLightweightCachedBatchSerializer(): GpuCachedBatchSerializer = {
+    ShimReflectionUtils.newInstanceOf(
+      "com.nvidia.spark.rapids.lenc.LightweightCachedBatchSerializerImpl")
+  }
+
   def newVortexDataSource(): org.apache.spark.sql.connector.catalog.TableProvider = {
     ShimReflectionUtils.newInstanceOf(
       "com.nvidia.spark.rapids.vortex.VortexDataSourceImpl")

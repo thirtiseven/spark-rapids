@@ -204,7 +204,7 @@ object GpuAstJitProgramPool {
   private val MAX_PER_KEY = 8
   private val pools = new ConcurrentHashMap[PoolKey, ConcurrentLinkedQueue[AstJitProgram]]()
 
-  Runtime.getRuntime.addShutdownHook(new Thread(() => {
+  def clear(): Unit = {
     val it = pools.values().iterator()
     while (it.hasNext) {
       val q = it.next()
@@ -215,7 +215,9 @@ object GpuAstJitProgramPool {
       }
     }
     pools.clear()
-  }))
+  }
+
+  Runtime.getRuntime.addShutdownHook(new Thread(() => clear()))
 
   def withProgram[T](
       key: PoolKey,
@@ -223,7 +225,13 @@ object GpuAstJitProgramPool {
     val queue = pools.computeIfAbsent(key, _ => new ConcurrentLinkedQueue[AstJitProgram]())
     val existing = queue.poll()
     val hit = existing != null
-    val prog = if (hit) existing else build
+    val prog = if (hit) {
+      existing
+    } else {
+      val p = build
+      p.noWarnLeakExpected()
+      p
+    }
     try {
       (body(prog), hit)
     } finally {

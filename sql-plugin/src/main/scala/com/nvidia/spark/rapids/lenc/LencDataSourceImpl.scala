@@ -320,11 +320,16 @@ case class LencScan(
     files: Array[String],
     fileSizes: Array[Long],
     fusedExpr: Option[String],
-    serConf: SerializableConfiguration) extends Scan with Batch {
+    serConf: SerializableConfiguration) extends Scan with Batch with SupportsReportStatistics {
   override def readSchema(): StructType = requiredSchema
   override def description(): String =
     s"LencScan(files=${files.length}, cols=${requiredSchema.length}, fused=${fusedExpr.getOrElse("none")})"
   override def toBatch: Batch = this
+  override def estimateStatistics(): Statistics = new Statistics {
+    private val sz = math.max(fileSizes.sum, 1L)
+    override def sizeInBytes(): java.util.OptionalLong = java.util.OptionalLong.of(sz)
+    override def numRows(): java.util.OptionalLong = java.util.OptionalLong.empty()
+  }
   override def planInputPartitions(): Array[InputPartition] =
     files.map(f => LencInputPartition(Array(f)))
   override def createReaderFactory(): PartitionReaderFactory = new PartitionReaderFactory {
@@ -344,9 +349,15 @@ case class GpuLencScan(
     files: Array[String],
     fileSizes: Array[Long],
     fusedExpr: Option[String],
-    serConf: SerializableConfiguration) extends GpuScan with Batch {
+    serConf: SerializableConfiguration) extends GpuScan with Batch with SupportsReportStatistics {
 
   override def readSchema(): StructType = requiredSchema
+
+  override def estimateStatistics(): Statistics = new Statistics {
+    private val sz = math.max(fileSizes.sum, 1L)
+    override def sizeInBytes(): java.util.OptionalLong = java.util.OptionalLong.of(sz)
+    override def numRows(): java.util.OptionalLong = java.util.OptionalLong.empty()
+  }
 
   override def description(): String =
     s"GpuLencScan(files=${files.length}, cols=${requiredSchema.length}, fused=${fusedExpr.getOrElse("none")})"

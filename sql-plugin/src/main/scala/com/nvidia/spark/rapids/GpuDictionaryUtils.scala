@@ -102,6 +102,28 @@ object GpuDictionaryUtils {
       }
     }
   }
+
+  /** Decodes any DICTIONARY32 columns into an owned ColumnarBatch and closes `cb`. */
+  def decodeBatchAndClose(cb: ColumnarBatch): ColumnarBatch = {
+    if (!hasDict32(cb)) {
+      cb
+    } else {
+      Arm.withResource(cb) { b =>
+        val cols: Array[org.apache.spark.sql.vectorized.ColumnVector] =
+          (0 until b.numCols()).safeMap { i =>
+            b.column(i) match {
+              case gcv: GpuColumnVector if gcv.getBase.getType == DType.DICTIONARY32 =>
+                GpuColumnVector.from(LencNative.decodeDictionary(gcv.getBase), gcv.dataType())
+                  .asInstanceOf[org.apache.spark.sql.vectorized.ColumnVector]
+              case gcv: GpuColumnVector =>
+                gcv.incRefCount().asInstanceOf[org.apache.spark.sql.vectorized.ColumnVector]
+              case other => other
+            }
+          }.toArray
+        new ColumnarBatch(cols, b.numRows())
+      }
+    }
+  }
 }
 
 /**

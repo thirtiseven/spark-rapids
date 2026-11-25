@@ -174,10 +174,9 @@ abstract class CudfBinaryComparison extends CudfBinaryOperator with Predicate {
   def hasFloatingPointInputs: Boolean = left.dataType == FloatType || left.dataType == DoubleType ||
     right.dataType == FloatType || right.dataType == DoubleType
 
-  // Exclude Float/Double because Spark uses total ordering for NaN while cuDF AST uses IEEE NaN.
+  // cuDF AST-JIT enforces Spark ETL NaN semantics (NVIDIA/cudf#25146).
   override protected def astJitCompatible: Boolean =
     left.dataType == right.dataType &&
-      !hasFloatingPointInputs &&
       GpuAstJitExpression.isSupportedDataType(left.dataType)
 
   def evaluateAndFixFloatingPointResult(

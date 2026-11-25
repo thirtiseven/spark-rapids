@@ -25,6 +25,7 @@ import ai.rapids.cudf.{HostMemoryBuffer, ParquetOptions, Table => CudfTable}
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.GpuMetric._
+import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.jni.LencNative
 
 import org.apache.spark.TaskContext
@@ -184,8 +185,7 @@ case class GpuLencScan(
   override def toBatch: Batch = this
 
   override def planInputPartitions(): Array[InputPartition] = {
-    // 1 file per partition (32 files -> 32 partitions, matching Spark Parquet partitions)
-    files.map(f => LencInputPartition(Array(f)))
+    LencPartitionHelper.groupFiles(files).map(LencInputPartition)
   }
 
   override def createReaderFactory(): PartitionReaderFactory = {
@@ -243,7 +243,6 @@ class GpuLencPartitionReader(
     dict32Mask: Array[Byte],
     metrics: Map[String, GpuMetric]) extends PartitionReader[ColumnarBatch] {
 
-  private var idx: Int = 0
   private var currentBatch: ColumnarBatch = _
   private val readTypes: Array[DataType] = readSchema.fields.map(_.dataType)
 
@@ -251,33 +250,26 @@ class GpuLencPartitionReader(
   private val bufferTime = metrics.getOrElse(BUFFER_TIME, NoopMetric)
   private val gpuDecodeTime = metrics.getOrElse(GPU_DECODE_TIME, NoopMetric)
   private val numOutputBatches = metrics.getOrElse(NUM_OUTPUT_BATCHES, NoopMetric)
+  private val prefetcher = new LencAsyncPrefetcher(filePaths, projectedIndices)
 
   override def next(): Boolean = {
     if (currentBatch != null) {
       currentBatch.close()
       currentBatch = null
     }
-    if (idx >= filePaths.length) {
+    val itemOpt = opTime.ns {
+      bufferTime.ns {
+        prefetcher.next()
+      }
+    }
+    if (itemOpt.isEmpty) {
       return false
     }
-    val path = filePaths(idx)
-    idx += 1
+    val item = itemOpt.get
 
     opTime.ns {
-      withResource(LencNative.planRead(path, projectedIndices)) { plan =>
-        val totalBytes = plan.totalPackedBytes()
-        // Step 1: Read projected compressed column ranges into Spark's pinned host pool OFF semaphore
-        val hostBuf = bufferTime.ns {
-          val buf = HostMemoryBuffer.allocate(math.max(totalBytes, 64L))
-          closeOnExcept(buf) { b =>
-            if (totalBytes > 0L) {
-              plan.readToHost(path, b)
-            }
-          }
-          buf
-        }
-        // Step 2: Acquire GPU semaphore, H2D + GPU decode (or fused decode+eval) -> GpuColumnVector
-        withResource(hostBuf) { hb =>
+      withResource(item.plan) { plan =>
+        withResource(item.hostBuf) { hb =>
           GpuSemaphore.acquireIfNecessary(TaskContext.get())
           val table = gpuDecodeTime.ns {
             if (fusedKind >= 0) {
@@ -307,6 +299,123 @@ class GpuLencPartitionReader(
       currentBatch.close()
       currentBatch = null
     }
+    prefetcher.close()
+  }
+}
+
+object LencPartitionHelper {
+  def groupFiles(files: Array[String]): Array[Array[String]] = {
+    val maxPartBytes = org.apache.spark.sql.internal.SQLConf.get
+      .getConfString("spark.rapids.sql.lenc.maxPartitionBytes", "268435456").toLong
+    if (files.length <= 64 || maxPartBytes <= 0L) {
+      return files.map(Array(_))
+    }
+    val maxFilesPerPart = 32
+    val groups = new scala.collection.mutable.ArrayBuffer[Array[String]]()
+    val cur = new scala.collection.mutable.ArrayBuffer[String]()
+    var curBytes = 0L
+    files.foreach { f =>
+      val fsz = new File(f).length()
+      if (cur.nonEmpty && (curBytes + fsz > maxPartBytes || cur.size >= maxFilesPerPart)) {
+        groups += cur.toArray
+        cur.clear()
+        curBytes = 0L
+      }
+      cur += f
+      curBytes += fsz
+    }
+    if (cur.nonEmpty) {
+      groups += cur.toArray
+    }
+    groups.toArray
+  }
+}
+
+final case class LencPrefetchedFile(
+    filePath: String,
+    plan: LencNative.ReadPlan,
+    hostBuf: HostMemoryBuffer)
+
+final class LencAsyncPrefetcher(
+    filePaths: Array[String],
+    colIndices: Array[Int]) extends AutoCloseable {
+
+  private var nextSubmitIdx = 0
+  private val useAsync = filePaths.length > 1
+  private val exec: java.util.concurrent.ExecutorService = if (useAsync) {
+    java.util.concurrent.Executors.newSingleThreadExecutor(new java.util.concurrent.ThreadFactory {
+      override def newThread(r: Runnable): Thread = {
+        val t = new Thread(r, "lenc-io-prefetch")
+        t.setDaemon(true)
+        t
+      }
+    })
+  } else null
+
+  private var pending: java.util.concurrent.Future[LencPrefetchedFile] = _
+
+  private def loadSync(path: String): LencPrefetchedFile = {
+    val plan = LencNative.planRead(path, colIndices)
+    closeOnExcept(plan) { p =>
+      val totalBytes = p.totalPackedBytes()
+      val buf = HostMemoryBuffer.allocate(math.max(totalBytes, 64L))
+      closeOnExcept(buf) { b =>
+        if (totalBytes > 0L) {
+          p.readToHost(path, b)
+        }
+        LencPrefetchedFile(path, p, b)
+      }
+    }
+  }
+
+  private def submitNext(): Unit = {
+    if (useAsync && nextSubmitIdx < filePaths.length) {
+      val path = filePaths(nextSubmitIdx)
+      nextSubmitIdx += 1
+      pending = exec.submit(new java.util.concurrent.Callable[LencPrefetchedFile] {
+        override def call(): LencPrefetchedFile = loadSync(path)
+      })
+    }
+  }
+
+  if (useAsync) {
+    submitNext()
+  }
+
+  def next(): Option[LencPrefetchedFile] = {
+    if (!useAsync) {
+      if (nextSubmitIdx >= filePaths.length) {
+        None
+      } else {
+        val path = filePaths(nextSubmitIdx)
+        nextSubmitIdx += 1
+        Some(loadSync(path))
+      }
+    } else if (pending == null) {
+      None
+    } else {
+      val fut = pending
+      pending = null
+      val item = fut.get()
+      submitNext()
+      Some(item)
+    }
+  }
+
+  override def close(): Unit = {
+    if (pending != null) {
+      try {
+        val item = pending.get()
+        item.hostBuf.safeClose()
+        item.plan.safeClose()
+      } catch {
+        case _: Throwable =>
+      }
+      pending = null
+    }
+    if (exec != null) {
+      exec.shutdownNow()
+    }
   }
 }
 
@@ -324,10 +433,32 @@ case class LencScanRuleMeta(
 
 /** Converts a directory of Parquet files directly to .lenc files + _lenc_schema.json on GPU. */
 class LencConverterImpl extends java.util.function.Function[Array[String], java.lang.Long] {
+  private def collectParquetFiles(dir: File): Array[File] = {
+    val buf = new scala.collection.mutable.ArrayBuffer[File]()
+    def walk(f: File): Unit = {
+      val list = f.listFiles()
+      if (list != null) {
+        list.foreach { child =>
+          if (child.isDirectory) {
+            walk(child)
+          } else if (child.isFile && child.getName.endsWith(".parquet")) {
+            buf += child
+          }
+        }
+      }
+    }
+    walk(dir)
+    buf.toArray.sortBy(_.getAbsolutePath)
+  }
+
   override def apply(args: Array[String]): java.lang.Long = {
     val parquetDir = LencSchemaIO.stripFileScheme(args(0))
     val lencDir = LencSchemaIO.stripFileScheme(args(1))
     val schemaJson = args(2)
+    val includeCols: Array[String] =
+      if (args.length >= 4 && args(3).nonEmpty) args(3).split(",") else Array.empty
+    val numThreads: Int =
+      if (args.length >= 5 && args(4).nonEmpty) args(4).toInt else 4
 
     val outDir = new File(lencDir)
     outDir.mkdirs()
@@ -335,19 +466,33 @@ class LencConverterImpl extends java.util.function.Function[Array[String], java.
       Paths.get(lencDir, LencSchemaIO.SCHEMA_FILE),
       schemaJson.getBytes(StandardCharsets.UTF_8))
 
-    val pqFiles = new File(parquetDir).listFiles()
-      .filter(f => f.isFile && f.getName.endsWith(".parquet"))
-      .sortBy(_.getName)
-
-    var totalBytes = 0L
-    val opts = ParquetOptions.DEFAULT
-    pqFiles.zipWithIndex.foreach { case (pqFile, i) =>
-      val outPath = new File(outDir, f"part-$i%05d.lenc")
-      withResource(CudfTable.readParquet(opts, pqFile)) { table =>
-        LencNative.writeTable(table, outPath.getAbsolutePath)
-      }
-      totalBytes += outPath.length()
+    val pqFiles = collectParquetFiles(new File(parquetDir))
+    val optsBuilder = ParquetOptions.builder()
+    if (includeCols.nonEmpty) {
+      optsBuilder.includeColumn(includeCols: _*)
     }
-    java.lang.Long.valueOf(totalBytes)
+    val opts = optsBuilder.build()
+
+    val totalBytes = new java.util.concurrent.atomic.AtomicLong(0L)
+    val pool = java.util.concurrent.Executors.newFixedThreadPool(math.max(1, numThreads))
+    try {
+      val futures = pqFiles.zipWithIndex.map { case (pqFile, i) =>
+        pool.submit(new Runnable {
+          override def run(): Unit = {
+            val outPath = new File(outDir, f"part-$i%05d.lenc")
+            if (!outPath.exists() || outPath.length() == 0L) {
+              withResource(CudfTable.readParquet(opts, pqFile)) { table =>
+                LencNative.writeTable(table, outPath.getAbsolutePath)
+              }
+            }
+            totalBytes.addAndGet(outPath.length())
+          }
+        })
+      }
+      futures.foreach(_.get())
+    } finally {
+      pool.shutdown()
+    }
+    java.lang.Long.valueOf(totalBytes.get())
   }
 }

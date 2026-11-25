@@ -272,11 +272,27 @@ trait GpuPartitioning extends Partitioning {
 
   def sliceInternalGpuOrCpuAndClose(numRows: Int, partitionIndexes: Array[Int],
       partitionColumns: Array[GpuColumnVector]): Array[(ColumnarBatch, Int)] = {
+    val decodedCols = if (partitionColumns.exists(
+        _.getBase.getType == ai.rapids.cudf.DType.DICTIONARY32)) {
+      withResource(partitionColumns) { cols =>
+        cols.safeMap { col =>
+          if (col.getBase.getType == ai.rapids.cudf.DType.DICTIONARY32) {
+            GpuColumnVector.from(
+              com.nvidia.spark.rapids.jni.LencNative.decodeDictionary(col.getBase),
+              col.dataType())
+          } else {
+            col.incRefCount()
+          }
+        }
+      }
+    } else {
+      partitionColumns
+    }
     // Both GPU slicers build a cuDF Table, which cannot hold a rows-only batch. The CPU
     // slicer cuts one by row count, and every shuffle writer accepts its zero-column slices.
-    val rowsOnly = partitionColumns.isEmpty
+    val rowsOnly = decodedCols.isEmpty
     if (usesKudoGPUSlicing && !rowsOnly) {
-      sliceAndSerializeOnGpu(numRows, partitionIndexes, partitionColumns)
+      sliceAndSerializeOnGpu(numRows, partitionIndexes, decodedCols)
     } else {
       val sliceOnGpu = usesGPUShuffle && !rowsOnly
       val nvtxId = if (sliceOnGpu) {
@@ -288,10 +304,10 @@ trait GpuPartitioning extends Partitioning {
       // for large number of small splits.
       nvtxId {
         if (sliceOnGpu) {
-          val tmp = sliceInternalOnGpuAndClose(numRows, partitionIndexes, partitionColumns)
+          val tmp = sliceInternalOnGpuAndClose(numRows, partitionIndexes, decodedCols)
           tmp.zipWithIndex.filter(_._1 != null)
         } else {
-          sliceInternalOnCpuAndClose(numRows, partitionIndexes, partitionColumns)
+          sliceInternalOnCpuAndClose(numRows, partitionIndexes, decodedCols)
         }
       }
     }

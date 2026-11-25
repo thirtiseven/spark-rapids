@@ -1378,8 +1378,10 @@ case class GpuFilterExecMeta(
   rule: DataFromReplacementRule
 ) extends SparkPlanMeta[FilterExec](filter, conf, parentMetaOpt, rule) {
   override def convertToGpu(): GpuExec = {
-    GpuFilterExec(childExprs.head.convertToGpu(),
-      childPlans.head.convertIfNeeded())()
+    val gpuCond = childExprs.head.convertToGpu()
+    val gpuChild = childPlans.head.convertIfNeeded()
+    com.nvidia.spark.rapids.lenc.LencLtoFusion.tryFuseFilter(gpuCond, gpuChild)
+      .getOrElse(GpuFilterExec(gpuCond, gpuChild)())
   }
 }
 

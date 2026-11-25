@@ -98,8 +98,9 @@ abstract class GpuHashPartitioningBase(expressions: Seq[Expression], numPartitio
 
   private def partitionColumnsAndClose(
       batch: ColumnarBatch): (Array[Int], Array[GpuColumnVector]) = {
-    val types = GpuColumnVector.extractTypes(batch)
-    val partedTable = hashPartitionAndClose(batch, numPartitions, NvtxRegistry.CALCULATE_PART)
+    val prepared = GpuDictionaryUtils.decodeBatchAndClose(batch)
+    val types = GpuColumnVector.extractTypes(prepared)
+    val partedTable = hashPartitionAndClose(prepared, numPartitions, NvtxRegistry.CALCULATE_PART)
     withResource(partedTable) { partedTable =>
       // Table.partition() returns numPartitions + 1 elements (last is total row count),
       // but downstream code expects numPartitions elements, so drop the last one

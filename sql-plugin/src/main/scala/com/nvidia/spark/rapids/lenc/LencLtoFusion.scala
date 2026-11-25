@@ -39,7 +39,7 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
 
 /**
  * AST leaf expression representing an inlineable LTO-IR .lenc column decoder UDF call
- * (`cudf::ast::jit::call` to `lenc_decode_*`), aligned with NVIDIA/cudf#24869.
+ * (`cudf::ast::jit::call` to `lenc_decode_*_sK`), aligned with NVIDIA/cudf#24869.
  */
 case class GpuLencDecodeLeaf(
     slot: Int,
@@ -60,7 +60,7 @@ case class GpuLencDecodeLeaf(
   override def columnarEval(batch: ColumnarBatch): GpuColumnVector =
     throw new UnsupportedOperationException("GpuLencDecodeLeaf is only for LTO AST-JIT")
 
-  override def toString: String = s"$symbol(slot=$slot)"
+  override def toString: String = s"${symbol}_s$slot()"
 }
 
 /** Executor-level thread-safe pool of compiled LTO Decode-in-Register + AST-JIT programs. */
@@ -106,6 +106,11 @@ object GpuLencLtoProgramPool {
   }
 }
 
+final case class LtoExprSpec(
+    fileColIndices: Array[Int],
+    compactExprs: Vector[Expression],
+    dictLiteralsPerSlot: Array[Array[String]])
+
 object LencLtoFusion {
   val LTO_FUSION_CONF = "spark.rapids.sql.lenc.ltoFusionEnabled"
 
@@ -115,6 +120,8 @@ object LencLtoFusion {
   private val ENC_RLE_INT: Byte = 2
   private val ENC_RAW_FIXED: Byte = 3
   private val ENC_SCALED_FLOAT_FOR: Byte = 4
+  private val ENC_DELTA_FOR_BITPACK: Byte = 6
+  private val ENC_NVCOMP_LZ4_FIXED: Byte = 8
 
   private val TYPE_INT32: Byte = 0
   private val TYPE_INT64: Byte = 1
@@ -124,7 +131,11 @@ object LencLtoFusion {
   private val TYPE_STRING: Byte = 5
 
   def decodeSymbolAndType(encoding: Byte, colType: Byte): (String, DataType, DType) = {
-    (encoding, colType) match {
+    // DELTA_FOR_BITPACK and NVCOMP_LZ4_FIXED are transparently pre-decoded into raw_ptr in lenc.cu
+    val effEnc =
+      if (encoding == ENC_DELTA_FOR_BITPACK || encoding == ENC_NVCOMP_LZ4_FIXED) ENC_RAW_FIXED
+      else encoding
+    (effEnc, colType) match {
       case (ENC_FOR_BITPACK, TYPE_INT64) => ("lenc_decode_for_i64", LongType, DType.INT64)
       case (ENC_FOR_BITPACK, TYPE_INT32) => ("lenc_decode_for_i32", IntegerType, DType.INT32)
       case (ENC_FOR_BITPACK, TYPE_DATE32) => ("lenc_decode_for_date32", DateType, DType.TIMESTAMP_DAYS)
@@ -135,10 +146,30 @@ object LencLtoFusion {
       case (ENC_DICT_BITPACK, TYPE_STRING) => ("lenc_decode_dict_code", IntegerType, DType.INT32)
       case (ENC_RAW_FIXED, TYPE_INT64) => ("lenc_decode_raw_i64", LongType, DType.INT64)
       case (ENC_RAW_FIXED, TYPE_INT32) => ("lenc_decode_raw_i32", IntegerType, DType.INT32)
+      case (ENC_RAW_FIXED, TYPE_DATE32) => ("lenc_decode_raw_date32", DateType, DType.TIMESTAMP_DAYS)
       case (ENC_RAW_FIXED, TYPE_FLOAT32) => ("lenc_decode_raw_f32", FloatType, DType.FLOAT32)
       case (ENC_RAW_FIXED, TYPE_FLOAT64) => ("lenc_decode_raw_f64", DoubleType, DType.FLOAT64)
       case (e, t) =>
         throw new UnsupportedOperationException(s"Unsupported .lenc LTO (encoding=$e, type=$t)")
+    }
+  }
+
+  def buildLtoProgram(
+      compactExprs: Vector[Expression],
+      encodings: Array[Byte],
+      types: Array[Byte]): LencNative.LtoProgram = {
+    val leafInfo = encodings.indices.map { slot =>
+      decodeSymbolAndType(encodings(slot), types(slot))
+    }
+    val ltoExprs = compactExprs.map { expr =>
+      expr.transformDown {
+        case ref: GpuBoundReference =>
+          val (sym, sparkDt, cudfDt) = leafInfo(ref.ordinal)
+          GpuLencDecodeLeaf(ref.ordinal, sym, sparkDt, cudfDt, ref.nullable)
+      }.asInstanceOf[GpuExpression]
+    }
+    withResource(ltoExprs.safeMap(_.convertToAst(Int.MaxValue).compileJit())) { compiled =>
+      LencNative.compileLtoProgram(compiled: _*)
     }
   }
 
@@ -147,28 +178,15 @@ object LencLtoFusion {
     case other => other
   }
 
-  /**
-   * Automatically fuse `GpuProjectExec(gpuExprs, GpuBatchScanExec(GpuLencScan))` into a single
-   * dynamically LTO-linked Decode-in-Register + AST-JIT scan (`GpuLencLtoScanExec`).
-   */
-  def tryFuse(gpuExprs: Seq[NamedExpression], gpuChild: SparkPlan): Option[GpuExec] = {
-    val enabled = SQLConf.get.getConfString(LTO_FUSION_CONF, "false").toBoolean
-    if (!enabled || gpuExprs.isEmpty) {
-      return None
-    }
-    val lencScan = gpuChild match {
-      case bs: GpuBatchScanExecBase =>
-        bs.scan match {
-          case s: GpuLencScan if s.fusedExpr.isEmpty => s
-          case _ => return None
-        }
-      case _ => return None
-    }
+  private def isSupportedLeafType(dt: DataType): Boolean = dt match {
+    case IntegerType | LongType | FloatType | DoubleType | DateType | StringType => true
+    case _ => false
+  }
 
-    val bound = GpuBindReferences.bindGpuReferences(gpuExprs, gpuChild.output, Map.empty)
-    val unwrapped = bound.map(unwrapAlias)
-
-    // Verify all expressions are AST-JIT eligible and have supported non-string output types
+  private def buildSpec(
+      unwrapped: Seq[Expression],
+      childOutput: Seq[Attribute],
+      fullSchema: StructType): Option[LtoExprSpec] = {
     val allEligible = unwrapped.forall {
       case g: GpuExpression =>
         g.supportsAstJit && g.dataType != StringType &&
@@ -179,19 +197,20 @@ object LencLtoFusion {
       return None
     }
 
-    // Collect distinct referenced input ordinals in gpuChild.output (max 16 slots)
     val refOrds = unwrapped.flatMap(_.collect {
       case ref: GpuBoundReference => ref.ordinal
     }).distinct.sorted
     if (refOrds.isEmpty || refOrds.size > 16) {
       return None
     }
+    if (!refOrds.forall(ord => isSupportedLeafType(childOutput(ord).dataType))) {
+      return None
+    }
 
     val oldOrdToSlot = refOrds.zipWithIndex.toMap
-    val fullNameToIdx = lencScan.fullSchema.fieldNames.zipWithIndex.toMap
-    val fileColIndices = refOrds.map(ord => fullNameToIdx(gpuChild.output(ord).name)).toArray
+    val fullNameToIdx = fullSchema.fieldNames.zipWithIndex.toMap
+    val fileColIndices = refOrds.map(ord => fullNameToIdx(childOutput(ord).name)).toArray
 
-    // Rebind ordinals to compact slots [0 .. K-1]
     var compactExprs: Vector[Expression] = unwrapped.map { e =>
       e.transformDown {
         case ref: GpuBoundReference =>
@@ -200,10 +219,9 @@ object LencLtoFusion {
       }
     }.toVector
 
-    // Rewrite StringType dictionary columns into canonical INT32 code comparisons
     val dictLiteralsPerSlot = Array.fill[Array[String]](refOrds.size)(Array.empty[String])
     refOrds.zipWithIndex.foreach { case (oldOrd, slot) =>
-      if (gpuChild.output(oldOrd).dataType == StringType) {
+      if (childOutput(oldOrd).dataType == StringType) {
         val litSet = mutable.HashSet.empty[String]
         val ok = compactExprs.forall(GpuDictAwareAstJit.collectDictPredicates(_, slot, litSet)) &&
           litSet.nonEmpty
@@ -218,30 +236,97 @@ object LencLtoFusion {
         }
       }
     }
+    Some(LtoExprSpec(fileColIndices, compactExprs, dictLiteralsPerSlot))
+  }
 
-    val outAttrs = gpuExprs.map(_.toAttribute)
-    Some(GpuLencLtoScanExec(
-      outAttrs,
-      lencScan.files,
-      fileColIndices,
-      compactExprs,
-      dictLiteralsPerSlot))
+  /**
+   * Pattern 1: Fuse `GpuFilterExec(gpuCond, GpuBatchScanExec(GpuLencScan))` into
+   * two-stage late-materialized `GpuLencLtoFilterScanExec`.
+   */
+  def tryFuseFilter(gpuCond: Expression, gpuChild: SparkPlan): Option[GpuExec] = {
+    val enabled = SQLConf.get.getConfString(LTO_FUSION_CONF, "false").toBoolean
+    if (!enabled) {
+      return None
+    }
+    val lencScan = gpuChild match {
+      case bs: GpuBatchScanExecBase =>
+        bs.scan match {
+          case s: GpuLencScan if s.fusedExpr.isEmpty => s
+          case _ => return None
+        }
+      case _ => return None
+    }
+    val boundCond = GpuBindReferences.bindGpuReference(gpuCond, gpuChild.output, Map.empty)
+    val filterSpecOpt = buildSpec(Seq(boundCond), gpuChild.output, lencScan.fullSchema)
+    filterSpecOpt.map { filterSpec =>
+      val fullNameToIdx = lencScan.fullSchema.fieldNames.zipWithIndex.toMap
+      val outFileIndices = gpuChild.output.map(a => fullNameToIdx(a.name)).toArray
+      val dict32Set = GpuDictionaryUtils.updateDriverDict32Cols(SQLConf.get)
+      val outDict32Mask: Array[Byte] =
+        if (dict32Set.isEmpty) Array.empty[Byte]
+        else gpuChild.output.map(a =>
+          if (a.dataType == StringType && dict32Set.contains(a.name)) 1.toByte else 0.toByte
+        ).toArray
+      GpuLencLtoFilterScanExec(
+        gpuChild.output,
+        lencScan.fullSchema,
+        lencScan.files,
+        filterSpec,
+        outFileIndices,
+        outDict32Mask)
+    }
+  }
+
+  /**
+   * Pattern 2 & 3:
+   * - `GpuProjectExec(gpuExprs, GpuBatchScanExec(GpuLencScan))` -> `GpuLencLtoScanExec`
+   * - `GpuProjectExec(gpuExprs, GpuLencLtoFilterScanExec)` -> `GpuLencLtoFilterProjectScanExec`
+   */
+  def tryFuse(gpuExprs: Seq[NamedExpression], gpuChild: SparkPlan): Option[GpuExec] = {
+    val enabled = SQLConf.get.getConfString(LTO_FUSION_CONF, "false").toBoolean
+    if (!enabled || gpuExprs.isEmpty) {
+      return None
+    }
+    gpuChild match {
+      case bs: GpuBatchScanExecBase =>
+        bs.scan match {
+          case s: GpuLencScan if s.fusedExpr.isEmpty =>
+            val bound = GpuBindReferences.bindGpuReferences(gpuExprs, gpuChild.output, Map.empty)
+            val unwrapped = bound.map(unwrapAlias)
+            buildSpec(unwrapped, gpuChild.output, s.fullSchema).map { projSpec =>
+              GpuLencLtoScanExec(gpuExprs.map(_.toAttribute), s.files, projSpec)
+            }
+          case _ => None
+        }
+
+      case fscan: GpuLencLtoFilterScanExec =>
+        val bound = GpuBindReferences.bindGpuReferences(gpuExprs, gpuChild.output, Map.empty)
+        val unwrapped = bound.map(unwrapAlias)
+        buildSpec(unwrapped, gpuChild.output, fscan.fullSchema).map { projSpec =>
+          GpuLencLtoFilterProjectScanExec(
+            gpuExprs.map(_.toAttribute),
+            fscan.files,
+            fscan.filterSpec,
+            projSpec)
+        }
+
+      case _ => None
+    }
   }
 }
 
-private case class LencLtoPartition(index: Int, filePath: String) extends Partition
+private case class LencLtoPartition(index: Int, filePaths: Array[String]) extends Partition
 
+/** Pattern 2 RDD: Project(Scan) with async 1-slot prefetch + dynamic LTO Decode-in-Register. */
 private class GpuLencLtoRdd(
     sc: SparkContext,
-    files: Array[String],
-    fileColIndices: Array[Int],
-    compactExprs: Vector[Expression],
-    dictLiteralsPerSlot: Array[Array[String]],
+    fileGroups: Array[Array[String]],
+    projSpec: LtoExprSpec,
     outTypes: Array[DataType],
     metrics: Map[String, GpuMetric]) extends RDD[ColumnarBatch](sc, Nil) {
 
   override protected def getPartitions: Array[Partition] =
-    files.zipWithIndex.map { case (f, i) => LencLtoPartition(i, f) }
+    fileGroups.zipWithIndex.map { case (fs, i) => LencLtoPartition(i, fs) }
 
   override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
     val lp = split.asInstanceOf[LencLtoPartition]
@@ -251,66 +336,215 @@ private class GpuLencLtoRdd(
     val numOutputRows = metrics.getOrElse(NUM_OUTPUT_ROWS, NoopMetric)
     val numOutputBatches = metrics.getOrElse(NUM_OUTPUT_BATCHES, NoopMetric)
 
-    val batch = opTime.ns {
-      withResource(LencNative.planRead(lp.filePath, fileColIndices)) { plan =>
-        val totalBytes = plan.totalPackedBytes()
-        val encodings = plan.columnEncodings()
-        val types = plan.columnTypes()
+    val prefetcher = new LencAsyncPrefetcher(lp.filePaths, projSpec.fileColIndices)
+    if (context != null) {
+      context.addTaskCompletionListener[Unit](_ => prefetcher.close())
+    }
 
-        // Step 1: Read compressed .lenc columns into Spark pinned host pool OFF GPU semaphore
-        val hostBuf = bufferTime.ns {
-          val buf = HostMemoryBuffer.allocate(math.max(totalBytes, 64L))
-          closeOnExcept(buf) { b =>
-            if (totalBytes > 0L) {
-              plan.readToHost(lp.filePath, b)
-            }
-          }
-          buf
-        }
+    new Iterator[ColumnarBatch] {
+      private var nextBatch: ColumnarBatch = _
 
-        // Step 2: Acquire GPU semaphore & run ONE dynamically LTO-linked Decode-in-Register kernel!
-        withResource(hostBuf) { hb =>
-          GpuSemaphore.acquireIfNecessary(TaskContext.get())
-          val table = gpuDecodeTime.ns {
-            val poolKey = GpuLencLtoProgramPool.PoolKey(
-              compactExprs, encodings.toVector, types.toVector)
-            val (tbl, _) = GpuLencLtoProgramPool.withProgram(poolKey, {
-              val leafInfo = encodings.indices.map { slot =>
-                LencLtoFusion.decodeSymbolAndType(encodings(slot), types(slot))
-              }
-              val ltoExprs = compactExprs.map { expr =>
-                expr.transformDown {
-                  case ref: GpuBoundReference =>
-                    val (sym, sparkDt, cudfDt) = leafInfo(ref.ordinal)
-                    GpuLencDecodeLeaf(ref.ordinal, sym, sparkDt, cudfDt, ref.nullable)
-                }.asInstanceOf[GpuExpression]
-              }
-              withResource(ltoExprs.safeMap(_.convertToAst(Int.MaxValue).compileJit())) { compiled =>
-                LencNative.compileLtoProgram(compiled: _*)
-              }
-            }) { prog =>
-              prog.run(plan, hb, dictLiteralsPerSlot)
-            }
-            tbl
+      private def advance(): Unit = {
+        while (nextBatch == null) {
+          val itemOpt = opTime.ns { bufferTime.ns { prefetcher.next() } }
+          if (itemOpt.isEmpty) {
+            prefetcher.close()
+            return
           }
-          withResource(table) { t =>
-            numOutputRows += t.getRowCount
-            numOutputBatches += 1
-            GpuColumnVector.from(t, outTypes)
+          val item = itemOpt.get
+          opTime.ns {
+            withResource(item.plan) { plan =>
+              val encodings = plan.columnEncodings()
+              val types = plan.columnTypes()
+              withResource(item.hostBuf) { hb =>
+                GpuSemaphore.acquireIfNecessary(TaskContext.get())
+                val table = gpuDecodeTime.ns {
+                  val poolKey = GpuLencLtoProgramPool.PoolKey(
+                    projSpec.compactExprs, encodings.toVector, types.toVector)
+                  val (tbl, _) = GpuLencLtoProgramPool.withProgram(
+                    poolKey,
+                    LencLtoFusion.buildLtoProgram(projSpec.compactExprs, encodings, types)) { prog =>
+                    prog.run(plan, hb, projSpec.dictLiteralsPerSlot)
+                  }
+                  tbl
+                }
+                withResource(table) { t =>
+                  numOutputRows += t.getRowCount
+                  numOutputBatches += 1
+                  nextBatch = GpuColumnVector.from(t, outTypes)
+                }
+              }
+            }
           }
         }
       }
+
+      override def hasNext: Boolean = {
+        if (nextBatch == null) advance()
+        nextBatch != null
+      }
+
+      override def next(): ColumnarBatch = {
+        if (!hasNext) throw new NoSuchElementException
+        val ret = nextBatch
+        nextBatch = null
+        ret
+      }
     }
-    Iterator.single(batch)
+  }
+}
+
+/** Pattern 1 & 3 RDD: Two-stage late-materialized Filter(Scan) or Project(Filter(Scan)) via LTO. */
+private class GpuLencLtoFilterRdd(
+    sc: SparkContext,
+    fileGroups: Array[Array[String]],
+    filterSpec: LtoExprSpec,
+    projSpecOpt: Option[LtoExprSpec],
+    outFileIndices: Array[Int],
+    outDict32Mask: Array[Byte],
+    outTypes: Array[DataType],
+    metrics: Map[String, GpuMetric]) extends RDD[ColumnarBatch](sc, Nil) {
+
+  override protected def getPartitions: Array[Partition] =
+    fileGroups.zipWithIndex.map { case (fs, i) => LencLtoPartition(i, fs) }
+
+  override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
+    val lp = split.asInstanceOf[LencLtoPartition]
+    val opTime = metrics.getOrElse(OP_TIME_LEGACY, NoopMetric)
+    val bufferTime = metrics.getOrElse(BUFFER_TIME, NoopMetric)
+    val gpuDecodeTime = metrics.getOrElse(GPU_DECODE_TIME, NoopMetric)
+    val numOutputRows = metrics.getOrElse(NUM_OUTPUT_ROWS, NoopMetric)
+    val numOutputBatches = metrics.getOrElse(NUM_OUTPUT_BATCHES, NoopMetric)
+
+    // Prefetch Stage 1 (filter columns only!) asynchronously OFF the GPU semaphore
+    val prefetcher = new LencAsyncPrefetcher(lp.filePaths, filterSpec.fileColIndices)
+    if (context != null) {
+      context.addTaskCompletionListener[Unit](_ => prefetcher.close())
+    }
+
+    val dict32Arr: Array[Byte] =
+      if (outDict32Mask.nonEmpty && outDict32Mask.exists(_ != 0)) outDict32Mask else null
+
+    new Iterator[ColumnarBatch] {
+      private var nextBatch: ColumnarBatch = _
+
+      private def advance(): Unit = {
+        while (nextBatch == null) {
+          val itemOpt = opTime.ns { bufferTime.ns { prefetcher.next() } }
+          if (itemOpt.isEmpty) {
+            prefetcher.close()
+            return
+          }
+          val item = itemOpt.get
+          opTime.ns {
+            val selectedOpt = withResource(item.plan) { fPlan =>
+              val fEncs = fPlan.columnEncodings()
+              val fTypes = fPlan.columnTypes()
+              withResource(item.hostBuf) { fHb =>
+                GpuSemaphore.acquireIfNecessary(TaskContext.get())
+                gpuDecodeTime.ns {
+                  val fKey = GpuLencLtoProgramPool.PoolKey(
+                    filterSpec.compactExprs, fEncs.toVector, fTypes.toVector)
+                  val (maskTbl, _) = GpuLencLtoProgramPool.withProgram(
+                    fKey,
+                    LencLtoFusion.buildLtoProgram(filterSpec.compactExprs, fEncs, fTypes)) { prog =>
+                    prog.run(fPlan, fHb, filterSpec.dictLiteralsPerSlot)
+                  }
+                  withResource(maskTbl) { mt =>
+                    val sel = LencNative.compactMaskIndices(mt.getColumn(0))
+                    if (sel.getRowCount == 0L) {
+                      sel.close()
+                      None
+                    } else {
+                      Some(sel)
+                    }
+                  }
+                }
+              }
+            }
+
+            // Stage 2: ONLY if >0 rows survived, read & late-materialize payload / LTO project!
+            selectedOpt.foreach { selCol =>
+              withResource(selCol) { sel =>
+                projSpecOpt match {
+                  case Some(pSpec) =>
+                    withResource(LencNative.planRead(item.filePath, pSpec.fileColIndices)) { pPlan =>
+                      val pBytes = pPlan.totalPackedBytes()
+                      val pEncs = pPlan.columnEncodings()
+                      val pTypes = pPlan.columnTypes()
+                      val pBuf = bufferTime.ns {
+                        val b = HostMemoryBuffer.allocate(math.max(pBytes, 64L))
+                        closeOnExcept(b) { buf =>
+                          if (pBytes > 0L) pPlan.readToHost(item.filePath, buf)
+                        }
+                        b
+                      }
+                      withResource(pBuf) { hb =>
+                        val tbl = gpuDecodeTime.ns {
+                          val pKey = GpuLencLtoProgramPool.PoolKey(
+                            pSpec.compactExprs, pEncs.toVector, pTypes.toVector)
+                          val (t, _) = GpuLencLtoProgramPool.withProgram(
+                            pKey,
+                            LencLtoFusion.buildLtoProgram(pSpec.compactExprs, pEncs, pTypes)) { prog =>
+                            prog.runSelected(pPlan, hb, pSpec.dictLiteralsPerSlot, sel)
+                          }
+                          t
+                        }
+                        withResource(tbl) { t =>
+                          numOutputRows += t.getRowCount
+                          numOutputBatches += 1
+                          nextBatch = GpuColumnVector.from(t, outTypes)
+                        }
+                      }
+                    }
+
+                  case None =>
+                    withResource(LencNative.planRead(item.filePath, outFileIndices)) { pPlan =>
+                      val pBytes = pPlan.totalPackedBytes()
+                      val pBuf = bufferTime.ns {
+                        val b = HostMemoryBuffer.allocate(math.max(pBytes, 64L))
+                        closeOnExcept(b) { buf =>
+                          if (pBytes > 0L) pPlan.readToHost(item.filePath, buf)
+                        }
+                        b
+                      }
+                      withResource(pBuf) { hb =>
+                        val tbl = gpuDecodeTime.ns {
+                          pPlan.decodeFromHostSelected(hb, dict32Arr, sel)
+                        }
+                        withResource(tbl) { t =>
+                          numOutputRows += t.getRowCount
+                          numOutputBatches += 1
+                          nextBatch = GpuColumnVector.from(t, outTypes)
+                        }
+                      }
+                    }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      override def hasNext: Boolean = {
+        if (nextBatch == null) advance()
+        nextBatch != null
+      }
+
+      override def next(): ColumnarBatch = {
+        if (!hasNext) throw new NoSuchElementException
+        val ret = nextBatch
+        nextBatch = null
+        ret
+      }
+    }
   }
 }
 
 case class GpuLencLtoScanExec(
     output: Seq[Attribute],
     files: Array[String],
-    fileColIndices: Array[Int],
-    compactExprs: Vector[Expression],
-    dictLiteralsPerSlot: Array[Array[String]]) extends LeafExecNode with GpuExec {
+    projSpec: LtoExprSpec) extends LeafExecNode with GpuExec {
 
   override def supportsColumnar: Boolean = true
 
@@ -325,16 +559,69 @@ case class GpuLencLtoScanExec(
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     val outTypes = output.map(_.dataType).toArray
-    new GpuLencLtoRdd(
-      sparkContext,
-      files,
-      fileColIndices,
-      compactExprs,
-      dictLiteralsPerSlot,
-      outTypes,
-      allMetrics)
+    val groups = LencPartitionHelper.groupFiles(files)
+    new GpuLencLtoRdd(sparkContext, groups, projSpec, outTypes, allMetrics)
   }
 
   override def simpleString(maxFields: Int): String =
-    s"GpuLencLtoScan(files=${files.length}, inCols=${fileColIndices.length}, outCols=${output.length})"
+    s"GpuLencLtoScan(files=${files.length}, inCols=${projSpec.fileColIndices.length}, outCols=${output.length})"
+}
+
+case class GpuLencLtoFilterScanExec(
+    output: Seq[Attribute],
+    fullSchema: StructType,
+    files: Array[String],
+    filterSpec: LtoExprSpec,
+    outFileIndices: Array[Int],
+    outDict32Mask: Array[Byte]) extends LeafExecNode with GpuExec {
+
+  override def supportsColumnar: Boolean = true
+
+  override protected def doExecute(): RDD[org.apache.spark.sql.catalyst.InternalRow] =
+    throw new IllegalStateException("GpuLencLtoFilterScanExec must execute columnar on GPU")
+
+  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
+    GPU_DECODE_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_GPU_DECODE_TIME),
+    BUFFER_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_BUFFER_TIME),
+    OP_TIME_LEGACY -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_OP_TIME_LEGACY)
+  )
+
+  override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
+    val outTypes = output.map(_.dataType).toArray
+    val groups = LencPartitionHelper.groupFiles(files)
+    new GpuLencLtoFilterRdd(
+      sparkContext, groups, filterSpec, None, outFileIndices, outDict32Mask, outTypes, allMetrics)
+  }
+
+  override def simpleString(maxFields: Int): String =
+    s"GpuLencLtoFilterScan(files=${files.length}, filterCols=${filterSpec.fileColIndices.length}, outCols=${output.length})"
+}
+
+case class GpuLencLtoFilterProjectScanExec(
+    output: Seq[Attribute],
+    files: Array[String],
+    filterSpec: LtoExprSpec,
+    projSpec: LtoExprSpec) extends LeafExecNode with GpuExec {
+
+  override def supportsColumnar: Boolean = true
+
+  override protected def doExecute(): RDD[org.apache.spark.sql.catalyst.InternalRow] =
+    throw new IllegalStateException("GpuLencLtoFilterProjectScanExec must execute columnar on GPU")
+
+  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
+    GPU_DECODE_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_GPU_DECODE_TIME),
+    BUFFER_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_BUFFER_TIME),
+    OP_TIME_LEGACY -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_OP_TIME_LEGACY)
+  )
+
+  override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
+    val outTypes = output.map(_.dataType).toArray
+    val groups = LencPartitionHelper.groupFiles(files)
+    new GpuLencLtoFilterRdd(
+      sparkContext, groups, filterSpec, Some(projSpec), Array.emptyIntArray, Array.emptyByteArray,
+      outTypes, allMetrics)
+  }
+
+  override def simpleString(maxFields: Int): String =
+    s"GpuLencLtoFilterProjectScan(files=${files.length}, fCols=${filterSpec.fileColIndices.length}, pCols=${projSpec.fileColIndices.length}, outCols=${output.length})"
 }

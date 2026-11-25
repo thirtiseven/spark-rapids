@@ -1264,6 +1264,7 @@ case class GpuOverrides(sparkSession: SparkSession = null) extends Rule[SparkPla
   // gets called once for each query stage (where a query stage is an `Exchange`).
   override def apply(sparkPlan: SparkPlan): SparkPlan =
     GpuOverrideUtil.withActiveSession(sparkSession) {
+      GpuDictionaryUtils.autoSelectDict32Cols(sparkPlan, SQLConf.get)
       applyWithContext(sparkPlan, None)
     }
 

@@ -20,10 +20,10 @@ import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue}
 
 import scala.collection.mutable
 
-import ai.rapids.cudf.{DType, HostMemoryBuffer}
+import ai.rapids.cudf.DType
 import ai.rapids.cudf.ast
 import com.nvidia.spark.rapids._
-import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
+import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.jni.LencNative
@@ -37,6 +37,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.util.SerializableConfiguration
 
 /**
  * Simple file/chunk-level range predicate extracted from conjunction filters for zero-reconversion
@@ -399,6 +400,8 @@ object LencLtoFusion {
         gpuChild.output,
         lencScan.fullSchema,
         lencScan.files,
+        lencScan.fileSizes,
+        lencScan.serConf,
         filterSpec,
         outFileIndices,
         outDict32Mask)
@@ -417,7 +420,7 @@ object LencLtoFusion {
             val bound = GpuBindReferences.bindGpuReferences(gpuExprs, gpuChild.output, Map.empty)
             val unwrapped = bound.map(unwrapAlias)
             buildSpec(unwrapped, gpuChild.output, s.fullSchema).map { projSpec =>
-              GpuLencLtoScanExec(gpuExprs.map(_.toAttribute), s.files, projSpec)
+              GpuLencLtoScanExec(gpuExprs.map(_.toAttribute), s.files, s.fileSizes, s.serConf, projSpec)
             }
           case _ => None
         }
@@ -428,7 +431,10 @@ object LencLtoFusion {
         buildSpec(unwrapped, gpuChild.output, fscan.fullSchema).map { projSpec =>
           GpuLencLtoFilterProjectScanExec(
             gpuExprs.map(_.toAttribute),
+            fscan.fullSchema,
             fscan.files,
+            fscan.fileSizes,
+            fscan.serConf,
             fscan.filterSpec,
             projSpec)
         }
@@ -444,6 +450,7 @@ private case class LencLtoPartition(index: Int, filePaths: Array[String]) extend
 private class GpuLencLtoRdd(
     sc: SparkContext,
     fileGroups: Array[Array[String]],
+    serConf: SerializableConfiguration,
     projSpec: LtoExprSpec,
     outTypes: Array[DataType],
     metrics: Map[String, GpuMetric]) extends RDD[ColumnarBatch](sc, Nil) {
@@ -459,7 +466,7 @@ private class GpuLencLtoRdd(
     val numOutputRows = metrics.getOrElse(NUM_OUTPUT_ROWS, NoopMetric)
     val numOutputBatches = metrics.getOrElse(NUM_OUTPUT_BATCHES, NoopMetric)
 
-    val prefetcher = new LencAsyncPrefetcher(lp.filePaths, projSpec.fileColIndices)
+    val prefetcher = new LencAsyncPrefetcher(lp.filePaths, projSpec.fileColIndices, Array.empty, serConf)
     if (context != null) {
       context.addTaskCompletionListener[Unit](_ => prefetcher.close())
     }
@@ -530,6 +537,7 @@ private class GpuLencLtoRdd(
 private class GpuLencLtoFilterRdd(
     sc: SparkContext,
     fileGroups: Array[Array[String]],
+    serConf: SerializableConfiguration,
     filterSpec: LtoExprSpec,
     projSpecOpt: Option[LtoExprSpec],
     outFileIndices: Array[Int],
@@ -562,8 +570,13 @@ private class GpuLencLtoFilterRdd(
       val projCmap = stage2FileCols.map(colToUnionSlot)
       val rangePreds = LencRangePruner.extract(
         filterSpec.compactExprs.head, filterSpec.fileColIndices, unionCols)
+      val cpSlots = if (rangePreds.nonEmpty) rangePreds.map(_.planSlot) else null
+      val cpOps = if (rangePreds.nonEmpty) rangePreds.map(_.op) else null
+      val cpIsF = if (rangePreds.nonEmpty) rangePreds.map(r => if (r.isFloat) 1.toByte else 0.toByte) else null
+      val cpIb = if (rangePreds.nonEmpty) rangePreds.map(_.intBound) else null
+      val cpDb = if (rangePreds.nonEmpty) rangePreds.map(_.doubleBound) else null
 
-      val prefetcher = new LencAsyncPrefetcher(lp.filePaths, unionCols, rangePreds)
+      val prefetcher = new LencAsyncPrefetcher(lp.filePaths, unionCols, rangePreds, serConf)
       if (context != null) {
         context.addTaskCompletionListener[Unit](_ => prefetcher.close())
       }
@@ -605,14 +618,16 @@ private class GpuLencLtoFilterRdd(
                             LencNative.runLtoFilterAndProject(
                               fProg, pProg, uPlan, hb,
                               filterCmap, filterSpec.dictLiteralsPerSlot,
-                              projCmap, pSpec.dictLiteralsPerSlot, dict32Arr)
+                              projCmap, pSpec.dictLiteralsPerSlot, dict32Arr,
+                              cpSlots, cpOps, cpIsF, cpIb, cpDb)
                           }
                           Option(t)
                         case None =>
                           Option(LencNative.runLtoFilterAndProject(
                             fProg, null, uPlan, hb,
                             filterCmap, filterSpec.dictLiteralsPerSlot,
-                            projCmap, Array.empty[Array[String]], dict32Arr))
+                            projCmap, Array.empty[Array[String]], dict32Arr,
+                            cpSlots, cpOps, cpIsF, cpIb, cpDb))
                       }
                     }
                     res
@@ -643,10 +658,10 @@ private class GpuLencLtoFilterRdd(
         }
       }
     } else {
-      // Mode B: Two-stage IO-skipping for heavy String payloads (e.g. NF_J0202)
+      // Mode B: Two-stage IO-skipping for heavy String payloads (e.g. NF_J0202) — works on local & S3A!
       val rangePreds = LencRangePruner.extract(
         filterSpec.compactExprs.head, filterSpec.fileColIndices, filterSpec.fileColIndices)
-      val prefetcher = new LencAsyncPrefetcher(lp.filePaths, filterSpec.fileColIndices, rangePreds)
+      val prefetcher = new LencAsyncPrefetcher(lp.filePaths, filterSpec.fileColIndices, rangePreds, serConf)
       if (context != null) {
         context.addTaskCompletionListener[Unit](_ => prefetcher.close())
       }
@@ -691,23 +706,20 @@ private class GpuLencLtoFilterRdd(
 
               selectedOpt.foreach { selCol =>
                 withResource(selCol) { sel =>
-                  withResource(LencNative.planRead(item.filePath, outFileIndices)) { pPlan =>
-                    val pBytes = pPlan.totalPackedBytes()
-                    val pBuf = bufferTime.ns {
-                      val b = HostMemoryBuffer.allocate(math.max(pBytes, 64L))
-                      closeOnExcept(b) { buf =>
-                        if (pBytes > 0L) pPlan.readToHost(item.filePath, buf)
-                      }
-                      b
-                    }
-                    withResource(pBuf) { hb =>
-                      val tbl = gpuDecodeTime.ns {
-                        pPlan.decodeFromHostSelected(hb, dict32Arr, sel)
-                      }
-                      withResource(tbl) { t =>
-                        numOutputRows += t.getRowCount
-                        numOutputBatches += 1
-                        nextBatch = GpuColumnVector.from(t, outTypes)
+                  val pItemOpt = bufferTime.ns {
+                    LencFileIO.loadPlanAndHost(item.filePath, outFileIndices, Array.empty, serConf)
+                  }
+                  pItemOpt.foreach { pItem =>
+                    withResource(pItem.plan) { pPlan =>
+                      withResource(pItem.hostBuf) { hb =>
+                        val tbl = gpuDecodeTime.ns {
+                          pPlan.decodeFromHostSelected(hb, dict32Arr, sel)
+                        }
+                        withResource(tbl) { t =>
+                          numOutputRows += t.getRowCount
+                          numOutputBatches += 1
+                          nextBatch = GpuColumnVector.from(t, outTypes)
+                        }
                       }
                     }
                   }
@@ -736,6 +748,8 @@ private class GpuLencLtoFilterRdd(
 case class GpuLencLtoScanExec(
     output: Seq[Attribute],
     files: Array[String],
+    fileSizes: Array[Long],
+    serConf: SerializableConfiguration,
     projSpec: LtoExprSpec) extends LeafExecNode with GpuExec {
 
   override def supportsColumnar: Boolean = true
@@ -751,8 +765,8 @@ case class GpuLencLtoScanExec(
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     val outTypes = output.map(_.dataType).toArray
-    val groups = LencPartitionHelper.groupFiles(files)
-    new GpuLencLtoRdd(sparkContext, groups, projSpec, outTypes, allMetrics)
+    val groups = LencPartitionHelper.groupFiles(files, fileSizes)
+    new GpuLencLtoRdd(sparkContext, groups, serConf, projSpec, outTypes, allMetrics)
   }
 
   override def simpleString(maxFields: Int): String =
@@ -763,6 +777,8 @@ case class GpuLencLtoFilterScanExec(
     output: Seq[Attribute],
     fullSchema: StructType,
     files: Array[String],
+    fileSizes: Array[Long],
+    serConf: SerializableConfiguration,
     filterSpec: LtoExprSpec,
     outFileIndices: Array[Int],
     outDict32Mask: Array[Byte]) extends LeafExecNode with GpuExec {
@@ -780,9 +796,9 @@ case class GpuLencLtoFilterScanExec(
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     val outTypes = output.map(_.dataType).toArray
-    val groups = LencPartitionHelper.groupFiles(files)
+    val groups = LencPartitionHelper.groupFiles(files, fileSizes)
     new GpuLencLtoFilterRdd(
-      sparkContext, groups, filterSpec, None, outFileIndices, outDict32Mask, outTypes, allMetrics)
+      sparkContext, groups, serConf, filterSpec, None, outFileIndices, outDict32Mask, outTypes, allMetrics)
   }
 
   override def simpleString(maxFields: Int): String =
@@ -791,7 +807,10 @@ case class GpuLencLtoFilterScanExec(
 
 case class GpuLencLtoFilterProjectScanExec(
     output: Seq[Attribute],
+    fullSchema: StructType,
     files: Array[String],
+    fileSizes: Array[Long],
+    serConf: SerializableConfiguration,
     filterSpec: LtoExprSpec,
     projSpec: LtoExprSpec) extends LeafExecNode with GpuExec {
 
@@ -808,9 +827,9 @@ case class GpuLencLtoFilterProjectScanExec(
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     val outTypes = output.map(_.dataType).toArray
-    val groups = LencPartitionHelper.groupFiles(files)
+    val groups = LencPartitionHelper.groupFiles(files, fileSizes)
     new GpuLencLtoFilterRdd(
-      sparkContext, groups, filterSpec, Some(projSpec), Array.emptyIntArray, Array.emptyByteArray,
+      sparkContext, groups, serConf, filterSpec, Some(projSpec), Array.emptyIntArray, Array.emptyByteArray,
       outTypes, allMetrics)
   }
 

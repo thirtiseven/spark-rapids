@@ -160,18 +160,52 @@ object JoinImpl {
     }
   }
 
+  private def decodeDict32TableIfNeeded(t: Table): (Table, Boolean) = {
+    var hasDict = false
+    var i = 0
+    val nc = t.getNumberOfColumns
+    while (i < nc && !hasDict) {
+      if (t.getColumn(i).getType == ai.rapids.cudf.DType.DICTIONARY32) hasDict = true
+      i += 1
+    }
+    if (!hasDict) {
+      (t, false)
+    } else {
+      val cols = (0 until nc).safeMap { idx =>
+        val cv = t.getColumn(idx)
+        if (cv.getType == ai.rapids.cudf.DType.DICTIONARY32) {
+          com.nvidia.spark.rapids.jni.LencNative.decodeDictionary(cv)
+        } else {
+          cv.incRefCount()
+        }
+      }
+      withResource(cols) { cs => (new Table(cs: _*), true) }
+    }
+  }
+
   private def filterGatherMapsMaybeJit(
       leftMap: GatherMap,
       rightMap: GatherMap,
       leftTable: Table,
       rightTable: Table,
-      compiledCondition: CompiledExpression): Array[GatherMap] = {
-    if (hasJitHandle(compiledCondition)) {
-      Table.filterJoinGatherMapsJit(
-        leftMap, rightMap, leftTable, rightTable, compiledCondition, ai.rapids.cudf.JoinKind.INNER)
-    } else {
-      JoinPrimitives.filterGatherMapsByAST(
-        leftMap, rightMap, leftTable, rightTable, compiledCondition)
+      compiledCondition: CompiledExpression,
+      joinKind: ai.rapids.cudf.JoinKind = ai.rapids.cudf.JoinKind.INNER): Array[GatherMap] = {
+    val (lTbl, lOwned) = decodeDict32TableIfNeeded(leftTable)
+    try {
+      val (rTbl, rOwned) = decodeDict32TableIfNeeded(rightTable)
+      try {
+        if (hasJitHandle(compiledCondition)) {
+          Table.filterJoinGatherMapsJit(
+            leftMap, rightMap, lTbl, rTbl, compiledCondition, joinKind)
+        } else {
+          JoinPrimitives.filterGatherMapsByAST(
+            leftMap, rightMap, lTbl, rTbl, compiledCondition)
+        }
+      } finally {
+        if (rOwned) rTbl.close()
+      }
+    } finally {
+      if (lOwned) lTbl.close()
     }
   }
 
@@ -582,11 +616,31 @@ object JoinImpl {
    * @param nullEquality if nulls should eb equal or not
    * @return the gather maps to use
    */
+  private def mixedLeftJoinMaybeJit(
+      leftKeys: Table, rightKeys: Table,
+      leftTable: Table, rightTable: Table,
+      compiledCondition: CompiledExpression,
+      nullEquality: NullEquality): Array[GatherMap] = {
+    val useJit = org.apache.spark.sql.internal.SQLConf.get
+      .getConfString("spark.rapids.sql.joinAstJitEnabled", "false").toBoolean &&
+      hasJitHandle(compiledCondition)
+    if (useJit) {
+      val eqMaps = leftKeys.leftJoinGatherMaps(rightKeys, nullEquality == NullEquality.EQUAL)
+      withResource(eqMaps) { maps =>
+        filterGatherMapsMaybeJit(
+          maps(0), maps(1), leftTable, rightTable, compiledCondition, ai.rapids.cudf.JoinKind.LEFT)
+      }
+    } else {
+      Table.mixedLeftJoinGatherMaps(leftKeys, rightKeys, leftTable, rightTable,
+        compiledCondition, nullEquality)
+    }
+  }
+
   def leftOuterHashJoinBuildRight(leftKeys: Table, rightKeys: Table,
                                   leftTable: Table, rightTable: Table,
                                   compiledCondition: CompiledExpression,
                                   nullEquality: NullEquality): GatherMapsResult = {
-    val arrayRet = Table.mixedLeftJoinGatherMaps(leftKeys, rightKeys, leftTable, rightTable,
+    val arrayRet = mixedLeftJoinMaybeJit(leftKeys, rightKeys, leftTable, rightTable,
       compiledCondition, nullEquality)
     GatherMapsResult(arrayRet(0), arrayRet(1))
   }
@@ -640,7 +694,7 @@ object JoinImpl {
                                   nullEquality: NullEquality): GatherMapsResult = {
     // Reverse the output of the join, because we expect the right gather map to
     // always be on the right
-    val arrayRet = Table.mixedLeftJoinGatherMaps(rightKeys, leftKeys, rightTable, leftTable,
+    val arrayRet = mixedLeftJoinMaybeJit(rightKeys, leftKeys, rightTable, leftTable,
       compiledCondition, nullEquality)
     GatherMapsResult(arrayRet(1), arrayRet(0))
   }

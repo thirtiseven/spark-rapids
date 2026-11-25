@@ -39,6 +39,7 @@ import org.apache.spark.unsafe.types.UTF8String
  */
 object GpuDictionaryUtils {
   val DICT32_COLS_CONF = "spark.rapids.sql.dictionary32.columns"
+  val DICT32_AUTO_CONF = "spark.rapids.sql.dictionary32.autoEnabled"
   val PROGRAM_POOL_CONF = "spark.rapids.sql.projectAstJit.programPoolEnabled"
 
   @volatile private var driverDict32Cols: Set[String] = Set.empty
@@ -56,9 +57,73 @@ object GpuDictionaryUtils {
 
   def updateDriverDict32Cols(conf: SQLConf): Set[String] = {
     val raw = conf.getConfString(DICT32_COLS_CONF, "").trim
-    val set = if (raw.isEmpty) Set.empty[String] else raw.split(",").map(_.trim).filter(_.nonEmpty).toSet
-    driverDict32Cols = set
-    set
+    if (raw.nonEmpty) {
+      val set = raw.split(",").map(_.trim).filter(_.nonEmpty).toSet
+      driverDict32Cols = set
+      set
+    } else if (!conf.getConfString(DICT32_AUTO_CONF, "false").toBoolean) {
+      driverDict32Cols = Set.empty
+      Set.empty
+    } else {
+      driverDict32Cols
+    }
+  }
+
+  /**
+   * Item 4A: Catalyst auto-selective DICTIONARY32 planner analysis.
+   * Collects String attributes used in EqualTo / InSet / In predicates while excluding
+   * pure HashAggregate grouping keys (preventing multi-batch groupby dictionary regressions).
+   */
+  def autoSelectDict32Cols(
+      plan: org.apache.spark.sql.execution.SparkPlan,
+      conf: SQLConf): Set[String] = {
+    val raw = conf.getConfString(DICT32_COLS_CONF, "").trim
+    if (raw.nonEmpty) {
+      val set = raw.split(",").map(_.trim).filter(_.nonEmpty).toSet
+      driverDict32Cols = set
+      return set
+    }
+    if (!conf.getConfString(DICT32_AUTO_CONF, "false").toBoolean) {
+      driverDict32Cols = Set.empty
+      return Set.empty
+    }
+    import org.apache.spark.sql.catalyst.expressions._
+    import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
+    import org.apache.spark.sql.types.StringType
+
+    val predCols = mutable.HashSet.empty[String]
+    val pureGroupCols = mutable.HashSet.empty[String]
+
+    def inspectExpr(e: Expression): Unit = {
+      e.foreach {
+        case EqualTo(a: Attribute, l: Literal) if a.dataType == StringType && l.value != null =>
+          predCols += a.name
+        case EqualTo(l: Literal, a: Attribute) if a.dataType == StringType && l.value != null =>
+          predCols += a.name
+        case InSet(a: Attribute, hset) if a.dataType == StringType && hset.nonEmpty =>
+          predCols += a.name
+        case In(a: Attribute, list) if a.dataType == StringType && list.nonEmpty &&
+            list.forall(_.isInstanceOf[Literal]) =>
+          predCols += a.name
+        case _ =>
+      }
+    }
+
+    plan.foreach {
+      case agg: BaseAggregateExec =>
+        agg.groupingExpressions.foreach {
+          case a: Attribute if a.dataType == StringType => pureGroupCols += a.name
+          case _ =>
+        }
+        agg.aggregateExpressions.foreach(inspectExpr)
+        agg.resultExpressions.foreach(inspectExpr)
+      case p =>
+        p.expressions.foreach(inspectExpr)
+    }
+
+    val chosen = (predCols -- pureGroupCols).toSet
+    driverDict32Cols = chosen
+    chosen
   }
 
   def programPoolEnabled(): Boolean =

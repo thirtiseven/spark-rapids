@@ -393,6 +393,19 @@ case class VortexScan(
 
 object VortexPartitionHelper {
   def groupFiles(files: Array[String], fileSizes: Array[Long]): Array[Array[String]] = {
+    if (files.isEmpty) {
+      return Array.empty
+    }
+    val totalBytes = if (fileSizes.length == files.length) {
+      fileSizes.sum
+    } else {
+      files.map(new File(_).length()).sum
+    }
+    // Coalesce small tables (<= 16 MiB, e.g. nation 64 KiB / region 32 KiB) into 1 single task
+    // so they don't spawn 13 tiny tasks waiting on GpuSemaphore!
+    if (totalBytes <= 16L * 1024L * 1024L) {
+      return Array(files)
+    }
     val maxPartBytes = SQLConf.get
       .getConfString("spark.rapids.sql.vortex.maxPartitionBytes", "1073741824").toLong
     if (files.length <= 16 || maxPartBytes <= 0L) {
@@ -638,6 +651,9 @@ class GpuVortexPartitionReader(
     false
   }
 
+  private val zeroCopyEnabled: Boolean = SQLConf.get
+    .getConfString("spark.rapids.sql.vortex.zeroCopyEnabled", "true").toBoolean
+
   override def next(): Boolean = {
     if (currentBatch != null) {
       currentBatch.close()
@@ -645,8 +661,9 @@ class GpuVortexPartitionReader(
     }
     if (readTypes.isEmpty) return false
 
+    // Acquire GpuSemaphore BEFORE opTime.ns so opTime reflects actual scan work, not semaphore wait!
+    GpuSemaphore.acquireIfNecessary(TaskContext.get())
     opTime.ns {
-      GpuSemaphore.acquireIfNecessary(TaskContext.get())
       if (useLateMat) {
         val pending = new ArrayBuffer[CudfTable]()
         var accBytes = 0L
@@ -690,17 +707,47 @@ class GpuVortexPartitionReader(
       }
 
       if (multiScan == null) return false
-      val tbl = gpuDecodeTime.ns {
-        multiScan.nextCoalescedBatch(dict32Mask, coalesceTargetBytes)
-      }
-      if (tbl == null) {
-        multiScan.safeClose()
-        multiScan = null
-        return false
-      }
-      withResource(tbl) { t =>
-        currentBatch = GpuColumnVector.from(t, readTypes)
-        numOutputBatches += 1
+      if (zeroCopyEnabled) {
+        val cvs = gpuDecodeTime.ns {
+          multiScan.nextZeroCopyBatch(dict32Mask)
+        }
+        if (cvs == null) {
+          multiScan.safeClose()
+          multiScan = null
+          return false
+        }
+        val numRows = if (cvs.nonEmpty) cvs(0).getRowCount.toInt else 0
+        val gpuCols = new Array[org.apache.spark.sql.vectorized.ColumnVector](cvs.length)
+        var ok = false
+        try {
+          var i = 0
+          while (i < cvs.length) {
+            gpuCols(i) = GpuColumnVector.from(cvs(i), readTypes(i))
+            cvs(i) = null
+            i += 1
+          }
+          currentBatch = new ColumnarBatch(gpuCols, numRows)
+          numOutputBatches += 1
+          ok = true
+        } finally {
+          if (!ok) {
+            cvs.foreach(c => if (c != null) c.close())
+            gpuCols.foreach(c => if (c != null) c.close())
+          }
+        }
+      } else {
+        val tbl = gpuDecodeTime.ns {
+          multiScan.nextCoalescedBatch(dict32Mask, coalesceTargetBytes)
+        }
+        if (tbl == null) {
+          multiScan.safeClose()
+          multiScan = null
+          return false
+        }
+        withResource(tbl) { t =>
+          currentBatch = GpuColumnVector.from(t, readTypes)
+          numOutputBatches += 1
+        }
       }
     }
     true

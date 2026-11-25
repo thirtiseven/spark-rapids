@@ -316,7 +316,13 @@ class SerializeConcatHostBuffersDeserializeBatch(
 @SerialVersionUID(100L)
 class SerializeBatchDeserializeHostBuffer(batch: ColumnarBatch)
   extends Serializable with AutoCloseable {
-  @transient private var columns = GpuColumnVector.extractBases(batch).map(_.copyToHost())
+  @transient private var columns = GpuColumnVector.extractBases(batch).map { cv =>
+    if (cv.getType == ai.rapids.cudf.DType.DICTIONARY32) {
+      withResource(com.nvidia.spark.rapids.jni.LencNative.decodeDictionary(cv))(_.copyToHost())
+    } else {
+      cv.copyToHost()
+    }
+  }
   @transient var header: JCudfSerialization.SerializedTableHeader = null
   @transient var buffer: HostMemoryBuffer = null
   @transient private var numRows = batch.numRows()

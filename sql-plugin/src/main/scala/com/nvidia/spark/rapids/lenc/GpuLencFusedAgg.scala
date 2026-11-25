@@ -1147,10 +1147,11 @@ object GpuLencFusedAgg {
       }
     }
 
-    // Mode 1: Low-Cardinality String GroupBy (1-2 string keys, e.g. Q1 or any small-dict rollup!)
-    // Use Mode 1 when 1-2 String keys & total <= 64 expected combinations (e.g. non-high-card scan),
-    // OR Mode 2 for high-cardinality multi-column / wide GroupBy (e.g. NF48 >= 8 aggs or non-String keys)!
-    val preferHighCard = groupAttrs.length >= 3 ||
+    // Mode 1: Low-Cardinality String GroupBy (1-2 string keys directly over LeafExecNode scan, e.g. Q1/U2!)
+    // Restrict to direct LeafExecNode scans (not post-join high-card keys like Q21 s_name!).
+    val isLeafScan = lencScanOpt.isDefined || basePlan.isInstanceOf[LeafExecNode]
+    val preferHighCard = !isLeafScan ||
+      groupAttrs.length >= 3 ||
       groupAttrs.exists(_.dataType != StringType) ||
       rawTerms.length >= 12
     if (!preferHighCard && groupAttrs.length <= 2 && groupAttrs.forall(_.dataType == StringType)) {

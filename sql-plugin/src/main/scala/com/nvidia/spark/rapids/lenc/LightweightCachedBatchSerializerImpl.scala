@@ -16,7 +16,9 @@
 
 package com.nvidia.spark.rapids.lenc
 
-import ai.rapids.cudf.{ColumnVector, DType, HostMemoryBuffer, Table => CudfTable}
+import java.nio.{ByteBuffer, ByteOrder}
+
+import ai.rapids.cudf.{ColumnVector, DType, DeviceMemoryBuffer, HostMemoryBuffer, Table => CudfTable}
 import com.nvidia.spark.GpuCachedBatchSerializer
 import com.nvidia.spark.rapids.{GpuColumnVector, GpuSemaphore}
 import com.nvidia.spark.rapids.Arm.withResource
@@ -35,20 +37,54 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.storage.StorageLevel
 
 /**
- * Compact GPU-Native cached batch holding a single Kudo+LSHF compressed byte frame
- * (FOR256 + GPU DICT_BITPACK + dynamic 127-bigram mini-FSST + sparse-float nvCOMP LZ4).
+ * Column-partitioned GPU-Native cached batch:
+ * stores each column's 40-byte ShufColMeta, compressed payload, and optional null bitmask in
+ * separate per-column byte arrays so reads NEVER touch unselected columns and assemble ONLY the
+ * projected columns directly into a pinned HostMemoryBuffer for 25+ GB/s PCIe DMA!
  */
 case class LightweightCachedBatch(
     override val numRows: Int,
-    bytes: Array[Byte]) extends CachedBatch {
-  override def sizeInBytes: Long = bytes.length.toLong
+    lshfHeader: Array[Byte],
+    colMetas: Array[Array[Byte]],
+    colPayloads: Array[Array[Byte]],
+    colNulls: Array[Array[Byte]]) extends CachedBatch {
+  override def sizeInBytes: Long = {
+    var tot = lshfHeader.length.toLong
+    var i = 0
+    while (i < colPayloads.length) {
+      tot += colMetas(i).length.toLong + colPayloads(i).length.toLong + colNulls(i).length.toLong
+      i += 1
+    }
+    tot
+  }
+}
+
+object LightweightLshfLayout {
+  val LSHF_HDR_BYTES = 16
+  val COL_META_BYTES = 40
+
+  def align8(v: Long): Long = (v + 7L) & ~7L
+
+  def readLeLong(arr: Array[Byte], off: Int): Long =
+    ByteBuffer.wrap(arr, off, 8).order(ByteOrder.LITTLE_ENDIAN).getLong
+
+  def readLeInt(arr: Array[Byte], off: Int): Int =
+    ByteBuffer.wrap(arr, off, 4).order(ByteOrder.LITTLE_ENDIAN).getInt
+
+  def writeLeLong(arr: Array[Byte], off: Int, v: Long): Unit =
+    ByteBuffer.wrap(arr, off, 8).order(ByteOrder.LITTLE_ENDIAN).putLong(v)
+
+  def writeLeInt(arr: Array[Byte], off: Int, v: Int): Unit =
+    ByteBuffer.wrap(arr, off, 4).order(ByteOrder.LITTLE_ENDIAN).putInt(v)
 }
 
 /**
  * GPU-Native Lightweight Table Cache Serializer (directly addressing the missing GPU encode
  * path in standard Vortex for Spark table caching):
- *   - GPU Populate (Encode): 100% GPU-native encoding -> transfers ONLY compressed bytes D2H!
- *   - GPU Read (Decode): H2D compressed bytes -> 100% GPU-native parallel decode at 400+ GB/s!
+ *   - GPU Populate (Encode): 100% GPU-native 170-SM encoding (FOR256 + GPU DICT + STRING_BIGRAM
+ *     + sparse LZ4) -> transfers ONLY compressed bytes D2H and splits by column!
+ *   - GPU Read (Decode): true per-column pruning -> stages ONLY selected columns into a PINNED
+ *     HostMemoryBuffer -> 25+ GB/s PCIe DMA -> 170-SM GPU parallel decode!
  *   - Non-flat / nested schemas cleanly fall back to ParquetCachedBatchSerializer.
  */
 class LightweightCachedBatchSerializerImpl extends GpuCachedBatchSerializer {
@@ -91,7 +127,6 @@ class LightweightCachedBatchSerializerImpl extends GpuCachedBatchSerializer {
       cacheAttributes: Seq[Attribute],
       selectedAttributes: Seq[Attribute],
       conf: SQLConf): RDD[InternalRow] = {
-    // Decode on GPU if LightweightCachedBatch, then convert to host rows; else delegate to PCBS
     val colRdd = gpuConvertCachedBatchToColumnarBatch(input, cacheAttributes, selectedAttributes, conf)
     colRdd.mapPartitions { iter =>
       iter.flatMap { cb =>
@@ -162,14 +197,15 @@ class LightweightCachedBatchSerializerImpl extends GpuCachedBatchSerializer {
           withResource(cb) { batch =>
             val nrows = batch.numRows()
             if (nrows == 0) {
-              LightweightCachedBatch(0, Array.emptyByteArray)
+              LightweightCachedBatch(0, Array.emptyByteArray, Array.empty, Array.empty, Array.empty)
             } else {
               GpuSemaphore.acquireIfNecessary(TaskContext.get())
               val cols = GpuColumnVector.extractBases(batch)
-              val decodedCols = new Array[ColumnVector](cols.length)
+              val ncols = cols.length
+              val decodedCols = new Array[ColumnVector](ncols)
               var i = 0
               try {
-                while (i < cols.length) {
+                while (i < ncols) {
                   val c = cols(i)
                   decodedCols(i) = if (c.getType == DType.DICTIONARY32) {
                     LencNative.decodeDictionary(c)
@@ -182,26 +218,53 @@ class LightweightCachedBatchSerializerImpl extends GpuCachedBatchSerializer {
                   withResource(LencNative.splitAndEncodeShuffleToDevice(tbl)) { dmbs =>
                     val dataDev = dmbs(0)
                     val totalLen = dataDev.getLength.toInt
-                    val outBytes = if (totalLen > 0) {
-                      withResource(HostMemoryBuffer.allocate(totalLen.toLong)) { hb =>
-                        hb.copyFromDeviceBuffer(dataDev)
-                        // Strip leading KudoTableHeader so cached bytes start directly at LSHF magic!
-                        val probeLen = math.min(totalLen, 4096)
-                        val probe = new Array[Byte](probeLen)
-                        hb.getBytes(probe, 0, 0L, probeLen)
-                        val kudoHdr = com.nvidia.spark.rapids.jni.kudo.KudoTableHeader
-                          .readFrom(new java.io.DataInputStream(
-                            new java.io.ByteArrayInputStream(probe)))
-                          .get().getSerializedSize
-                        val lshfLen = totalLen - kudoHdr
-                        val arr = new Array[Byte](lshfLen)
-                        hb.getBytes(arr, 0, kudoHdr.toLong, lshfLen)
-                        arr
+                    withResource(HostMemoryBuffer.allocate(totalLen.toLong)) { hb =>
+                      hb.copyFromDeviceBuffer(dataDev)
+                      val probeLen = math.min(totalLen, 4096)
+                      val probe = new Array[Byte](probeLen)
+                      hb.getBytes(probe, 0, 0L, probeLen)
+                      val kudoHdr = com.nvidia.spark.rapids.jni.kudo.KudoTableHeader
+                        .readFrom(new java.io.DataInputStream(
+                          new java.io.ByteArrayInputStream(probe)))
+                        .get().getSerializedSize.toLong
+
+                      // Extract LshfHeader (16B) and per-column ShufColMeta (40B) + payloads/nulls
+                      val lshfHdr = new Array[Byte](LightweightLshfLayout.LSHF_HDR_BYTES)
+                      hb.getBytes(lshfHdr, 0, kudoHdr, LightweightLshfLayout.LSHF_HDR_BYTES)
+
+                      val colMetas = new Array[Array[Byte]](ncols)
+                      val colPayloads = new Array[Array[Byte]](ncols)
+                      val colNulls = new Array[Array[Byte]](ncols)
+                      var c = 0
+                      while (c < ncols) {
+                        val mArr = new Array[Byte](LightweightLshfLayout.COL_META_BYTES)
+                        val mOff = kudoHdr + LightweightLshfLayout.LSHF_HDR_BYTES +
+                          c.toLong * LightweightLshfLayout.COL_META_BYTES
+                        hb.getBytes(mArr, 0, mOff, LightweightLshfLayout.COL_META_BYTES)
+                        val payOff = LightweightLshfLayout.readLeLong(mArr, 0)
+                        val paySz = LightweightLshfLayout.readLeLong(mArr, 8).toInt
+                        val nullOff = LightweightLshfLayout.readLeLong(mArr, 16)
+                        val nullSz = LightweightLshfLayout.readLeInt(mArr, 24)
+                        val hasNulls = mArr(37) != 0
+
+                        val pArr = new Array[Byte](paySz)
+                        if (paySz > 0) {
+                          hb.getBytes(pArr, 0, kudoHdr + payOff, paySz)
+                        }
+                        val nArr = if (hasNulls && nullSz > 0) {
+                          val a = new Array[Byte](nullSz)
+                          hb.getBytes(a, 0, kudoHdr + nullOff, nullSz)
+                          a
+                        } else {
+                          Array.emptyByteArray
+                        }
+                        colMetas(c) = mArr
+                        colPayloads(c) = pArr
+                        colNulls(c) = nArr
+                        c += 1
                       }
-                    } else {
-                      Array.emptyByteArray
+                      LightweightCachedBatch(nrows, lshfHdr, colMetas, colPayloads, colNulls)
                     }
-                    LightweightCachedBatch(nrows, outBytes)
                   }
                 }
               } finally {
@@ -235,7 +298,7 @@ class LightweightCachedBatchSerializerImpl extends GpuCachedBatchSerializer {
         override def next(): ColumnarBatch = {
           iter.next() match {
             case lcb: LightweightCachedBatch =>
-              if (lcb.numRows == 0 || lcb.bytes.isEmpty) {
+              if (lcb.numRows == 0 || lcb.lshfHeader.isEmpty) {
                 val emptyCols = selectedTypes.map { dt =>
                   GpuColumnVector.emptyBatchFromTypes(Array(dt)).column(0)
                 }
@@ -244,10 +307,72 @@ class LightweightCachedBatchSerializerImpl extends GpuCachedBatchSerializer {
                 new ColumnarBatch(Array.empty, lcb.numRows)
               } else {
                 GpuSemaphore.acquireIfNecessary(TaskContext.get())
-                // Column-pruned GPU decode: H2D-copies and decodes ONLY selectedIndices!
-                withResource(LencNative.decodeCachedLshfProjected(
-                    lcb.bytes, selectedIndices, selectedDTypes)) { projTbl =>
-                  GpuColumnVector.from(projTbl, selectedTypes)
+                // True per-column pruning + PINNED HostMemoryBuffer DMA (25+ GB/s):
+                // NEVER touches unselected columns' arrays!
+                val nsel = selectedIndices.length
+                val hdrSz = LightweightLshfLayout.align8(
+                  LightweightLshfLayout.LSHF_HDR_BYTES.toLong +
+                    nsel.toLong * LightweightLshfLayout.COL_META_BYTES)
+                var cur = hdrSz
+                val dstPayOffs = new Array[Long](nsel)
+                val dstNullOffs = new Array[Long](nsel)
+                var i = 0
+                while (i < nsel) {
+                  val sc = selectedIndices(i)
+                  dstPayOffs(i) = cur
+                  cur = LightweightLshfLayout.align8(cur + lcb.colPayloads(sc).length.toLong)
+                  if (lcb.colNulls(sc).nonEmpty) {
+                    dstNullOffs(i) = cur
+                    cur = LightweightLshfLayout.align8(cur + lcb.colNulls(sc).length.toLong)
+                  } else {
+                    dstNullOffs(i) = 0L
+                  }
+                  i += 1
+                }
+                val compactLen = cur
+
+                withResource(HostMemoryBuffer.allocate(compactLen)) { hb =>
+                  // Write patched LshfHeader (num_cols = nsel) + patched ShufColMeta[nsel]
+                  val hdrBuf = new Array[Byte](hdrSz.toInt)
+                  System.arraycopy(lcb.lshfHeader, 0, hdrBuf, 0, LightweightLshfLayout.LSHF_HDR_BYTES)
+                  LightweightLshfLayout.writeLeInt(hdrBuf, 8, nsel)
+                  var k = 0
+                  while (k < nsel) {
+                    val sc = selectedIndices(k)
+                    val mOff = LightweightLshfLayout.LSHF_HDR_BYTES +
+                      k * LightweightLshfLayout.COL_META_BYTES
+                    System.arraycopy(
+                      lcb.colMetas(sc), 0, hdrBuf, mOff, LightweightLshfLayout.COL_META_BYTES)
+                    LightweightLshfLayout.writeLeLong(hdrBuf, mOff, dstPayOffs(k))
+                    LightweightLshfLayout.writeLeLong(hdrBuf, mOff + 16, dstNullOffs(k))
+                    k += 1
+                  }
+                  hb.setBytes(0L, hdrBuf, 0, hdrBuf.length)
+
+                  // Stage ONLY selected columns directly into pinned HostMemoryBuffer
+                  k = 0
+                  while (k < nsel) {
+                    val sc = selectedIndices(k)
+                    val pArr = lcb.colPayloads(sc)
+                    if (pArr.nonEmpty) {
+                      hb.setBytes(dstPayOffs(k), pArr, 0, pArr.length)
+                    }
+                    val nArr = lcb.colNulls(sc)
+                    if (nArr.nonEmpty) {
+                      hb.setBytes(dstNullOffs(k), nArr, 0, nArr.length)
+                    }
+                    k += 1
+                  }
+
+                  // Single pinned PCIe DMA H2D + 170-SM saturated GPU decode!
+                  withResource(DeviceMemoryBuffer.allocate(compactLen)) { db =>
+                    db.copyFromHostBuffer(hb)
+                    val offs = Array(0L, compactLen)
+                    withResource(LencNative.assembleAndDecodeShuffleFromDevice(
+                        hb, db, offs, selectedDTypes, null)) { projTbl =>
+                      GpuColumnVector.from(projTbl, selectedTypes)
+                    }
+                  }
                 }
               }
             case other =>

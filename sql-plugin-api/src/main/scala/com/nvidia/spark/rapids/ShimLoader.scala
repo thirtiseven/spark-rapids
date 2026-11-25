@@ -397,4 +397,14 @@ object ShimLoader {
       "com.nvidia.spark.rapids.lenc.LencConverterImpl")
   }
 
+  def newVortexDataSource(): org.apache.spark.sql.connector.catalog.TableProvider = {
+    ShimReflectionUtils.newInstanceOf(
+      "com.nvidia.spark.rapids.vortex.VortexDataSourceImpl")
+  }
+
+  def newVortexConverter(): java.util.function.Function[Array[String], java.lang.Long] = {
+    ShimReflectionUtils.newInstanceOf(
+      "com.nvidia.spark.rapids.vortex.VortexConverterImpl")
+  }
+
 }

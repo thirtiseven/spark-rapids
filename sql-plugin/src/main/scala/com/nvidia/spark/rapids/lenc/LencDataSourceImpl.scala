@@ -422,6 +422,8 @@ class GpuLencPartitionReader(
 
   private var currentBatch: ColumnarBatch = _
   private val readTypes: Array[DataType] = readSchema.fields.map(_.dataType)
+  private val coalesceTargetBytes: Long = org.apache.spark.sql.internal.SQLConf.get
+    .getConfString("spark.rapids.sql.lenc.coalesceTargetBytes", "0").toLong
 
   private val opTime = metrics.getOrElse(OP_TIME_LEGACY, NoopMetric)
   private val bufferTime = metrics.getOrElse(BUFFER_TIME, NoopMetric)
@@ -429,37 +431,68 @@ class GpuLencPartitionReader(
   private val numOutputBatches = metrics.getOrElse(NUM_OUTPUT_BATCHES, NoopMetric)
   private val prefetcher = new LencAsyncPrefetcher(filePaths, projectedIndices, Array.empty, serConf)
 
+  private def decodeOneFile(item: LencPrefetchedFile): CudfTable = {
+    withResource(item.plan) { plan =>
+      withResource(item.hostBuf) { hb =>
+        GpuSemaphore.acquireIfNecessary(TaskContext.get())
+        gpuDecodeTime.ns {
+          if (fusedKind >= 0) {
+            plan.decodeAndEvalFused(hb, fusedKind, 0L)
+          } else {
+            plan.decodeFromHost(hb, dict32Mask)
+          }
+        }
+      }
+    }
+  }
+
   override def next(): Boolean = {
     if (currentBatch != null) {
       currentBatch.close()
       currentBatch = null
     }
-    val itemOpt = opTime.ns {
-      bufferTime.ns {
-        prefetcher.next()
-      }
-    }
-    if (itemOpt.isEmpty) {
+    val firstOpt = opTime.ns { bufferTime.ns { prefetcher.next() } }
+    if (firstOpt.isEmpty) {
       return false
     }
-    val item = itemOpt.get
 
     opTime.ns {
-      withResource(item.plan) { plan =>
-        withResource(item.hostBuf) { hb =>
-          GpuSemaphore.acquireIfNecessary(TaskContext.get())
-          val table = gpuDecodeTime.ns {
-            if (fusedKind >= 0) {
-              plan.decodeAndEvalFused(hb, fusedKind, 0L)
-            } else {
-              plan.decodeFromHost(hb, dict32Mask)
+      val firstTbl = decodeOneFile(firstOpt.get)
+      val canCoalesce = coalesceTargetBytes > 0L && dict32Mask == null && fusedKind < 0
+      val finalTbl = if (!canCoalesce || firstTbl.getDeviceMemorySize >= coalesceTargetBytes) {
+        firstTbl
+      } else {
+        val pending = new scala.collection.mutable.ArrayBuffer[CudfTable]()
+        pending += firstTbl
+        var accBytes = firstTbl.getDeviceMemorySize
+        var accRows = firstTbl.getRowCount
+        try {
+          while (accBytes < coalesceTargetBytes && accRows < 100000000L) {
+            val nextOpt = bufferTime.ns { prefetcher.next() }
+            nextOpt match {
+              case Some(item) =>
+                val t = decodeOneFile(item)
+                pending += t
+                accBytes += t.getDeviceMemorySize
+                accRows += t.getRowCount
+              case None =>
+                accBytes = coalesceTargetBytes
             }
           }
-          withResource(table) { t =>
-            currentBatch = GpuColumnVector.from(t, readTypes)
-            numOutputBatches += 1
+          if (pending.length == 1) {
+            pending.remove(0)
+          } else {
+            val all = pending.toArray
+            pending.clear()
+            withResource(all) { tbls => CudfTable.concatenate(tbls: _*) }
           }
+        } finally {
+          pending.safeClose()
         }
+      }
+      withResource(finalTbl) { t =>
+        currentBatch = GpuColumnVector.from(t, readTypes)
+        numOutputBatches += 1
       }
     }
     true

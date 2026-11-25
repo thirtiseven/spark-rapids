@@ -727,9 +727,37 @@ object JoinImpl {
                                  leftTable: Table, rightTable: Table,
                                  compiledCondition: CompiledExpression,
                                  nullEquality: NullEquality): GatherMapsResult = {
-    val leftRet = Table.mixedLeftSemiJoinGatherMap(leftKeys, rightKeys, leftTable, rightTable,
-      compiledCondition, nullEquality)
-    GatherMapsResult.makeFromLeft(leftRet)
+    if (hasJitHandle(compiledCondition)) {
+      val eqMaps = JoinPrimitives.hashInnerJoin(leftKeys, rightKeys, nullEquality == NullEquality.EQUAL)
+      val filtered = withResource(eqMaps) { maps =>
+        filterGatherMapsMaybeJit(
+          maps(0), maps(1), leftTable, rightTable, compiledCondition, ai.rapids.cudf.JoinKind.INNER)
+      }
+      withResource(filtered) { fm =>
+        val nPass = fm(0).getRowCount.toInt
+        if (nPass == 0) {
+          GatherMapsResult.makeFromLeft(new GatherMap(ai.rapids.cudf.DeviceMemoryBuffer.allocate(0L)))
+        } else {
+          withResource(fm(0).toColumnView(0, nPass)) { passView =>
+            withResource(passView.copyToColumnVector()) { passCol =>
+              withResource(new Table(passCol)) { passTbl =>
+                withResource(passTbl.groupBy(0).aggregate()) { uniqTbl =>
+                  val uniqCol = uniqTbl.getColumn(0)
+                  val nUniq = uniqCol.getRowCount
+                  val dataBuf = uniqCol.getDeviceBufferFor(ai.rapids.cudf.BufferType.DATA)
+                  val buf = dataBuf.sliceWithCopy(0L, nUniq * 4L)
+                  GatherMapsResult.makeFromLeft(new GatherMap(buf))
+                }
+              }
+            }
+          }
+        }
+      }
+    } else {
+      val leftRet = Table.mixedLeftSemiJoinGatherMap(leftKeys, rightKeys, leftTable, rightTable,
+        compiledCondition, nullEquality)
+      GatherMapsResult.makeFromLeft(leftRet)
+    }
   }
 
   /**
@@ -760,9 +788,41 @@ object JoinImpl {
                                  leftTable: Table, rightTable: Table,
                                  compiledCondition: CompiledExpression,
                                  nullEquality: NullEquality): GatherMapsResult = {
-    val leftRet = Table.mixedLeftAntiJoinGatherMap(leftKeys, rightKeys, leftTable, rightTable,
-      compiledCondition, nullEquality)
-    GatherMapsResult.makeFromLeft(leftRet)
+    if (hasJitHandle(compiledCondition)) {
+      val eqMaps = JoinPrimitives.hashInnerJoin(leftKeys, rightKeys, nullEquality == NullEquality.EQUAL)
+      val filtered = withResource(eqMaps) { maps =>
+        filterGatherMapsMaybeJit(
+          maps(0), maps(1), leftTable, rightTable, compiledCondition, ai.rapids.cudf.JoinKind.INNER)
+      }
+      val leftRows = leftKeys.getRowCount.toInt
+      withResource(filtered) { fm =>
+        withResource(ai.rapids.cudf.Scalar.fromInt(0)) { zero =>
+          withResource(ai.rapids.cudf.ColumnVector.sequence(zero, leftRows)) { allIdx =>
+            withResource(new Table(allIdx)) { allTbl =>
+              val nPass = fm(0).getRowCount.toInt
+              if (nPass == 0) {
+                val dataBuf = allIdx.getDeviceBufferFor(ai.rapids.cudf.BufferType.DATA)
+                val buf = dataBuf.sliceWithCopy(0L, leftRows.toLong * 4L)
+                GatherMapsResult.makeFromLeft(new GatherMap(buf))
+              } else {
+                withResource(fm(0).toColumnView(0, nPass)) { passView =>
+                  withResource(passView.copyToColumnVector()) { passCol =>
+                    withResource(new Table(passCol)) { passTbl =>
+                      val antiMap = allTbl.leftAntiJoinGatherMap(passTbl, false)
+                      GatherMapsResult.makeFromLeft(antiMap)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } else {
+      val leftRet = Table.mixedLeftAntiJoinGatherMap(leftKeys, rightKeys, leftTable, rightTable,
+        compiledCondition, nullEquality)
+      GatherMapsResult.makeFromLeft(leftRet)
+    }
   }
 
   /**

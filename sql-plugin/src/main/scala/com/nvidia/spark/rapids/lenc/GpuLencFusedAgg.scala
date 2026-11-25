@@ -26,9 +26,7 @@ import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.GpuMetric._
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.jni.LencNative
-import com.nvidia.spark.rapids.shims.GpuBatchScanExecBase
 
-import org.apache.spark.{Partition, SparkContext, TaskContext}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.Partial
@@ -38,7 +36,6 @@ import org.apache.spark.sql.rapids._
 import org.apache.spark.sql.rapids.aggregate._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
-import org.apache.spark.util.SerializableConfiguration
 
 /**
  * Item 2: 100% Generic Compiler-Level NVRTC/LTO Reduction + Conditional GroupBy Engine.
@@ -1070,73 +1067,18 @@ object GpuLencFusedAgg {
     val outAttrs = resultExprs.map(_.toAttribute)
     val outTypes = resultExprs.map(_.dataType).toArray
 
-    // Check if child is Filter(Scan) or LencLtoFilterScan / LencLtoFilterProjectScan
-    val (basePlan, filterExprOpt, lencScanOpt): (SparkPlan, Option[Expression], Option[GpuLencScan]) =
+    // Unwrap optional GpuFilterExec directly over any GPU scan / child plan (Parquet, Vortex, etc.)
+    val (basePlan, filterExprOpt): (SparkPlan, Option[Expression]) =
       afterProj match {
-        case f: GpuFilterExec =>
-          val lsOpt = f.child match {
-            case bs: GpuBatchScanExecBase =>
-              bs.scan match {
-                case ls: GpuLencScan if ls.fusedExpr.isEmpty => Some(ls)
-                case _ => None
-              }
-            case _ => None
-          }
-          (f.child, Some(unwrapJit(f.condition)), lsOpt)
-
-        case flto: GpuLencLtoFilterScanExec =>
-          val ls = GpuLencScan(flto.fullSchema, flto.fullSchema, flto.files, Array.emptyLongArray, None, flto.serConf)
-          // Reconstruct attribute-bound filter from filterSpec
-          val attrFilter = flto.filterSpec.compactExprs.head.transformDown {
-            case ref: GpuBoundReference =>
-              val fci = flto.filterSpec.fileColIndices(ref.ordinal)
-              val fname = flto.fullSchema.fields(fci).name
-              flto.output.find(_.name == fname).getOrElse(ref)
-          }
-          (flto, Some(attrFilter), Some(ls))
-
-        case fplto: GpuLencLtoFilterProjectScanExec if gpuGrouping.isEmpty =>
-          // Mode 0 Global Reduce over already-fused FilterProjectScan (e.g. TPCH Q6!)
-          val ls = GpuLencScan(fplto.fullSchema, fplto.fullSchema, fplto.files, Array.emptyLongArray, None, fplto.serConf)
-          val fpltoOut = fplto.output
-          val projExpand = fpltoOut.zipWithIndex.map { case (attr, i) =>
-            val e = fplto.projSpec.compactExprs(i).transformDown {
-              case ref: GpuBoundReference =>
-                val fci = fplto.projSpec.fileColIndices(ref.ordinal)
-                val fld = fplto.fullSchema.fields(fci)
-                AttributeReference(fld.name, fld.dataType, fld.nullable)(ExprId(1000000L + fci))
-            }
-            attr.exprId -> e
-          }.toMap
-          val fullAttrs = fplto.fullSchema.fields.zipWithIndex.map { case (fld, i) =>
-            AttributeReference(fld.name, fld.dataType, fld.nullable)(ExprId(1000000L + i))
-          }.toSeq
-          val attrFilter = fplto.filterSpec.compactExprs.head.transformDown {
-            case ref: GpuBoundReference =>
-              val fci = fplto.filterSpec.fileColIndices(ref.ordinal)
-              fullAttrs(fci)
-          }
-          val expandedTerms = rawTerms.map(t => t.copy(inputExpr = t.inputExpr.map(inlineProjectMap(_, projExpand))))
-          return tryBuildGlobalOrLowCard(
-            outAttrs, outTypes, Seq.empty, Some(attrFilter), expandedTerms, outBufToTerm,
-            fullAttrs, fplto, Some(ls))
-
-        case bs: GpuBatchScanExecBase =>
-          val lsOpt = bs.scan match {
-            case ls: GpuLencScan if ls.fusedExpr.isEmpty => Some(ls)
-            case _ => None
-          }
-          (bs, None, lsOpt)
-
-        case other =>
-          (other, None, None)
+        case f: GpuFilterExec => (f.child, Some(unwrapJit(f.condition)))
+        case other => (other, None)
       }
 
     // Mode 0: Global Conditional Reduce (0 group keys)
     if (gpuGrouping.isEmpty) {
       return tryBuildGlobalOrLowCard(
         outAttrs, outTypes, Seq.empty, filterExprOpt, rawTerms, outBufToTerm,
-        basePlan.output, basePlan, lencScanOpt)
+        basePlan.output, basePlan)
     }
 
     // Resolve grouping key attributes on basePlan.output
@@ -1149,7 +1091,7 @@ object GpuLencFusedAgg {
 
     // Mode 1: Low-Cardinality String GroupBy (1-2 string keys directly over LeafExecNode scan, e.g. Q1/U2!)
     // Restrict to direct LeafExecNode scans (not post-join high-card keys like Q21 s_name!).
-    val isLeafScan = lencScanOpt.isDefined || basePlan.isInstanceOf[LeafExecNode]
+    val isLeafScan = basePlan.isInstanceOf[LeafExecNode]
     val preferHighCard = !isLeafScan ||
       groupAttrs.length >= 3 ||
       groupAttrs.exists(_.dataType != StringType) ||
@@ -1157,7 +1099,7 @@ object GpuLencFusedAgg {
     if (!preferHighCard && groupAttrs.length <= 2 && groupAttrs.forall(_.dataType == StringType)) {
       val m1 = tryBuildGlobalOrLowCard(
         outAttrs, outTypes, groupAttrs, filterExprOpt, rawTerms, outBufToTerm,
-        basePlan.output, basePlan, lencScanOpt)
+        basePlan.output, basePlan)
       if (m1.isDefined) return m1
     }
 
@@ -1189,8 +1131,7 @@ object GpuLencFusedAgg {
       rawTerms: Seq[GenericAggTerm],
       outBufToTerm: Array[Int],
       baseOutput: Seq[Attribute],
-      basePlan: SparkPlan,
-      lencScanOpt: Option[GpuLencScan]): Option[GpuExec] = {
+      basePlan: SparkPlan): Option[GpuExec] = {
     val maxGroups = if (groupAttrs.isEmpty) 1 else 64
     bindAndRewriteDicts(filterExprOpt, rawTerms, baseOutput, groupAttrs).flatMap {
       case (inputOrds, boundFilter, boundTerms, dictLits) =>
@@ -1200,22 +1141,9 @@ object GpuLencFusedAgg {
         GenericJitReduceCodegen.generateLowCardKernel(boundFilter, gkSlots, maxGroups, boundTerms).map {
           case (cudaSrc, kname) =>
             val aggKinds = boundTerms.map(_.kind).toArray
-            lencScanOpt match {
-              case Some(ls) =>
-                val fullNameToIdx = ls.fullSchema.fieldNames.zipWithIndex.toMap
-                val fileColIndices = inputOrds.map(ord => fullNameToIdx(baseOutput(ord).name))
-                val rangePreds = boundFilter.map { bf =>
-                  LencRangePruner.extract(bf, fileColIndices, fileColIndices)
-                }.getOrElse(Array.empty)
-                GpuGenericLencJitReduceExec(
-                  outAttrs, ls.files, ls.fileSizes, ls.serConf, fileColIndices,
-                  dictLits, gkSlots, maxGroups, aggKinds, outBufToTerm, outTypes,
-                  rangePreds, cudaSrc, kname)
-              case None =>
-                GpuGenericTableJitReduceExec(
-                  outAttrs, basePlan, inputOrds, dictLits, gkSlots, maxGroups,
-                  aggKinds, outBufToTerm, outTypes, cudaSrc, kname)
-            }
+            GpuGenericTableJitReduceExec(
+              outAttrs, basePlan, inputOrds, dictLits, gkSlots, maxGroups,
+              aggKinds, outBufToTerm, outTypes, cudaSrc, kname)
         }
     }
   }
@@ -1239,135 +1167,6 @@ private object GenericReduceBatchBuilder {
       cols.map(_.asInstanceOf[org.apache.spark.sql.vectorized.ColumnVector]).toArray,
       rawTbl.getRowCount.toInt)
   }
-}
-
-private case class GenericJitReducePartition(index: Int, filePaths: Array[String]) extends Partition
-
-private class GpuGenericLencJitReduceRdd(
-    sc: SparkContext,
-    fileGroups: Array[Array[String]],
-    serConf: SerializableConfiguration,
-    fileColIndices: Array[Int],
-    dictLits: Array[Array[String]],
-    gkSlots: Array[Int],
-    maxGroups: Int,
-    aggKinds: Array[Byte],
-    outBufToTerm: Array[Int],
-    outTypes: Array[DataType],
-    rangePreds: Array[LencRangePred],
-    cudaSrc: String,
-    kernelName: String,
-    metrics: Map[String, GpuMetric]) extends RDD[ColumnarBatch](sc, Nil) {
-
-  override protected def getPartitions: Array[Partition] =
-    fileGroups.zipWithIndex.map { case (fs, i) => GenericJitReducePartition(i, fs) }
-
-  override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
-    val p = split.asInstanceOf[GenericJitReducePartition]
-    val opTime = metrics.getOrElse(OP_TIME_LEGACY, NoopMetric)
-    val bufferTime = metrics.getOrElse(BUFFER_TIME, NoopMetric)
-    val gpuDecodeTime = metrics.getOrElse(GPU_DECODE_TIME, NoopMetric)
-    val numOutputRows = metrics.getOrElse(NUM_OUTPUT_ROWS, NoopMetric)
-    val numOutputBatches = metrics.getOrElse(NUM_OUTPUT_BATCHES, NoopMetric)
-
-    val prefetcher = new LencAsyncPrefetcher(p.filePaths, fileColIndices, rangePreds, serConf)
-    if (context != null) {
-      context.addTaskCompletionListener[Unit](_ => prefetcher.close())
-    }
-
-    val cpSlots = if (rangePreds.nonEmpty) rangePreds.map(_.planSlot) else null
-    val cpOps = if (rangePreds.nonEmpty) rangePreds.map(_.op) else null
-    val cpIsF = if (rangePreds.nonEmpty) rangePreds.map(r => if (r.isFloat) 1.toByte else 0.toByte) else null
-    val cpIb = if (rangePreds.nonEmpty) rangePreds.map(_.intBound) else null
-    val cpDb = if (rangePreds.nonEmpty) rangePreds.map(_.doubleBound) else null
-
-    new Iterator[ColumnarBatch] {
-      private var nextBatch: ColumnarBatch = _
-
-      private def advance(): Unit = {
-        while (nextBatch == null) {
-          val itemOpt = opTime.ns { bufferTime.ns { prefetcher.next() } }
-          if (itemOpt.isEmpty) {
-            prefetcher.close()
-            return
-          }
-          val item = itemOpt.get
-          opTime.ns {
-            withResource(item.plan) { plan =>
-              withResource(item.hostBuf) { hb =>
-                GpuSemaphore.acquireIfNecessary(TaskContext.get())
-                val tbl = gpuDecodeTime.ns {
-                  GpuJitReducePool.withProgram(cudaSrc, kernelName) { prog =>
-                    prog.runOnLenc(
-                      plan, hb, dictLits, gkSlots, maxGroups, aggKinds,
-                      cpSlots, cpOps, cpIsF, cpIb, cpDb)
-                  }
-                }
-                withResource(tbl) { t =>
-                  if (t.getRowCount > 0) {
-                    numOutputRows += t.getRowCount
-                    numOutputBatches += 1
-                    nextBatch = GenericReduceBatchBuilder.projectBuffers(
-                      t, gkSlots.length, outBufToTerm, outTypes)
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-
-      override def hasNext: Boolean = {
-        if (nextBatch == null) advance()
-        nextBatch != null
-      }
-
-      override def next(): ColumnarBatch = {
-        if (!hasNext) throw new NoSuchElementException
-        val ret = nextBatch
-        nextBatch = null
-        ret
-      }
-    }
-  }
-}
-
-case class GpuGenericLencJitReduceExec(
-    output: Seq[Attribute],
-    files: Array[String],
-    fileSizes: Array[Long],
-    serConf: SerializableConfiguration,
-    fileColIndices: Array[Int],
-    dictLits: Array[Array[String]],
-    gkSlots: Array[Int],
-    maxGroups: Int,
-    aggKinds: Array[Byte],
-    outBufToTerm: Array[Int],
-    outTypes: Array[DataType],
-    rangePreds: Array[LencRangePred],
-    cudaSrc: String,
-    kernelName: String) extends LeafExecNode with GpuExec {
-
-  override def supportsColumnar: Boolean = true
-
-  override protected def doExecute(): RDD[org.apache.spark.sql.catalyst.InternalRow] =
-    throw new IllegalStateException("GpuGenericLencJitReduceExec must execute columnar on GPU")
-
-  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
-    GPU_DECODE_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_GPU_DECODE_TIME),
-    BUFFER_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_BUFFER_TIME),
-    OP_TIME_LEGACY -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_OP_TIME_LEGACY)
-  )
-
-  override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
-    val groups = LencPartitionHelper.groupFiles(files, fileSizes)
-    new GpuGenericLencJitReduceRdd(
-      sparkContext, groups, serConf, fileColIndices, dictLits, gkSlots, maxGroups,
-      aggKinds, outBufToTerm, outTypes, rangePreds, cudaSrc, kernelName, allMetrics)
-  }
-
-  override def simpleString(maxFields: Int): String =
-    s"GpuGenericLencJitReduce(files=${files.length}, gk=${gkSlots.length}, aggs=${aggKinds.length})"
 }
 
 case class GpuGenericTableJitReduceExec(

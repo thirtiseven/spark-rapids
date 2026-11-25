@@ -64,38 +64,36 @@ class GpuProjectExecMeta(
     // Force list to avoid recursive Java serialization of lazy list Seq implementation
     val gpuExprs = childExprs.map(_.convertToGpu().asInstanceOf[NamedExpression]).toList
     val gpuChild = childPlans.head.convertIfNeeded()
-    com.nvidia.spark.rapids.lenc.LencLtoFusion.tryFuse(gpuExprs, gpuChild).getOrElse {
-      val projectList = GpuProjectAstPlanner.wrapProjectOutputs(
-        gpuExprs, proj.conf, conf.isProjectAstEnabled, conf.isProjectAstJitEnabled)
-          .map(_.asInstanceOf[NamedExpression]).toList
-      // Report original eligibility here and final backend selection after tiering. These outputs
-      // run on the GPU either way, so NOT_ON_GPU does not report them.
-      if (conf.shouldExplainAll && conf.isProjectAstEnabled) {
-        val legacyExplain = childExprs.iterator.zip(projectList.iterator).flatMap {
-          case (meta, expression) if GpuAstJitExpression.extractTopLevel(expression).isEmpty =>
-            Some(meta.explainAst(all = true)).filter(_.nonEmpty)
-                .map(explanation => s"  Legacy Project AST eligibility:\n$explanation")
-          case _ => None
-        }
-        val regularExplain = gpuExprs.iterator.zip(projectList.iterator).collect {
-          case (expr, expression)
-              if GpuProjectAstExpressionBase.extractTopLevel(expression).isEmpty &&
-                !GpuBatchUtils.isFixedWidth(expr.dataType) =>
-            s"  $expr cannot be converted to legacy Project AST because its return type " +
-              s"${expr.dataType} is not fixed-width\n"
-          case (expr, expression)
-              if GpuProjectAstExpressionBase.extractTopLevel(expression).isEmpty &&
-                isTopLevelNullLiteral(expr) =>
-            s"  $expr will use the regular GPU projection instead of legacy Project AST so " +
-              "null outputs can reuse the cached null vector\n"
-        }
-        val explain = (legacyExplain ++ regularExplain).mkString
-        if (explain.nonEmpty) {
-          logWarning(s"LEGACY PROJECT AST\n$explain")
-        }
+    val projectList = GpuProjectAstPlanner.wrapProjectOutputs(
+      gpuExprs, proj.conf, conf.isProjectAstEnabled, conf.isProjectAstJitEnabled)
+        .map(_.asInstanceOf[NamedExpression]).toList
+    // Report original eligibility here and final backend selection after tiering. These outputs
+    // run on the GPU either way, so NOT_ON_GPU does not report them.
+    if (conf.shouldExplainAll && conf.isProjectAstEnabled) {
+      val legacyExplain = childExprs.iterator.zip(projectList.iterator).flatMap {
+        case (meta, expression) if GpuAstJitExpression.extractTopLevel(expression).isEmpty =>
+          Some(meta.explainAst(all = true)).filter(_.nonEmpty)
+              .map(explanation => s"  Legacy Project AST eligibility:\n$explanation")
+        case _ => None
       }
-      GpuProjectExec(projectList, gpuChild)(Some(proj.projectList.toList))
+      val regularExplain = gpuExprs.iterator.zip(projectList.iterator).collect {
+        case (expr, expression)
+            if GpuProjectAstExpressionBase.extractTopLevel(expression).isEmpty &&
+              !GpuBatchUtils.isFixedWidth(expr.dataType) =>
+          s"  $expr cannot be converted to legacy Project AST because its return type " +
+            s"${expr.dataType} is not fixed-width\n"
+        case (expr, expression)
+            if GpuProjectAstExpressionBase.extractTopLevel(expression).isEmpty &&
+              isTopLevelNullLiteral(expr) =>
+          s"  $expr will use the regular GPU projection instead of legacy Project AST so " +
+            "null outputs can reuse the cached null vector\n"
+      }
+      val explain = (legacyExplain ++ regularExplain).mkString
+      if (explain.nonEmpty) {
+        logWarning(s"LEGACY PROJECT AST\n$explain")
+      }
     }
+    GpuProjectExec(projectList, gpuChild)(Some(proj.projectList.toList))
   }
 }
 
@@ -1377,12 +1375,8 @@ case class GpuFilterExecMeta(
   parentMetaOpt: Option[RapidsMeta[_, _, _]],
   rule: DataFromReplacementRule
 ) extends SparkPlanMeta[FilterExec](filter, conf, parentMetaOpt, rule) {
-  override def convertToGpu(): GpuExec = {
-    val gpuCond = childExprs.head.convertToGpu()
-    val gpuChild = childPlans.head.convertIfNeeded()
-    com.nvidia.spark.rapids.lenc.LencLtoFusion.tryFuseFilter(gpuCond, gpuChild)
-      .getOrElse(GpuFilterExec(gpuCond, gpuChild)())
-  }
+  override def convertToGpu(): GpuExec =
+    GpuFilterExec(childExprs.head.convertToGpu(), childPlans.head.convertIfNeeded())()
 }
 
 case class GpuFilterExec(

@@ -34,8 +34,142 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, ExprId, NamedExpression}
 import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan}
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.rapids._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
+
+/**
+ * Simple file/chunk-level range predicate extracted from conjunction filters for zero-reconversion
+ * .lenc Min-Max ZoneMap pruning (Track 3).
+ * op: 0 = LT, 1 = LE, 2 = GT, 3 = GE, 4 = EQ.
+ */
+final case class LencRangePred(
+    planSlot: Int,
+    op: Int,
+    isFloat: Boolean,
+    intBound: Long,
+    doubleBound: Double)
+
+object LencRangePruner {
+  val OP_LT = 0
+  val OP_LE = 1
+  val OP_GT = 2
+  val OP_GE = 3
+  val OP_EQ = 4
+
+  private def pow10(e: Int): Double = e match {
+    case 0 => 1.0
+    case 1 => 10.0
+    case 2 => 100.0
+    case 3 => 1000.0
+    case 4 => 10000.0
+    case k => math.pow(10.0, k)
+  }
+
+  def canSkipFile(plan: LencNative.ReadPlan, preds: Array[LencRangePred]): Boolean = {
+    if (preds.isEmpty) return false
+    val hasMM = plan.colHasMinMax()
+    val mins = plan.colMins()
+    val maxs = plan.colMaxs()
+    val exps = plan.colScaleExp10()
+    var i = 0
+    while (i < preds.length) {
+      val pr = preds(i)
+      val s = pr.planSlot
+      if (s >= 0 && s < hasMM.length && hasMM(s) != 0) {
+        if (pr.isFloat) {
+          val inv = 1.0 / pow10(exps(s))
+          val fmin = mins(s).toDouble * inv
+          val fmax = maxs(s).toDouble * inv
+          val b = pr.doubleBound
+          // Conservative epsilon for float scaling rounding
+          val eps = 1e-6 * math.max(1.0, math.abs(b))
+          val skip = pr.op match {
+            case OP_LT => fmin >= b + eps
+            case OP_LE => fmin > b + eps
+            case OP_GT => fmax <= b - eps
+            case OP_GE => fmax < b - eps
+            case OP_EQ => (b < fmin - eps) || (b > fmax + eps)
+            case _ => false
+          }
+          if (skip) return true
+        } else {
+          val lo = mins(s)
+          val hi = maxs(s)
+          val b = pr.intBound
+          val skip = pr.op match {
+            case OP_LT => lo >= b
+            case OP_LE => lo > b
+            case OP_GT => hi <= b
+            case OP_GE => hi < b
+            case OP_EQ => (b < lo) || (b > hi)
+            case _ => false
+          }
+          if (skip) return true
+        }
+      }
+      i += 1
+    }
+    false
+  }
+
+  private def literalToBound(lit: GpuLiteral): Option[(Boolean, Long, Double)] = {
+    if (lit.value == null) return None
+    lit.dataType match {
+      case IntegerType | DateType => Some((false, lit.value.asInstanceOf[Int].toLong, 0.0))
+      case LongType | TimestampType => Some((false, lit.value.asInstanceOf[Long], 0.0))
+      case ShortType => Some((false, lit.value.asInstanceOf[Short].toLong, 0.0))
+      case ByteType => Some((false, lit.value.asInstanceOf[Byte].toLong, 0.0))
+      case FloatType =>
+        val v = lit.value.asInstanceOf[Float].toDouble
+        if (v.isNaN) None else Some((true, 0L, v))
+      case DoubleType =>
+        val v = lit.value.asInstanceOf[Double]
+        if (v.isNaN) None else Some((true, 0L, v))
+      case _ => None
+    }
+  }
+
+  /** Extract conjunctive range predicates mapped to slots in `planFileColIndices`. */
+  def extract(
+      filterExpr: Expression,
+      filterFileColIndices: Array[Int],
+      planFileColIndices: Array[Int]): Array[LencRangePred] = {
+    val fileColToPlanSlot = planFileColIndices.zipWithIndex.toMap
+    val out = mutable.ArrayBuffer.empty[LencRangePred]
+
+    def splitAnd(e: Expression): Seq[Expression] = e match {
+      case GpuAnd(l, r) => splitAnd(l) ++ splitAnd(r)
+      case other => Seq(other)
+    }
+
+    def addCmp(ref: GpuBoundReference, lit: GpuLiteral, op: Int): Unit = {
+      if (ref.ordinal >= 0 && ref.ordinal < filterFileColIndices.length) {
+        val fci = filterFileColIndices(ref.ordinal)
+        fileColToPlanSlot.get(fci).foreach { pslot =>
+          literalToBound(lit).foreach { case (isF, ib, db) =>
+            out += LencRangePred(pslot, op, isF, ib, db)
+          }
+        }
+      }
+    }
+
+    splitAnd(filterExpr).foreach {
+      case GpuLessThan(ref: GpuBoundReference, lit: GpuLiteral) => addCmp(ref, lit, OP_LT)
+      case GpuLessThan(lit: GpuLiteral, ref: GpuBoundReference) => addCmp(ref, lit, OP_GT)
+      case GpuLessThanOrEqual(ref: GpuBoundReference, lit: GpuLiteral) => addCmp(ref, lit, OP_LE)
+      case GpuLessThanOrEqual(lit: GpuLiteral, ref: GpuBoundReference) => addCmp(ref, lit, OP_GE)
+      case GpuGreaterThan(ref: GpuBoundReference, lit: GpuLiteral) => addCmp(ref, lit, OP_GT)
+      case GpuGreaterThan(lit: GpuLiteral, ref: GpuBoundReference) => addCmp(ref, lit, OP_LT)
+      case GpuGreaterThanOrEqual(ref: GpuBoundReference, lit: GpuLiteral) => addCmp(ref, lit, OP_GE)
+      case GpuGreaterThanOrEqual(lit: GpuLiteral, ref: GpuBoundReference) => addCmp(ref, lit, OP_LE)
+      case GpuEqualTo(ref: GpuBoundReference, lit: GpuLiteral) => addCmp(ref, lit, OP_EQ)
+      case GpuEqualTo(lit: GpuLiteral, ref: GpuBoundReference) => addCmp(ref, lit, OP_EQ)
+      case _ =>
+    }
+    out.toArray
+  }
+}
 
 /**
  * AST leaf expression representing an inlineable LTO-IR .lenc column decoder UDF call
@@ -114,7 +248,6 @@ final case class LtoExprSpec(
 object LencLtoFusion {
   val LTO_FUSION_CONF = "spark.rapids.sql.lenc.ltoFusionEnabled"
 
-  // Must match lenc.hpp Encoding & ColType enum values
   private val ENC_FOR_BITPACK: Byte = 0
   private val ENC_DICT_BITPACK: Byte = 1
   private val ENC_RLE_INT: Byte = 2
@@ -131,7 +264,6 @@ object LencLtoFusion {
   private val TYPE_STRING: Byte = 5
 
   def decodeSymbolAndType(encoding: Byte, colType: Byte): (String, DataType, DType) = {
-    // DELTA_FOR_BITPACK and NVCOMP_LZ4_FIXED are transparently pre-decoded into raw_ptr in lenc.cu
     val effEnc =
       if (encoding == ENC_DELTA_FOR_BITPACK || encoding == ENC_NVCOMP_LZ4_FIXED) ENC_RAW_FIXED
       else encoding
@@ -239,10 +371,6 @@ object LencLtoFusion {
     Some(LtoExprSpec(fileColIndices, compactExprs, dictLiteralsPerSlot))
   }
 
-  /**
-   * Pattern 1: Fuse `GpuFilterExec(gpuCond, GpuBatchScanExec(GpuLencScan))` into
-   * two-stage late-materialized `GpuLencLtoFilterScanExec`.
-   */
   def tryFuseFilter(gpuCond: Expression, gpuChild: SparkPlan): Option[GpuExec] = {
     val enabled = SQLConf.get.getConfString(LTO_FUSION_CONF, "false").toBoolean
     if (!enabled) {
@@ -277,11 +405,6 @@ object LencLtoFusion {
     }
   }
 
-  /**
-   * Pattern 2 & 3:
-   * - `GpuProjectExec(gpuExprs, GpuBatchScanExec(GpuLencScan))` -> `GpuLencLtoScanExec`
-   * - `GpuProjectExec(gpuExprs, GpuLencLtoFilterScanExec)` -> `GpuLencLtoFilterProjectScanExec`
-   */
   def tryFuse(gpuExprs: Seq[NamedExpression], gpuChild: SparkPlan): Option[GpuExec] = {
     val enabled = SQLConf.get.getConfString(LTO_FUSION_CONF, "false").toBoolean
     if (!enabled || gpuExprs.isEmpty) {
@@ -394,7 +517,16 @@ private class GpuLencLtoRdd(
   }
 }
 
-/** Pattern 1 & 3 RDD: Two-stage late-materialized Filter(Scan) or Project(Filter(Scan)) via LTO. */
+/**
+ * Track 3 Unified Adaptive Filter+Project / Filter+Decode LTO RDD:
+ * - Zero-reconversion file Min-Max ZoneMap pruning in LencAsyncPrefetcher!
+ * - Mode A (Single-H2D Unified LTO): when `projSpecOpt.isDefined` OR payload has NO String
+ *   columns (e.g. TPC-H Q6/Q14/Q19), prefetches union(filterCols, projCols) ONCE off-semaphore
+ *   and executes BOTH filter LTO + selected-row project/decode on ONE single H2D buffer!
+ * - Mode B (Two-Stage IO-Skipping LTO): when payload includes heavy String columns (e.g. NF_J0202),
+ *   prefetches ONLY filter cols, skips Stage 2 disk read if 0 rows match, and releases the GPU
+ *   semaphore during Stage 2 disk read!
+ */
 private class GpuLencLtoFilterRdd(
     sc: SparkContext,
     fileGroups: Array[Array[String]],
@@ -416,126 +548,186 @@ private class GpuLencLtoFilterRdd(
     val numOutputRows = metrics.getOrElse(NUM_OUTPUT_ROWS, NoopMetric)
     val numOutputBatches = metrics.getOrElse(NUM_OUTPUT_BATCHES, NoopMetric)
 
-    // Prefetch Stage 1 (filter columns only!) asynchronously OFF the GPU semaphore
-    val prefetcher = new LencAsyncPrefetcher(lp.filePaths, filterSpec.fileColIndices)
-    if (context != null) {
-      context.addTaskCompletionListener[Unit](_ => prefetcher.close())
-    }
+    val hasHeavyStringPayload = projSpecOpt.isEmpty && outTypes.contains(StringType)
+    val useSingleH2D = !hasHeavyStringPayload
 
     val dict32Arr: Array[Byte] =
       if (outDict32Mask.nonEmpty && outDict32Mask.exists(_ != 0)) outDict32Mask else null
 
-    new Iterator[ColumnarBatch] {
-      private var nextBatch: ColumnarBatch = _
+    if (useSingleH2D) {
+      val stage2FileCols = projSpecOpt.map(_.fileColIndices).getOrElse(outFileIndices)
+      val unionCols = (filterSpec.fileColIndices ++ stage2FileCols).distinct.sorted
+      val colToUnionSlot = unionCols.zipWithIndex.toMap
+      val filterCmap = filterSpec.fileColIndices.map(colToUnionSlot)
+      val projCmap = stage2FileCols.map(colToUnionSlot)
+      val rangePreds = LencRangePruner.extract(
+        filterSpec.compactExprs.head, filterSpec.fileColIndices, unionCols)
 
-      private def advance(): Unit = {
-        while (nextBatch == null) {
-          val itemOpt = opTime.ns { bufferTime.ns { prefetcher.next() } }
-          if (itemOpt.isEmpty) {
-            prefetcher.close()
-            return
-          }
-          val item = itemOpt.get
-          opTime.ns {
-            val selectedOpt = withResource(item.plan) { fPlan =>
-              val fEncs = fPlan.columnEncodings()
-              val fTypes = fPlan.columnTypes()
-              withResource(item.hostBuf) { fHb =>
-                GpuSemaphore.acquireIfNecessary(TaskContext.get())
-                gpuDecodeTime.ns {
-                  val fKey = GpuLencLtoProgramPool.PoolKey(
-                    filterSpec.compactExprs, fEncs.toVector, fTypes.toVector)
-                  val (maskTbl, _) = GpuLencLtoProgramPool.withProgram(
-                    fKey,
-                    LencLtoFusion.buildLtoProgram(filterSpec.compactExprs, fEncs, fTypes)) { prog =>
-                    prog.run(fPlan, fHb, filterSpec.dictLiteralsPerSlot)
-                  }
-                  withResource(maskTbl) { mt =>
-                    val sel = LencNative.compactMaskIndices(mt.getColumn(0))
-                    if (sel.getRowCount == 0L) {
-                      sel.close()
-                      None
-                    } else {
-                      Some(sel)
-                    }
-                  }
-                }
-              }
+      val prefetcher = new LencAsyncPrefetcher(lp.filePaths, unionCols, rangePreds)
+      if (context != null) {
+        context.addTaskCompletionListener[Unit](_ => prefetcher.close())
+      }
+
+      new Iterator[ColumnarBatch] {
+        private var nextBatch: ColumnarBatch = _
+
+        private def advance(): Unit = {
+          while (nextBatch == null) {
+            val itemOpt = opTime.ns { bufferTime.ns { prefetcher.next() } }
+            if (itemOpt.isEmpty) {
+              prefetcher.close()
+              return
             }
-
-            // Stage 2: ONLY if >0 rows survived, read & late-materialize payload / LTO project!
-            selectedOpt.foreach { selCol =>
-              withResource(selCol) { sel =>
-                projSpecOpt match {
-                  case Some(pSpec) =>
-                    withResource(LencNative.planRead(item.filePath, pSpec.fileColIndices)) { pPlan =>
-                      val pBytes = pPlan.totalPackedBytes()
-                      val pEncs = pPlan.columnEncodings()
-                      val pTypes = pPlan.columnTypes()
-                      val pBuf = bufferTime.ns {
-                        val b = HostMemoryBuffer.allocate(math.max(pBytes, 64L))
-                        closeOnExcept(b) { buf =>
-                          if (pBytes > 0L) pPlan.readToHost(item.filePath, buf)
-                        }
-                        b
-                      }
-                      withResource(pBuf) { hb =>
-                        val tbl = gpuDecodeTime.ns {
+            val item = itemOpt.get
+            opTime.ns {
+              withResource(item.plan) { uPlan =>
+                val uEncs = uPlan.columnEncodings()
+                val uTypes = uPlan.columnTypes()
+                val fEncs = filterCmap.map(uEncs)
+                val fTypes = filterCmap.map(uTypes)
+                withResource(item.hostBuf) { hb =>
+                  GpuSemaphore.acquireIfNecessary(TaskContext.get())
+                  val tblOpt = gpuDecodeTime.ns {
+                    val fKey = GpuLencLtoProgramPool.PoolKey(
+                      filterSpec.compactExprs, fEncs.toVector, fTypes.toVector)
+                    val (res, _) = GpuLencLtoProgramPool.withProgram(
+                      fKey,
+                      LencLtoFusion.buildLtoProgram(filterSpec.compactExprs, fEncs, fTypes)) { fProg =>
+                      projSpecOpt match {
+                        case Some(pSpec) =>
+                          val pEncs = projCmap.map(uEncs)
+                          val pTypes = projCmap.map(uTypes)
                           val pKey = GpuLencLtoProgramPool.PoolKey(
                             pSpec.compactExprs, pEncs.toVector, pTypes.toVector)
                           val (t, _) = GpuLencLtoProgramPool.withProgram(
                             pKey,
-                            LencLtoFusion.buildLtoProgram(pSpec.compactExprs, pEncs, pTypes)) { prog =>
-                            prog.runSelected(pPlan, hb, pSpec.dictLiteralsPerSlot, sel)
+                            LencLtoFusion.buildLtoProgram(pSpec.compactExprs, pEncs, pTypes)) { pProg =>
+                            LencNative.runLtoFilterAndProject(
+                              fProg, pProg, uPlan, hb,
+                              filterCmap, filterSpec.dictLiteralsPerSlot,
+                              projCmap, pSpec.dictLiteralsPerSlot, dict32Arr)
                           }
-                          t
-                        }
-                        withResource(tbl) { t =>
-                          numOutputRows += t.getRowCount
-                          numOutputBatches += 1
-                          nextBatch = GpuColumnVector.from(t, outTypes)
-                        }
+                          Option(t)
+                        case None =>
+                          Option(LencNative.runLtoFilterAndProject(
+                            fProg, null, uPlan, hb,
+                            filterCmap, filterSpec.dictLiteralsPerSlot,
+                            projCmap, Array.empty[Array[String]], dict32Arr))
                       }
                     }
-
-                  case None =>
-                    withResource(LencNative.planRead(item.filePath, outFileIndices)) { pPlan =>
-                      val pBytes = pPlan.totalPackedBytes()
-                      val pBuf = bufferTime.ns {
-                        val b = HostMemoryBuffer.allocate(math.max(pBytes, 64L))
-                        closeOnExcept(b) { buf =>
-                          if (pBytes > 0L) pPlan.readToHost(item.filePath, buf)
-                        }
-                        b
-                      }
-                      withResource(pBuf) { hb =>
-                        val tbl = gpuDecodeTime.ns {
-                          pPlan.decodeFromHostSelected(hb, dict32Arr, sel)
-                        }
-                        withResource(tbl) { t =>
-                          numOutputRows += t.getRowCount
-                          numOutputBatches += 1
-                          nextBatch = GpuColumnVector.from(t, outTypes)
-                        }
-                      }
+                    res
+                  }
+                  tblOpt.foreach { tbl =>
+                    withResource(tbl) { t =>
+                      numOutputRows += t.getRowCount
+                      numOutputBatches += 1
+                      nextBatch = GpuColumnVector.from(t, outTypes)
                     }
+                  }
                 }
               }
             }
           }
         }
+
+        override def hasNext: Boolean = {
+          if (nextBatch == null) advance()
+          nextBatch != null
+        }
+
+        override def next(): ColumnarBatch = {
+          if (!hasNext) throw new NoSuchElementException
+          val ret = nextBatch
+          nextBatch = null
+          ret
+        }
+      }
+    } else {
+      // Mode B: Two-stage IO-skipping for heavy String payloads (e.g. NF_J0202)
+      val rangePreds = LencRangePruner.extract(
+        filterSpec.compactExprs.head, filterSpec.fileColIndices, filterSpec.fileColIndices)
+      val prefetcher = new LencAsyncPrefetcher(lp.filePaths, filterSpec.fileColIndices, rangePreds)
+      if (context != null) {
+        context.addTaskCompletionListener[Unit](_ => prefetcher.close())
       }
 
-      override def hasNext: Boolean = {
-        if (nextBatch == null) advance()
-        nextBatch != null
-      }
+      new Iterator[ColumnarBatch] {
+        private var nextBatch: ColumnarBatch = _
 
-      override def next(): ColumnarBatch = {
-        if (!hasNext) throw new NoSuchElementException
-        val ret = nextBatch
-        nextBatch = null
-        ret
+        private def advance(): Unit = {
+          while (nextBatch == null) {
+            val itemOpt = opTime.ns { bufferTime.ns { prefetcher.next() } }
+            if (itemOpt.isEmpty) {
+              prefetcher.close()
+              return
+            }
+            val item = itemOpt.get
+            opTime.ns {
+              val selectedOpt = withResource(item.plan) { fPlan =>
+                val fEncs = fPlan.columnEncodings()
+                val fTypes = fPlan.columnTypes()
+                withResource(item.hostBuf) { fHb =>
+                  GpuSemaphore.acquireIfNecessary(TaskContext.get())
+                  gpuDecodeTime.ns {
+                    val fKey = GpuLencLtoProgramPool.PoolKey(
+                      filterSpec.compactExprs, fEncs.toVector, fTypes.toVector)
+                    val (maskTbl, _) = GpuLencLtoProgramPool.withProgram(
+                      fKey,
+                      LencLtoFusion.buildLtoProgram(filterSpec.compactExprs, fEncs, fTypes)) { prog =>
+                      prog.run(fPlan, fHb, filterSpec.dictLiteralsPerSlot)
+                    }
+                    withResource(maskTbl) { mt =>
+                      val sel = LencNative.compactMaskIndices(mt.getColumn(0))
+                      if (sel.getRowCount == 0L) {
+                        sel.close()
+                        None
+                      } else {
+                        Some(sel)
+                      }
+                    }
+                  }
+                }
+              }
+
+              selectedOpt.foreach { selCol =>
+                withResource(selCol) { sel =>
+                  withResource(LencNative.planRead(item.filePath, outFileIndices)) { pPlan =>
+                    val pBytes = pPlan.totalPackedBytes()
+                    val pBuf = bufferTime.ns {
+                      val b = HostMemoryBuffer.allocate(math.max(pBytes, 64L))
+                      closeOnExcept(b) { buf =>
+                        if (pBytes > 0L) pPlan.readToHost(item.filePath, buf)
+                      }
+                      b
+                    }
+                    withResource(pBuf) { hb =>
+                      val tbl = gpuDecodeTime.ns {
+                        pPlan.decodeFromHostSelected(hb, dict32Arr, sel)
+                      }
+                      withResource(tbl) { t =>
+                        numOutputRows += t.getRowCount
+                        numOutputBatches += 1
+                        nextBatch = GpuColumnVector.from(t, outTypes)
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        override def hasNext: Boolean = {
+          if (nextBatch == null) advance()
+          nextBatch != null
+        }
+
+        override def next(): ColumnarBatch = {
+          if (!hasNext) throw new NoSuchElementException
+          val ret = nextBatch
+          nextBatch = null
+          ret
+        }
       }
     }
   }

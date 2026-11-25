@@ -198,10 +198,32 @@ trait GpuPartitioning extends Partitioning {
     }
   }
 
+  private def isLencShuffleSupported(table: Table): Boolean = {
+    if (!org.apache.spark.sql.internal.SQLConf.get
+        .getConfString("spark.rapids.sql.lenc.shuffleEnabled", "false").toBoolean) {
+      return false
+    }
+    var i = 0
+    val nc = table.getNumberOfColumns
+    while (i < nc) {
+      val dt = table.getColumn(i).getType
+      if (dt.isNestedType || dt == ai.rapids.cudf.DType.DICTIONARY32 ||
+          dt.getTypeId == ai.rapids.cudf.DType.DTypeEnum.DECIMAL128) {
+        return false
+      }
+      i += 1
+    }
+    true
+  }
+
   private def gpuSplitAndSerialize(table: Table, slices: Int*): Array[DeviceMemoryBuffer] = {
     NvtxRegistry.GPU_KUDO_SERIALIZE {
       withRetryNoSplit {
-        KudoGpuSerializer.splitAndSerializeToDevice(table, slices: _*)
+        if (isLencShuffleSupported(table)) {
+          com.nvidia.spark.rapids.jni.LencNative.splitAndEncodeShuffleToDevice(table, slices: _*)
+        } else {
+          KudoGpuSerializer.splitAndSerializeToDevice(table, slices: _*)
+        }
       }
     }
   }

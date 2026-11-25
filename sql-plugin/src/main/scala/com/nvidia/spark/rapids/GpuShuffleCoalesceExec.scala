@@ -390,36 +390,72 @@ class KudoGpuTableOperator(dataTypes: Array[DataType])
       // one host allocation per batch instead of one per table, and every
       // pinned allocation serializes on a single lock.
       val spillables = columns.map(_.spillableKudoTable)
-      val dataBufSize = spillables.foldLeft(0L) { (acc, skt) =>
-        acc + skt.header.getTotalDataLen + skt.header.getSerializedSize
+      // Detect LSHF lightweight-encoded shuffle frames via 4-byte magic in first non-empty payload
+      val isLencFrame = {
+        val firstNonEmpty = spillables.find(_.header.getTotalDataLen >= 16)
+        firstNonEmpty.exists { skt =>
+          withResource(HostMemoryBuffer.allocate(skt.header.getTotalDataLen)) { tmp =>
+            skt.materializeInto(tmp, 0L)
+            tmp.getInt(0L) == 0x4648534C // "LSHF"
+          }
+        }
       }
-      val offsetsBufSize = 8L * (spillables.length + 1)
-      val dataHostBuf = HostMemoryBuffer.allocate(dataBufSize)
-      val hostBuffers = closeOnExcept(dataHostBuf) { _ =>
-        KudoBuffers(dataHostBuf, HostMemoryBuffer.allocate(offsetsBufSize))
-      }
-      withResource(hostBuffers) { case KudoBuffers(dataHost, offsetsHost) =>
-        var currentOffset = 0L
+      if (isLencFrame) {
+        // Stage ONLY 8-byte-aligned LSHF payloads (strip Kudo headers -> guaranteed 8B GPU alignment!)
+        val hostOffArr = new Array[Long](spillables.length + 1)
+        var alignedSize = 0L
         spillables.zipWithIndex.foreach { case (skt, i) =>
-          offsetsHost.setLong(i * 8L, currentOffset)
-          skt.header.writeTo(dataHost, currentOffset)
-          currentOffset += skt.header.getSerializedSize
-          skt.materializeInto(dataHost, currentOffset)
-          currentOffset += skt.header.getTotalDataLen
+          hostOffArr(i) = alignedSize
+          alignedSize = (alignedSize + skt.header.getTotalDataLen + 7L) & ~7L
         }
-        offsetsHost.setLong(spillables.length * 8L, currentOffset)
-        val dataDevBuf = DeviceMemoryBuffer.allocate(dataHost.getLength)
-        val devBuffers = closeOnExcept(dataDevBuf) { _ =>
-          KudoBuffers(dataDevBuf, DeviceMemoryBuffer.allocate(offsetsHost.getLength))
+        hostOffArr(spillables.length) = alignedSize
+        withResource(HostMemoryBuffer.allocate(math.max(alignedSize, 8L))) { dataHost =>
+          spillables.zipWithIndex.foreach { case (skt, i) =>
+            if (skt.header.getTotalDataLen > 0) {
+              skt.materializeInto(dataHost, hostOffArr(i))
+            }
+          }
+          withResource(DeviceMemoryBuffer.allocate(dataHost.getLength)) { dataDev =>
+            dataDev.copyFromHostBuffer(dataHost)
+            val dtypes = dataTypes.map(GpuColumnVector.getNonNestedRapidsType)
+            withResource(com.nvidia.spark.rapids.jni.LencNative
+                .assembleAndDecodeShuffleFromDevice(dataHost, dataDev, hostOffArr, dtypes, null)) { t =>
+              GpuColumnVector.from(t, dataTypes)
+            }
+          }
         }
-        withResource(devBuffers) { case KudoBuffers(dataDev, offsetsDev) =>
-          dataDev.copyFromHostBuffer(dataHost)
-          offsetsDev.copyFromHostBuffer(offsetsHost)
+      } else {
+        val dataBufSize = spillables.foldLeft(0L) { (acc, skt) =>
+          acc + skt.header.getTotalDataLen + skt.header.getSerializedSize
+        }
+        val offsetsBufSize = 8L * (spillables.length + 1)
+        val dataHostBuf = HostMemoryBuffer.allocate(dataBufSize)
+        val hostBuffers = closeOnExcept(dataHostBuf) { _ =>
+          KudoBuffers(dataHostBuf, HostMemoryBuffer.allocate(offsetsBufSize))
+        }
+        withResource(hostBuffers) { case KudoBuffers(dataHost, offsetsHost) =>
+          var currentOffset = 0L
+          spillables.zipWithIndex.foreach { case (skt, i) =>
+            offsetsHost.setLong(i * 8L, currentOffset)
+            skt.header.writeTo(dataHost, currentOffset)
+            currentOffset += skt.header.getSerializedSize
+            skt.materializeInto(dataHost, currentOffset)
+            currentOffset += skt.header.getTotalDataLen
+          }
+          offsetsHost.setLong(spillables.length * 8L, currentOffset)
+          val dataDevBuf = DeviceMemoryBuffer.allocate(dataHost.getLength)
+          val devBuffers = closeOnExcept(dataDevBuf) { _ =>
+            KudoBuffers(dataDevBuf, DeviceMemoryBuffer.allocate(offsetsHost.getLength))
+          }
+          withResource(devBuffers) { case KudoBuffers(dataDev, offsetsDev) =>
+            dataDev.copyFromHostBuffer(dataHost)
+            offsetsDev.copyFromHostBuffer(offsetsHost)
 
-          val schema = GpuColumnVector.from(dataTypes)
-          withResource(KudoGpuSerializer.assembleFromDeviceRaw(
-              schema, dataDev, offsetsDev)) { table =>
-            GpuColumnVector.from(table, dataTypes)
+            val schema = GpuColumnVector.from(dataTypes)
+            withResource(KudoGpuSerializer.assembleFromDeviceRaw(
+                schema, dataDev, offsetsDev)) { table =>
+              GpuColumnVector.from(table, dataTypes)
+            }
           }
         }
       }

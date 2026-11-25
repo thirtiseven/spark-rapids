@@ -63,7 +63,11 @@ class LazyCompiledCondition(
         if (compiledBuildRight == null) {
           // Condition is bound to leftOutput ++ rightOutput
           // numFirstTableColumns = numLeftColumns maps left columns to AST LEFT
-          compiledBuildRight = leftRightBoundCondition.convertToAst(numLeftColumns).compile()
+          val astExpr = leftRightBoundCondition.convertToAst(numLeftColumns)
+          val useJit = org.apache.spark.sql.internal.SQLConf.get
+            .getConfString("spark.rapids.sql.joinAstJitEnabled", "false").toBoolean &&
+            leftRightBoundCondition.supportsAstJit
+          compiledBuildRight = if (useJit) astExpr.compileJit() else astExpr.compile()
         }
       }
     }
@@ -92,7 +96,11 @@ class LazyCompiledCondition(
             transformedConditionBuildLeft = transformForBuildLeft(leftRightBoundCondition)
           }
           // numFirstTableColumns = numRightColumns maps right columns to AST LEFT
-          compiledBuildLeft = transformedConditionBuildLeft.convertToAst(numRightColumns).compile()
+          val astExpr = transformedConditionBuildLeft.convertToAst(numRightColumns)
+          val useJit = org.apache.spark.sql.internal.SQLConf.get
+            .getConfString("spark.rapids.sql.joinAstJitEnabled", "false").toBoolean &&
+            transformedConditionBuildLeft.supportsAstJit
+          compiledBuildLeft = if (useJit) astExpr.compileJit() else astExpr.compile()
         }
       }
     }

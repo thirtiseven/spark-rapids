@@ -338,7 +338,8 @@ final case class LencPrefetchedFile(
 
 final class LencAsyncPrefetcher(
     filePaths: Array[String],
-    colIndices: Array[Int]) extends AutoCloseable {
+    colIndices: Array[Int],
+    rangePreds: Array[LencRangePred] = Array.empty) extends AutoCloseable {
 
   private var nextSubmitIdx = 0
   private val useAsync = filePaths.length > 1
@@ -352,18 +353,23 @@ final class LencAsyncPrefetcher(
     })
   } else null
 
-  private var pending: java.util.concurrent.Future[LencPrefetchedFile] = _
+  private var pending: java.util.concurrent.Future[Option[LencPrefetchedFile]] = _
 
-  private def loadSync(path: String): LencPrefetchedFile = {
+  private def loadSync(path: String): Option[LencPrefetchedFile] = {
     val plan = LencNative.planRead(path, colIndices)
     closeOnExcept(plan) { p =>
-      val totalBytes = p.totalPackedBytes()
-      val buf = HostMemoryBuffer.allocate(math.max(totalBytes, 64L))
-      closeOnExcept(buf) { b =>
-        if (totalBytes > 0L) {
-          p.readToHost(path, b)
+      if (rangePreds.nonEmpty && LencRangePruner.canSkipFile(p, rangePreds)) {
+        p.close()
+        None
+      } else {
+        val totalBytes = p.totalPackedBytes()
+        val buf = HostMemoryBuffer.allocate(math.max(totalBytes, 64L))
+        closeOnExcept(buf) { b =>
+          if (totalBytes > 0L) {
+            p.readToHost(path, b)
+          }
+          Some(LencPrefetchedFile(path, p, b))
         }
-        LencPrefetchedFile(path, p, b)
       }
     }
   }
@@ -372,8 +378,8 @@ final class LencAsyncPrefetcher(
     if (useAsync && nextSubmitIdx < filePaths.length) {
       val path = filePaths(nextSubmitIdx)
       nextSubmitIdx += 1
-      pending = exec.submit(new java.util.concurrent.Callable[LencPrefetchedFile] {
-        override def call(): LencPrefetchedFile = loadSync(path)
+      pending = exec.submit(new java.util.concurrent.Callable[Option[LencPrefetchedFile]] {
+        override def call(): Option[LencPrefetchedFile] = loadSync(path)
       })
     }
   }
@@ -384,30 +390,32 @@ final class LencAsyncPrefetcher(
 
   def next(): Option[LencPrefetchedFile] = {
     if (!useAsync) {
-      if (nextSubmitIdx >= filePaths.length) {
-        None
-      } else {
+      while (nextSubmitIdx < filePaths.length) {
         val path = filePaths(nextSubmitIdx)
         nextSubmitIdx += 1
-        Some(loadSync(path))
+        val opt = loadSync(path)
+        if (opt.isDefined) return opt
       }
-    } else if (pending == null) {
       None
     } else {
-      val fut = pending
-      pending = null
-      val item = fut.get()
-      submitNext()
-      Some(item)
+      while (pending != null) {
+        val fut = pending
+        pending = null
+        val opt = fut.get()
+        submitNext()
+        if (opt.isDefined) return opt
+      }
+      None
     }
   }
 
   override def close(): Unit = {
     if (pending != null) {
       try {
-        val item = pending.get()
-        item.hostBuf.safeClose()
-        item.plan.safeClose()
+        pending.get().foreach { item =>
+          item.hostBuf.safeClose()
+          item.plan.safeClose()
+        }
       } catch {
         case _: Throwable =>
       }

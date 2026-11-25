@@ -1419,20 +1419,25 @@ abstract class GpuBaseAggregateMeta[INPUT <: SparkPlan](
       canUsePartialSortAgg &&
       groupingCanBeSorted
 
-    GpuHashAggregateExec(
-      aggRequiredChildDistributionExpressions,
-      gpuGroupingExpressions,
-      gpuAggregateExpressions,
-      aggregateAttributes.map(_.convertToGpu().asInstanceOf[Attribute]),
-      resultExpressions.map(_.convertToGpu().asInstanceOf[NamedExpression]),
-      gpuChild,
-      conf.gpuTargetBatchSizeBytes,
-      estimatedPreProcessGrowth,
-      conf.forceSinglePassPartialSortAgg,
-      allowSinglePassAgg,
-      allowNonFullyAggregatedOutput,
-      conf.skipAggPassReductionRatio
-    )(Some(agg.resultExpressions))
+    val gpuResultExpressions = resultExpressions.map(_.convertToGpu().asInstanceOf[NamedExpression])
+    com.nvidia.spark.rapids.lenc.GpuLencFusedAgg
+      .tryFuse(gpuGroupingExpressions, gpuAggregateExpressions, gpuResultExpressions, gpuChild)
+      .getOrElse {
+        GpuHashAggregateExec(
+          aggRequiredChildDistributionExpressions,
+          gpuGroupingExpressions,
+          gpuAggregateExpressions,
+          aggregateAttributes.map(_.convertToGpu().asInstanceOf[Attribute]),
+          gpuResultExpressions,
+          gpuChild,
+          conf.gpuTargetBatchSizeBytes,
+          estimatedPreProcessGrowth,
+          conf.forceSinglePassPartialSortAgg,
+          allowSinglePassAgg,
+          allowNonFullyAggregatedOutput,
+          conf.skipAggPassReductionRatio
+        )(Some(agg.resultExpressions))
+      }
   }
 }
 

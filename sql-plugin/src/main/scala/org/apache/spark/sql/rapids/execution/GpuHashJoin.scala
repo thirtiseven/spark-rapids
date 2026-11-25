@@ -152,11 +152,34 @@ object JoinImpl {
    * @param compiledCondition the compiled AST predicate
    * @return the gather maps filtered by teh AST expression.
    */
+  private def hasJitHandle(compiledCondition: CompiledExpression): Boolean = {
+    try {
+      compiledCondition.getJitNativeHandle != 0L
+    } catch {
+      case _: IllegalStateException => false
+    }
+  }
+
+  private def filterGatherMapsMaybeJit(
+      leftMap: GatherMap,
+      rightMap: GatherMap,
+      leftTable: Table,
+      rightTable: Table,
+      compiledCondition: CompiledExpression): Array[GatherMap] = {
+    if (hasJitHandle(compiledCondition)) {
+      Table.filterJoinGatherMapsJit(
+        leftMap, rightMap, leftTable, rightTable, compiledCondition, ai.rapids.cudf.JoinKind.INNER)
+    } else {
+      JoinPrimitives.filterGatherMapsByAST(
+        leftMap, rightMap, leftTable, rightTable, compiledCondition)
+    }
+  }
+
   def filterInnerJoinWithAST(inner: GatherMapsResult,
                              leftTable: Table,
                              rightTable: Table,
                              compiledCondition: CompiledExpression): GatherMapsResult = {
-    val arrayRet = JoinPrimitives.filterGatherMapsByAST(
+    val arrayRet = filterGatherMapsMaybeJit(
       inner.left, inner.right, leftTable, rightTable, compiledCondition)
     GatherMapsResult(arrayRet(0), arrayRet(1))
   }
@@ -176,7 +199,7 @@ object JoinImpl {
                                     compiledCondition: CompiledExpression): GatherMapsResult = {
     // The compiled condition has the left and right tables swapped, but we cannot change
     // that, so swap the input tables, then swap back the outputs to properly match
-    val arrayRet = JoinPrimitives.filterGatherMapsByAST(
+    val arrayRet = filterGatherMapsMaybeJit(
       inner.right, inner.left, rightTable, leftTable, compiledCondition)
     GatherMapsResult(arrayRet(1), arrayRet(0))
   }
@@ -344,6 +367,26 @@ object JoinImpl {
    * @param nullEquality if nulls should eb equal or not
    * @return the gather maps to use
    */
+  private def mixedInnerJoinMaybeJit(
+      leftKeys: Table, rightKeys: Table,
+      leftTable: Table, rightTable: Table,
+      compiledCondition: CompiledExpression,
+      nullEquality: NullEquality): Array[GatherMap] = {
+    val useJit = org.apache.spark.sql.internal.SQLConf.get
+      .getConfString("spark.rapids.sql.joinAstJitEnabled", "false").toBoolean &&
+      hasJitHandle(compiledCondition)
+    if (useJit) {
+      val eqMaps = JoinPrimitives.hashInnerJoin(leftKeys, rightKeys, nullEquality == NullEquality.EQUAL)
+      withResource(eqMaps) { maps =>
+        Table.filterJoinGatherMapsJit(
+          maps(0), maps(1), leftTable, rightTable, compiledCondition, ai.rapids.cudf.JoinKind.INNER)
+      }
+    } else {
+      Table.mixedInnerJoinGatherMaps(leftKeys, rightKeys, leftTable, rightTable,
+        compiledCondition, nullEquality)
+    }
+  }
+
   def innerHashJoinBuildLeft(leftKeys: Table, rightKeys: Table,
                               leftTable: Table, rightTable: Table,
                               compiledCondition: CompiledExpression,
@@ -351,7 +394,7 @@ object JoinImpl {
     // Even though it's an inner join, we need to switch the join order since the
     // condition has been compiled to expect the build side on the left and the stream
     // side on the right.
-    val arrayRet = Table.mixedInnerJoinGatherMaps(rightKeys, leftKeys, rightTable, leftTable,
+    val arrayRet = mixedInnerJoinMaybeJit(rightKeys, leftKeys, rightTable, leftTable,
       compiledCondition, nullEquality)
     // Reverse the output of the join, because we expect the right gather map to
     // always be on the right.
@@ -404,7 +447,7 @@ object JoinImpl {
                               leftTable: Table, rightTable: Table,
                               compiledCondition: CompiledExpression,
                               nullEquality: NullEquality): GatherMapsResult = {
-    val arrayRet = Table.mixedInnerJoinGatherMaps(leftKeys, rightKeys, leftTable, rightTable,
+    val arrayRet = mixedInnerJoinMaybeJit(leftKeys, rightKeys, leftTable, rightTable,
       compiledCondition, nullEquality)
     GatherMapsResult(arrayRet(0), arrayRet(1))
   }

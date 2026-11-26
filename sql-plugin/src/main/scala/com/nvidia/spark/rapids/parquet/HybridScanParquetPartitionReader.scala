@@ -1210,6 +1210,12 @@ class HybridScanFilters(
     FilterToAstConverter(readDataSchema, isCaseSensitive, useColumnNames = false)
       .pushedAst(pushed)
 
+  private def hasSelectiveFilter(f: Filter): Boolean = f match {
+    case _: org.apache.spark.sql.sources.IsNotNull => false
+    case org.apache.spark.sql.sources.And(l, r) => hasSelectiveFilter(l) || hasSelectiveFilter(r)
+    case _ => true
+  }
+
   /**
    * Why the filter is not safe to push, or None. Every conjunct left over has to be one the
    * scan's own output can be filtered on afterwards.
@@ -1217,6 +1223,8 @@ class HybridScanFilters(
   def ineligibleReason: Option[String] = {
     if (!byName.resolvesAllColumns(residual)) {
       Some("a conjunct that cannot be pushed reads a column the scan does not output")
+    } else if (!pushed.exists(hasSelectiveFilter)) {
+      Some("no selective value filter pushed (empty or IsNotNull-only)")
     } else {
       None
     }

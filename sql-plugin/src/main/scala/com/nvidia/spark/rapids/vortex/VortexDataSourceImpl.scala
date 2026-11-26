@@ -411,14 +411,22 @@ object VortexPartitionHelper {
     if (files.length <= 16 || maxPartBytes <= 0L) {
       return files.map(Array(_))
     }
-    val maxFilesPerPart = 64
+    // Ensure medium/large tables (> 512 MiB, e.g. customer 9G / orders 43G) always produce
+    // at least 16 balanced partitions so all concurrent GPU task slots stay saturated!
+    val minPartitions = 16
+    val effectiveMaxBytes = if (totalBytes > 512L * 1024L * 1024L) {
+      math.min(maxPartBytes, math.max(totalBytes / minPartitions, 64L * 1024L * 1024L))
+    } else {
+      maxPartBytes
+    }
+    val maxFilesPerPart = math.max(1, math.min(64, (files.length + minPartitions - 1) / minPartitions))
     val groups = new ArrayBuffer[Array[String]]()
     val cur = new ArrayBuffer[String]()
     var curBytes = 0L
     files.indices.foreach { idx =>
       val f = files(idx)
       val fsz = if (idx < fileSizes.length) fileSizes(idx) else new File(f).length()
-      if (cur.nonEmpty && (curBytes + fsz > maxPartBytes || cur.size >= maxFilesPerPart)) {
+      if (cur.nonEmpty && (curBytes + fsz > effectiveMaxBytes || cur.size >= maxFilesPerPart)) {
         groups += cur.toArray
         cur.clear()
         curBytes = 0L
@@ -589,9 +597,12 @@ class GpuVortexPartitionReader(
           // 100% of file skipped — ZERO payload bytes read or decoded!
           return None
         }
-        // Adaptive selectivity gate: if > 20% pass, fall back to direct 1-pass multi-file scan
-        // for all remaining files (zero wasted rowIndices D2H copy!)
-        if (nPass * 5L > nRows) {
+        // Tightened adaptive selectivity gate (fixes Q04 3.8% & Q22 50% double-open regressions!):
+        // Since vortex-cuda's with_row_indices still decodes CudaFlat chunks before filtering,
+        // 2-phase late materialization only pays off when selectivity <= 2% (nPass * 50 <= nRows)
+        // or entire files are skipped (nPass == 0, e.g. NF_J0202). Otherwise fall back immediately
+        // to 1-pass true zero-copy for all remaining files!
+        if (nPass * 50L > nRows) {
           useLateMat = false
           val pTbl = gpuDecodeTime.ns {
             VortexNative.scanFileWithRows(path, payloadColNames, null, payloadDictMask)
@@ -614,13 +625,18 @@ class GpuVortexPartitionReader(
             }
           }
         }
-        // Phase 2: Low selectivity (<= 20%) -> Vortex takes ONLY surviving rows of heavy payload columns!
+        // Phase 2: Ultra-low selectivity (<= 2%) -> Vortex takes ONLY surviving rows of heavy payload!
         val rowIndices = VortexNative.maskToRowIndices(mask)
         val pTbl = gpuDecodeTime.ns {
           VortexNative.scanFileWithRows(path, payloadColNames, rowIndices, payloadDictMask)
         }
         if (pTbl == null) return None
         withResource(pTbl) { pt =>
+          // If surviving payload is tiny (< 48 bytes/row, e.g. narrow dict strings), disable
+          // 2-phase for remaining files so we never double-open for cheap columns!
+          if (nPass > 0L && pt.getDeviceMemorySize < nPass * 48L) {
+            useLateMat = false
+          }
           withResource(ft.filter(mask)) { filtFt =>
             val outCols = new Array[ColumnVector](colNames.length)
             try {

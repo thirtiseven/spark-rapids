@@ -58,4 +58,24 @@ object VortexTools {
       .apply(Array(parquetDir, vortexDir, schemaJson, includeCols, numThreads.toString))
       .longValue()
   }
+
+  /**
+   * Compacts a Hive date-partitioned Parquet table into 1:1 identical contiguous date-sorted
+   * big Parquet files (Snappy, 128 MB row groups, ROWGROUP stats) AND Standard Vortex files
+   * with a _vortex_zonemap.tsv manifest for Spark 3.5 SupportsRuntimeFiltering DPP!
+   */
+  def compactHiveParquetToSortedPair(
+      rawHivePqDir: String,
+      outPqDir: String,
+      outVxDir: String,
+      fullSchemaJson: String,
+      partCol: String,
+      targetChunkMB: Int = 512,
+      numThreads: Int = 4): Long = {
+    ShimLoader.newVortexConverter()
+      .apply(Array(
+        rawHivePqDir, outVxDir, fullSchemaJson, "", numThreads.toString,
+        "COMPACT_SORTED_PAIR", outPqDir, partCol, targetChunkMB.toString))
+      .longValue()
+  }
 }

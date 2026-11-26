@@ -25,7 +25,7 @@ import java.util
 
 import scala.collection.mutable.ArrayBuffer
 
-import ai.rapids.cudf.{ColumnVector, DType, ParquetOptions, Scalar, Table => CudfTable}
+import ai.rapids.cudf.{ColumnVector, CompressionType, DType, ParquetOptions, ParquetWriterOptions, Scalar, Table => CudfTable}
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.GpuMetric._
@@ -43,10 +43,17 @@ import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
+case class VortexZoneEntry(
+    minVal: Long,
+    maxVal: Long,
+    hasMinMax: Boolean,
+    hasNull: Boolean) extends Serializable
+
 case class VortexFileGroup(
     partVals: Array[Any],
     files: Array[String],
-    fileSizes: Array[Long]) extends Serializable
+    fileSizes: Array[Long],
+    zone: Option[VortexZoneEntry] = None) extends Serializable
 
 /** Evaluates Spark DSv2 partition filters (static & runtime DPP) against Hive partition values. */
 object VortexPartitionPruner {
@@ -144,6 +151,43 @@ object VortexPartitionPruner {
     }
     refs(f).exists(r => r.nonEmpty && r.subsetOf(partColSet))
   }
+
+  /** Conservative file-level [min, max] zone-map pruning (never drops any file that could match). */
+  def matchesZone(f: Filter, zoneCol: String, z: VortexZoneEntry): Boolean = {
+    def toLongOpt(v: Any): Option[Long] = v match {
+      case n: Number => Some(n.longValue())
+      case d: Date => Some(d.toLocalDate.toEpochDay)
+      case ld: LocalDate => Some(ld.toEpochDay)
+      case _ => None
+    }
+    f match {
+      case EqualTo(a, v) if a == zoneCol =>
+        if (v == null) false
+        else toLongOpt(v).forall(vl => z.hasMinMax && vl >= z.minVal && vl <= z.maxVal)
+      case EqualNullSafe(a, v) if a == zoneCol =>
+        if (v == null) z.hasNull
+        else toLongOpt(v).forall(vl => z.hasMinMax && vl >= z.minVal && vl <= z.maxVal)
+      case In(a, vs) if a == zoneCol =>
+        if (vs == null || vs.isEmpty) false
+        else vs.exists { v =>
+          if (v == null) z.hasNull
+          else toLongOpt(v).forall(vl => z.hasMinMax && vl >= z.minVal && vl <= z.maxVal)
+        }
+      case LessThan(a, v) if a == zoneCol =>
+        if (v == null) false else toLongOpt(v).forall(vl => z.hasMinMax && z.minVal < vl)
+      case LessThanOrEqual(a, v) if a == zoneCol =>
+        if (v == null) false else toLongOpt(v).forall(vl => z.hasMinMax && z.minVal <= vl)
+      case GreaterThan(a, v) if a == zoneCol =>
+        if (v == null) false else toLongOpt(v).forall(vl => z.hasMinMax && z.maxVal > vl)
+      case GreaterThanOrEqual(a, v) if a == zoneCol =>
+        if (v == null) false else toLongOpt(v).forall(vl => z.hasMinMax && z.maxVal >= vl)
+      case IsNull(a) if a == zoneCol => z.hasNull
+      case IsNotNull(a) if a == zoneCol => z.hasMinMax
+      case And(l, r) => matchesZone(l, zoneCol, z) && matchesZone(r, zoneCol, z)
+      case Or(l, r) => matchesZone(l, zoneCol, z) || matchesZone(r, zoneCol, z)
+      case _ => true
+    }
+  }
 }
 
 /**
@@ -156,6 +200,7 @@ object VortexPartitionPruner {
  */
 object VortexSchemaIO {
   val SCHEMA_FILE = "_vortex_schema.json"
+  val ZONEMAP_FILE = "_vortex_zonemap.tsv"
   private val HIVE_DEFAULT_PART = "__HIVE_DEFAULT_PARTITION__"
 
   def stripFileScheme(path: String): String = {
@@ -190,11 +235,11 @@ object VortexSchemaIO {
   }
 
   /**
-   * Discovers dataSchema, fullSchema (data + Hive partition cols), partition col metadata,
-   * and VortexFileGroups (1 group for unpartitioned dirs; 1 group per Hive partition leaf).
+   * Discovers dataSchema, fullSchema (data + Hive partition cols), Hive partition col metadata,
+   * optional file-level zone-map column name (from _vortex_zonemap.tsv), and VortexFileGroups.
    */
   def discoverTable(dirPath: String): (
-      StructType, StructType, Array[String], Array[DataType], Array[VortexFileGroup]) = {
+      StructType, StructType, Array[String], Array[DataType], Array[String], Array[VortexFileGroup]) = {
     val clean = stripFileScheme(dirPath)
     val root = new File(clean)
     require(root.isDirectory, s"Not a directory: $clean")
@@ -207,12 +252,39 @@ object VortexSchemaIO {
     val hasPartSubdirs = topEntries.exists(d => d.isDirectory && d.getName.contains("="))
 
     if (!hasPartSubdirs) {
+      val zmFile = new File(root, ZONEMAP_FILE)
+      if (zmFile.exists() && topVortex.nonEmpty) {
+        val lines = new String(Files.readAllBytes(zmFile.toPath), StandardCharsets.UTF_8)
+          .linesIterator.map(_.trim).filter(_.nonEmpty).toArray
+        if (lines.nonEmpty && lines(0).startsWith("#COL=")) {
+          val zoneCol = lines(0).stripPrefix("#COL=").split("\t")(0)
+          val byName = topVortex.map(f => f.getName -> f).toMap
+          val groups = new ArrayBuffer[VortexFileGroup]()
+          lines.drop(1).foreach { ln =>
+            val parts = ln.split("\t")
+            if (parts.length >= 4) {
+              byName.get(parts(0)).foreach { f =>
+                val hasMM = parts(1) != "NULL" && parts(2) != "NULL"
+                val mn = if (hasMM) parts(1).toLong else 0L
+                val mx = if (hasMM) parts(2).toLong else 0L
+                val hn = parts(3) == "1"
+                groups += VortexFileGroup(
+                  Array.empty, Array(f.getAbsolutePath), Array(f.length()),
+                  Some(VortexZoneEntry(mn, mx, hasMM, hn)))
+              }
+            }
+          }
+          if (groups.nonEmpty) {
+            return (dataSchema, dataSchema, Array.empty, Array.empty, Array(zoneCol), groups.toArray)
+          }
+        }
+      }
       val grp = if (topVortex.nonEmpty) {
         Array(VortexFileGroup(Array.empty, topVortex.map(_.getAbsolutePath), topVortex.map(_.length())))
       } else {
         Array.empty[VortexFileGroup]
       }
-      return (dataSchema, dataSchema, Array.empty, Array.empty, grp)
+      return (dataSchema, dataSchema, Array.empty, Array.empty, Array.empty, grp)
     }
 
     // Walk Hive col=val/ tree
@@ -233,7 +305,7 @@ object VortexSchemaIO {
     walk(root, Seq.empty)
 
     if (rawGroups.isEmpty) {
-      return (dataSchema, dataSchema, Array.empty, Array.empty, Array.empty)
+      return (dataSchema, dataSchema, Array.empty, Array.empty, Array.empty, Array.empty)
     }
 
     val partColNames = rawGroups.head._1.map(_._1).toArray
@@ -251,7 +323,7 @@ object VortexSchemaIO {
       VortexFileGroup(typedVals, vxs.map(_.getAbsolutePath), vxs.map(_.length()))
     }.toArray
 
-    (dataSchema, fullSchema, partColNames, partColTypes, groups)
+    (dataSchema, fullSchema, partColNames, partColTypes, Array.empty, groups)
   }
 
   def readSchema(dirPath: String): StructType = discoverTable(dirPath)._2
@@ -476,9 +548,10 @@ class VortexDataSourceImpl extends TableProvider {
       partitioning: Array[Transform],
       properties: util.Map[String, String]): Table = {
     val path = properties.get("path")
-    val (dataSchema, fullSchema, partColNames, partColTypes, fileGroups) =
+    val (dataSchema, fullSchema, partColNames, partColTypes, zoneColNames, fileGroups) =
       VortexSchemaIO.discoverTable(path)
-    new VortexTable(path, dataSchema, fullSchema, schema, partColNames, partColTypes, fileGroups)
+    new VortexTable(
+      path, dataSchema, fullSchema, schema, partColNames, partColTypes, zoneColNames, fileGroups)
   }
 }
 
@@ -489,6 +562,7 @@ class VortexTable(
     exposedSchema: StructType,
     partColNames: Array[String],
     partColTypes: Array[DataType],
+    zoneColNames: Array[String],
     fileGroups: Array[VortexFileGroup]) extends Table with SupportsRead {
 
   override def name(): String = s"vortex-gpu($path)"
@@ -496,13 +570,14 @@ class VortexTable(
   override def schema(): StructType = exposedSchema
 
   override def partitioning(): Array[Transform] =
-    partColNames.map(Expressions.identity)
+    (partColNames ++ zoneColNames).distinct.map(Expressions.identity)
 
   override def capabilities(): util.Set[TableCapability] =
     util.EnumSet.of(TableCapability.BATCH_READ)
 
   override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder =
-    new VortexScanBuilder(dataSchema, fullSchema, exposedSchema, partColNames, partColTypes, fileGroups)
+    new VortexScanBuilder(
+      dataSchema, fullSchema, exposedSchema, partColNames, partColTypes, zoneColNames, fileGroups)
 }
 
 class VortexScanBuilder(
@@ -511,6 +586,7 @@ class VortexScanBuilder(
     exposedSchema: StructType,
     partColNames: Array[String],
     partColTypes: Array[DataType],
+    zoneColNames: Array[String],
     fileGroups: Array[VortexFileGroup])
   extends ScanBuilder with SupportsPushDownRequiredColumns with SupportsPushDownFilters {
 
@@ -535,7 +611,13 @@ class VortexScanBuilder(
       collectedFilters = dataFs.filter(f => VortexGpuFilterEval.isPushable(f, dataSchema))
       dataFs
     } else {
+      if (zoneColNames.nonEmpty && filters.nonEmpty) {
+        val zc = zoneColNames(0)
+        prunedGroups = fileGroups.filter(g =>
+          g.zone.forall(z => filters.forall(VortexPartitionPruner.matchesZone(_, zc, z))))
+      }
       collectedFilters = filters.filter(f => VortexGpuFilterEval.isPushable(f, dataSchema))
+      // Always keep exact row-level filters above zone-map pruned scans for 100% SQL parity!
       filters
     }
   }
@@ -548,7 +630,9 @@ class VortexScanBuilder(
       val refs = VortexGpuFilterEval.referencedCols(f)
       refs.nonEmpty && refs.subsetOf(reqDataNames)
     }
-    VortexScan(dataSchema, fullSchema, requiredSchema, partColNames, partColTypes, prunedGroups, applicable)
+    VortexScan(
+      dataSchema, fullSchema, requiredSchema,
+      partColNames, partColTypes, zoneColNames, prunedGroups, applicable)
   }
 }
 
@@ -562,6 +646,7 @@ case class VortexScan(
     requiredSchema: StructType,
     partColNames: Array[String],
     partColTypes: Array[DataType],
+    zoneColNames: Array[String],
     fileGroups: Array[VortexFileGroup],
     lateMatFilters: Array[Filter] = Array.empty)
   extends Scan with Batch with SupportsReportStatistics with SupportsRuntimeFiltering {
@@ -580,13 +665,19 @@ case class VortexScan(
 
   override def filterAttributes(): Array[NamedReference] = {
     val reqSet = requiredSchema.fieldNames.toSet
-    partColNames.filter(reqSet.contains).map(Expressions.column)
+    (partColNames ++ zoneColNames).distinct.filter(reqSet.contains).map(Expressions.column)
   }
 
   override def filter(filters: Array[Filter]): Unit = {
-    if (partColNames.nonEmpty && filters != null && filters.nonEmpty) {
-      activeGroups = activeGroups.filter(g =>
-        filters.forall(VortexPartitionPruner.matches(_, partColNames, partColTypes, g.partVals)))
+    if (filters != null && filters.nonEmpty) {
+      if (partColNames.nonEmpty) {
+        activeGroups = activeGroups.filter(g =>
+          filters.forall(VortexPartitionPruner.matches(_, partColNames, partColTypes, g.partVals)))
+      } else if (zoneColNames.nonEmpty) {
+        val zc = zoneColNames(0)
+        activeGroups = activeGroups.filter(g =>
+          g.zone.forall(z => filters.forall(VortexPartitionPruner.matchesZone(_, zc, z))))
+      }
     }
   }
 
@@ -690,6 +781,7 @@ case class GpuVortexScan(
     requiredSchema: StructType,
     partColNames: Array[String],
     partColTypes: Array[DataType],
+    zoneColNames: Array[String],
     fileGroups: Array[VortexFileGroup],
     lateMatFilters: Array[Filter] = Array.empty)
   extends GpuScan with Batch with SupportsReportStatistics with SupportsRuntimeFiltering {
@@ -717,13 +809,19 @@ case class GpuVortexScan(
 
   override def filterAttributes(): Array[NamedReference] = {
     val reqSet = requiredSchema.fieldNames.toSet
-    partColNames.filter(reqSet.contains).map(Expressions.column)
+    (partColNames ++ zoneColNames).distinct.filter(reqSet.contains).map(Expressions.column)
   }
 
   override def filter(filters: Array[Filter]): Unit = {
-    if (partColNames.nonEmpty && filters != null && filters.nonEmpty) {
-      activeGroups = activeGroups.filter(g =>
-        filters.forall(VortexPartitionPruner.matches(_, partColNames, partColTypes, g.partVals)))
+    if (filters != null && filters.nonEmpty) {
+      if (partColNames.nonEmpty) {
+        activeGroups = activeGroups.filter(g =>
+          filters.forall(VortexPartitionPruner.matches(_, partColNames, partColTypes, g.partVals)))
+      } else if (zoneColNames.nonEmpty) {
+        val zc = zoneColNames(0)
+        activeGroups = activeGroups.filter(g =>
+          g.zone.forall(z => filters.forall(VortexPartitionPruner.matchesZone(_, zc, z))))
+      }
     }
   }
 
@@ -1293,7 +1391,7 @@ case class VortexScanRuleMeta(
   override def convertToGpu(): GpuScan =
     GpuVortexScan(
       a.dataSchema, a.fullSchema, a.requiredSchema,
-      a.partColNames, a.partColTypes, a.fileGroups, a.lateMatFilters)
+      a.partColNames, a.partColTypes, a.zoneColNames, a.fileGroups, a.lateMatFilters)
 }
 
 /** Converts a directory of Parquet files (flat OR Hive col=val/ partitioned!) directly to standard .vortex files! */
@@ -1314,6 +1412,17 @@ class VortexConverterImpl extends java.util.function.Function[Array[String], jav
   }
 
   override def apply(args: Array[String]): java.lang.Long = {
+    if (args.length >= 9 && args(5) == "COMPACT_SORTED_PAIR") {
+      return compactHiveParquetToSortedPair(
+        rawHivePqDir = VortexSchemaIO.stripFileScheme(args(0)),
+        outVxDir = VortexSchemaIO.stripFileScheme(args(1)),
+        fullSchemaJson = args(2),
+        numThreads = math.max(1, args(4).toInt),
+        outPqDir = VortexSchemaIO.stripFileScheme(args(6)),
+        partCol = args(7),
+        targetChunkBytes = math.max(64L, args(8).toLong) * 1024L * 1024L)
+    }
+
     val parquetDir = VortexSchemaIO.stripFileScheme(args(0))
     val vortexDir = VortexSchemaIO.stripFileScheme(args(1))
     val schemaJson = args(2)
@@ -1389,5 +1498,210 @@ class VortexConverterImpl extends java.util.function.Function[Array[String], jav
       pool.shutdown()
     }
     java.lang.Long.valueOf(totalBytes.get())
+  }
+
+  /**
+   * Compacts a Hive col=val/ Parquet directory into 1:1 identical contiguous date-sorted
+   * big Parquet files + Standard Vortex files + _vortex_zonemap.tsv for Spark 3.5 DPP!
+   */
+  private def compactHiveParquetToSortedPair(
+      rawHivePqDir: String,
+      outVxDir: String,
+      fullSchemaJson: String,
+      numThreads: Int,
+      outPqDir: String,
+      partCol: String,
+      targetChunkBytes: Long): java.lang.Long = {
+    val fullSchema = DataType.fromJson(fullSchemaJson).asInstanceOf[StructType]
+    val fullColNames = fullSchema.fieldNames
+    val partColIdx = fullSchema.fieldIndex(partCol)
+    val partColType = fullSchema.fields(partColIdx).dataType
+    val dataColNames = fullSchema.fields.filterNot(_.name == partCol).map(_.name)
+
+    val srcRoot = new File(rawHivePqDir).getCanonicalFile
+    val pqOutDir = new File(outPqDir)
+    val vxOutDir = new File(outVxDir)
+    pqOutDir.mkdirs()
+    vxOutDir.mkdirs()
+    Files.write(
+      Paths.get(outVxDir, VortexSchemaIO.SCHEMA_FILE),
+      fullSchemaJson.getBytes(StandardCharsets.UTF_8))
+
+    // Collect leaf Hive partCol=val/ directories separated into sorted numeric & NULL partitions
+    val prefix = partCol + "="
+    val partDirs = Option(srcRoot.listFiles()).getOrElse(Array.empty)
+      .filter(d => d.isDirectory && d.getName.startsWith(prefix))
+    val numericParts = new ArrayBuffer[(Long, Array[File], Long)]()
+    val nullFiles = new ArrayBuffer[File]()
+    partDirs.foreach { d =>
+      val rawV = d.getName.stripPrefix(prefix)
+      val fs = collectParquetFiles(d)
+      if (fs.nonEmpty) {
+        if (rawV == "__HIVE_DEFAULT_PARTITION__") {
+          nullFiles ++= fs
+        } else {
+          numericParts += ((rawV.toLong, fs, fs.map(_.length()).sum))
+        }
+      }
+    }
+    val sortedNum = numericParts.sortBy(_._1)
+
+    // Pack consecutive date_sk partitions into contiguous ~targetChunkBytes chunks
+    case class ChunkSpec(
+        chunkIdx: Int,
+        days: Array[(Option[Long], Array[File])],
+        minVal: Option[Long],
+        maxVal: Option[Long],
+        hasNull: Boolean)
+
+    val chunks = new ArrayBuffer[ChunkSpec]()
+    val curDays = new ArrayBuffer[(Option[Long], Array[File])]()
+    var curBytes = 0L
+    var curMin = Long.MaxValue
+    var curMax = Long.MinValue
+    sortedNum.foreach { case (dVal, fs, sz) =>
+      if (curDays.nonEmpty && curBytes + sz > targetChunkBytes) {
+        chunks += ChunkSpec(chunks.length, curDays.toArray, Some(curMin), Some(curMax), hasNull = false)
+        curDays.clear()
+        curBytes = 0L
+        curMin = Long.MaxValue
+        curMax = Long.MinValue
+      }
+      curDays += ((Some(dVal), fs))
+      curBytes += sz
+      if (dVal < curMin) curMin = dVal
+      if (dVal > curMax) curMax = dVal
+    }
+    if (curDays.nonEmpty) {
+      chunks += ChunkSpec(chunks.length, curDays.toArray, Some(curMin), Some(curMax), hasNull = false)
+    }
+    if (nullFiles.nonEmpty) {
+      // Split NULL partition into <= targetChunkBytes chunks as well
+      val curNull = new ArrayBuffer[File]()
+      var curNBytes = 0L
+      nullFiles.foreach { f =>
+        if (curNull.nonEmpty && curNBytes + f.length() > targetChunkBytes) {
+          chunks += ChunkSpec(chunks.length, Array((None, curNull.toArray)), None, None, hasNull = true)
+          curNull.clear()
+          curNBytes = 0L
+        }
+        curNull += f
+        curNBytes += f.length()
+      }
+      if (curNull.nonEmpty) {
+        chunks += ChunkSpec(chunks.length, Array((None, curNull.toArray)), None, None, hasNull = true)
+      }
+    }
+
+    val readOpts = ParquetOptions.builder().includeColumn(dataColNames: _*).build()
+    val writeOpts = SchemaUtils
+      .writerOptionsFromSchema(ParquetWriterOptions.builder(), fullSchema, nullable = false)
+      .withCompressionType(CompressionType.SNAPPY)
+      .withRowGroupSizeBytes(128L * 1024L * 1024L)
+      .withStatisticsFrequency(ParquetWriterOptions.StatisticsFrequency.ROWGROUP)
+      .build()
+
+    def makePartCol(optVal: Option[Long], nRows: Int): ColumnVector = {
+      val s = optVal match {
+        case None => Scalar.fromNull(GpuColumnVector.getNonNestedRapidsType(partColType))
+        case Some(v) => partColType match {
+          case IntegerType => Scalar.fromInt(v.toInt)
+          case LongType => Scalar.fromLong(v)
+          case _ => Scalar.fromInt(v.toInt)
+        }
+      }
+      withResource(s)(sc => ColumnVector.fromScalar(sc, nRows))
+    }
+
+    def attachPartCol(dataTbl: CudfTable, optVal: Option[Long]): CudfTable = {
+      val nRows = dataTbl.getRowCount.toInt
+      val cols = new Array[ColumnVector](fullColNames.length)
+      try {
+        var dIdx = 0
+        var i = 0
+        while (i < fullColNames.length) {
+          if (i == partColIdx) {
+            cols(i) = makePartCol(optVal, nRows)
+          } else {
+            cols(i) = dataTbl.getColumn(dIdx).incRefCount()
+            dIdx += 1
+          }
+          i += 1
+        }
+        new CudfTable(cols: _*)
+      } finally {
+        cols.foreach(c => if (c != null) c.close())
+      }
+    }
+
+    val totalVxBytes = new java.util.concurrent.atomic.AtomicLong(0L)
+    val pool = java.util.concurrent.Executors.newFixedThreadPool(numThreads)
+    try {
+      val futures = chunks.map { ch =>
+        pool.submit(new Runnable {
+          override def run(): Unit = {
+            val pqFile = new File(pqOutDir, f"part-${ch.chunkIdx}%05d.parquet")
+            val vxFile = new File(vxOutDir, f"part-${ch.chunkIdx}%05d.vortex")
+            if (!pqFile.exists() || pqFile.length() == 0L || !vxFile.exists() || vxFile.length() == 0L) {
+              val dayTables = new ArrayBuffer[CudfTable]()
+              try {
+                ch.days.foreach { case (optVal, files) =>
+                  files.foreach { f =>
+                    withResource(CudfTable.readParquet(readOpts, f)) { dt =>
+                      if (dt.getRowCount > 0) {
+                        dayTables += attachPartCol(dt, optVal)
+                      }
+                    }
+                  }
+                }
+                if (dayTables.nonEmpty) {
+                  val merged = if (dayTables.length == 1) {
+                    dayTables.remove(0)
+                  } else {
+                    val arr = dayTables.toArray
+                    dayTables.clear()
+                    withResource(arr)(ts => CudfTable.concatenate(ts: _*))
+                  }
+                  withResource(merged) { tbl =>
+                    if (!pqFile.exists() || pqFile.length() == 0L) {
+                      withResource(CudfTable.writeParquetChunked(writeOpts, pqFile)) { w =>
+                        w.write(tbl)
+                      }
+                    }
+                    if (!vxFile.exists() || vxFile.length() == 0L) {
+                      VortexNative.writeTable(tbl, fullColNames, vxFile.getAbsolutePath)
+                    }
+                  }
+                }
+              } finally {
+                dayTables.safeClose()
+              }
+            }
+            if (vxFile.exists()) {
+              totalVxBytes.addAndGet(vxFile.length())
+            }
+          }
+        })
+      }
+      futures.foreach(_.get())
+    } finally {
+      pool.shutdown()
+    }
+
+    // Write _vortex_zonemap.tsv manifest for Spark 3.5 SupportsRuntimeFiltering DPP
+    val sb = new StringBuilder()
+    sb.append(s"#COL=$partCol\t${partColType.simpleString}\n")
+    chunks.foreach { ch =>
+      val fn = f"part-${ch.chunkIdx}%05d.vortex"
+      val mn = ch.minVal.map(_.toString).getOrElse("NULL")
+      val mx = ch.maxVal.map(_.toString).getOrElse("NULL")
+      val hn = if (ch.hasNull) "1" else "0"
+      sb.append(s"$fn\t$mn\t$mx\t$hn\n")
+    }
+    Files.write(
+      Paths.get(outVxDir, VortexSchemaIO.ZONEMAP_FILE),
+      sb.toString.getBytes(StandardCharsets.UTF_8))
+
+    java.lang.Long.valueOf(totalVxBytes.get())
   }
 }

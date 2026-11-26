@@ -578,8 +578,10 @@ case class VortexScan(
 
   override def toBatch: Batch = this
 
-  override def filterAttributes(): Array[NamedReference] =
-    partColNames.map(Expressions.column)
+  override def filterAttributes(): Array[NamedReference] = {
+    val reqSet = requiredSchema.fieldNames.toSet
+    partColNames.filter(reqSet.contains).map(Expressions.column)
+  }
 
   override def filter(filters: Array[Filter]): Unit = {
     if (partColNames.nonEmpty && filters != null && filters.nonEmpty) {
@@ -713,8 +715,10 @@ case class GpuVortexScan(
 
   override def toBatch: Batch = this
 
-  override def filterAttributes(): Array[NamedReference] =
-    partColNames.map(Expressions.column)
+  override def filterAttributes(): Array[NamedReference] = {
+    val reqSet = requiredSchema.fieldNames.toSet
+    partColNames.filter(reqSet.contains).map(Expressions.column)
+  }
 
   override def filter(filters: Array[Filter]): Unit = {
     if (partColNames.nonEmpty && filters != null && filters.nonEmpty) {
@@ -782,7 +786,10 @@ case class GpuVortexPartitionReaderFactory(
 
   override def createColumnarReader(partition: InputPartition): PartitionReader[ColumnarBatch] = {
     val vp = partition.asInstanceOf[VortexInputPartition]
-    if (partColNames.isEmpty) {
+    val needsPartCols = partColNames.nonEmpty &&
+      readSchema.fieldNames.exists(partColNames.contains)
+    if (!needsPartCols) {
+      // Fast single-CudaExecutionCtx 16-worker Tokio prefetch across all surviving (DPP-pruned) files!
       new GpuVortexPartitionReader(
         vp.filePaths, readSchema, colNames, dict32Mask, coalesceTargetBytes, batchRows,
         lateMatFilters, metrics)

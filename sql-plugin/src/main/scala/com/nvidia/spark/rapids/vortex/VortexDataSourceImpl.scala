@@ -566,7 +566,9 @@ class GpuVortexPartitionReader(
   // fast enough that opening a file twice only pays off when skipping heavy strings or 0-match files!
   private val lateMatForceAll: Boolean = SQLConf.get
     .getConfString("spark.rapids.sql.vortex.lateMatAllTypes", "false").toBoolean
-  useLateMat = useLateMat && (payloadHasStrings || lateMatForceAll)
+  private val partTotalBytes: Long =
+    filePaths.map(p => new java.io.File(p).length()).sum
+  useLateMat = useLateMat && (payloadHasStrings || lateMatForceAll) && partTotalBytes >= (64L << 20)
 
   private var fileIdx = 0
   private var multiScan: VortexNative.MultiFileScan =

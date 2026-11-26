@@ -1036,7 +1036,12 @@ class GpuVortexPartitionReader(
     .getConfString("spark.rapids.sql.vortex.lateMatAllTypes", "false").toBoolean
   private val partTotalBytes: Long =
     filePaths.map(p => new java.io.File(p).length()).sum
-  useLateMat = useLateMat && (payloadHasStrings || lateMatForceAll) && partTotalBytes >= (64L << 20)
+  private val avgFileBytes: Long =
+    if (filePaths.nonEmpty) partTotalBytes / filePaths.length else 0L
+  private lazy val useZeroCopyForPart: Boolean =
+    zeroCopyEnabled && (filePaths.length <= 2 || avgFileBytes >= (24L << 20))
+  useLateMat = useLateMat && (payloadHasStrings || lateMatForceAll) &&
+    partTotalBytes >= (64L << 20) && avgFileBytes >= (24L << 20)
 
   private var fileIdx = 0
   private var multiScan: VortexNative.MultiFileScan =
@@ -1211,7 +1216,7 @@ class GpuVortexPartitionReader(
       }
 
       if (multiScan == null) return false
-      if (zeroCopyEnabled) {
+      if (useZeroCopyForPart) {
         val cvs = gpuDecodeTime.ns {
           multiScan.nextZeroCopyBatch(dict32Mask)
         }

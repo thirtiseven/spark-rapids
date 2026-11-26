@@ -1119,9 +1119,10 @@ object GpuLencFusedAgg {
       if (m1.isDefined) return m1
     }
 
-    // Mode 2: Arbitrary High-Cardinality Conditional GroupBy (works for ANY keys + ANY aggs!)
-    // Use when >= 4 conditional/computed aggs (eliminating intermediate CASE/Project HBM traffic!)
-    if (rawTerms.length >= 4) {
+    // Mode 2: Arbitrary High-Cardinality Conditional GroupBy over direct LeafExecNode scan
+    // (e.g. NF_J0048 36-branch CASE WHEN pivot). Restrict to isLeafScan so post-join low-card
+    // aggregations like TPC-DS Q66/Q04/Q23 don't suffer high-card atomic contention!
+    if (isLeafScan && rawTerms.length >= 4) {
       val idToOrd = basePlan.output.zipWithIndex.map { case (a, i) => a.exprId -> i }.toMap
       val groupOrds = groupAttrs.map(a => idToOrd.getOrElse(a.exprId, return None)).toArray
       bindAndRewriteDicts(filterExprOpt, rawTerms, basePlan.output, Seq.empty).flatMap {

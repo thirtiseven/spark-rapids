@@ -849,6 +849,8 @@ object ParquetSchemaUtils {
       cv.castTo(GpuColumnVector.getNonNestedRapidsType(dt))
     } else if (DType.STRING.equals(cv.getType) && dt == BinaryType) {
       convertStringToBinary(cv)
+    } else if (DType.DICTIONARY32.equals(cv.getType) && dt == StringType) {
+      cv.copyToColumnVector()
     } else {
       throw new IllegalStateException("Logical error: no valid casts are found " +
           s"${cv.getType} to $dt")

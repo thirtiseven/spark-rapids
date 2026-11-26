@@ -929,14 +929,16 @@ case class GpuVortexScan(
       .getConfString("spark.rapids.sql.vortex.lateMaterializationEnabled", "true").toBoolean
     val activeFilters = if (lateMatEnabled) lateMatFilters else Array.empty[Filter]
     val fallbackCountCol = if (dataSchema.nonEmpty) dataSchema.fields(0).name else ""
+    val fullSchemaBytes = math.max(fullSchema.defaultSize, 1)
     GpuVortexPartitionReaderFactory(
-      requiredSchema, colNames, partColNames, partColTypes, fallbackCountCol,
+      requiredSchema, fullSchemaBytes, colNames, partColNames, partColTypes, fallbackCountCol,
       dict32Mask, coalesceTargetBytes, batchRows, activeFilters, metrics)
   }
 }
 
 case class GpuVortexPartitionReaderFactory(
     readSchema: StructType,
+    fullSchemaBytes: Int,
     colNames: Array[String],
     partColNames: Array[String],
     partColTypes: Array[DataType],
@@ -959,11 +961,11 @@ case class GpuVortexPartitionReaderFactory(
     if (!needsPartCols) {
       // Fast single-CudaExecutionCtx 16-worker Tokio prefetch across all surviving (DPP-pruned) files!
       new GpuVortexPartitionReader(
-        vp.filePaths, readSchema, colNames, dict32Mask, coalesceTargetBytes, batchRows,
-        lateMatFilters, metrics)
+        vp.filePaths, readSchema, fullSchemaBytes, colNames, dict32Mask, coalesceTargetBytes,
+        batchRows, lateMatFilters, metrics)
     } else {
       new GpuVortexHivePartitionedReader(
-        vp.groups, readSchema, partColNames, partColTypes, fallbackCountCol,
+        vp.groups, readSchema, fullSchemaBytes, partColNames, partColTypes, fallbackCountCol,
         dict32Mask, coalesceTargetBytes, batchRows, metrics)
     }
   }
@@ -978,6 +980,7 @@ case class GpuVortexPartitionReaderFactory(
 class GpuVortexHivePartitionedReader(
     groups: Array[VortexFileGroup],
     readSchema: StructType,
+    fullSchemaBytes: Int,
     partColNames: Array[String],
     partColTypes: Array[DataType],
     fallbackCountCol: String,
@@ -1035,7 +1038,9 @@ class GpuVortexHivePartitionedReader(
     val avg = if (fs.nonEmpty) totB / fs.length else 0L
     (fs.toArray, fg.toArray, avg)
   }
-  private val zeroCopyLargeFile = avgFileBytes >= 24L * 1024L * 1024L
+  private val avgProjBytes: Long =
+    (avgFileBytes.toDouble * math.max(readSchema.defaultSize, 1) / math.max(fullSchemaBytes, 1)).toLong
+  private val zeroCopyLargeFile = allFiles.length <= 2 || avgProjBytes >= (24L << 20)
   private var activeScan: VortexNative.MultiFileScan = _
   private var eof = false
 
@@ -1113,7 +1118,7 @@ class GpuVortexHivePartitionedReader(
     // Start pure-CPU off-GpuSemaphore Tokio host-segment prefetch BEFORE acquiring GpuSemaphore!
     // Uses zero GPU VRAM until nextZeroCopyBatch exports under the semaphore.
     if (activeScan == null) {
-      activeScan = VortexNative.openMultiScan(allFiles, scanCols, batchRows, 4)
+      activeScan = VortexNative.openMultiScan(allFiles, scanCols, batchRows, 2)
     }
 
     GpuSemaphore.acquireIfNecessary(TaskContext.get())
@@ -1222,6 +1227,7 @@ class GpuVortexHivePartitionedReader(
 class GpuVortexPartitionReader(
     filePaths: Array[String],
     readSchema: StructType,
+    fullSchemaBytes: Int,
     colNames: Array[String],
     dict32Mask: Array[Byte],
     coalesceTargetBytes: Long,
@@ -1270,18 +1276,15 @@ class GpuVortexPartitionReader(
     filePaths.map(p => new java.io.File(p).length()).sum
   private val avgFileBytes: Long =
     if (filePaths.nonEmpty) partTotalBytes / filePaths.length else 0L
+  private val avgProjBytes: Long =
+    (avgFileBytes.toDouble * math.max(readSchema.defaultSize, 1) / math.max(fullSchemaBytes, 1)).toLong
   private lazy val useZeroCopyForPart: Boolean =
-    zeroCopyEnabled && (filePaths.length <= 2 || avgFileBytes >= (24L << 20))
+    zeroCopyEnabled && (filePaths.length <= 2 || avgProjBytes >= (24L << 20))
   useLateMat = useLateMat && (payloadHasStrings || lateMatForceAll) &&
-    partTotalBytes >= (64L << 20) && avgFileBytes >= (24L << 20)
+    filePaths.length <= 16 && partTotalBytes >= (64L << 20) && avgFileBytes >= (24L << 20)
 
   private var fileIdx = 0
-  private var multiScan: VortexNative.MultiFileScan =
-    if (!useLateMat && readTypes.nonEmpty && filePaths.nonEmpty) {
-      VortexNative.openMultiScan(filePaths, colNames, batchRows, 0)
-    } else {
-      null
-    }
+  private var multiScan: VortexNative.MultiFileScan = _
 
   private val opTime = metrics.getOrElse(OP_TIME_LEGACY, NoopMetric)
   private val gpuDecodeTime = metrics.getOrElse(GPU_DECODE_TIME, NoopMetric)
@@ -1399,7 +1402,7 @@ class GpuVortexPartitionReader(
     if (!useLateMat && multiScan == null && fileIdx < filePaths.length) {
       val rem = filePaths.slice(fileIdx, filePaths.length)
       fileIdx = filePaths.length
-      multiScan = VortexNative.openMultiScan(rem, colNames, batchRows, 4)
+      multiScan = VortexNative.openMultiScan(rem, colNames, batchRows, 2)
     }
 
     GpuSemaphore.acquireIfNecessary(TaskContext.get())
@@ -1866,5 +1869,113 @@ class VortexConverterImpl extends java.util.function.Function[Array[String], jav
       sb.toString.getBytes(StandardCharsets.UTF_8))
 
     java.lang.Long.valueOf(totalVxBytes.get())
+  }
+}
+
+/**
+ * Post-transition physical column pruner for GpuVortexScan:
+ * Spark's V2ScanRelationPushDown runs BEFORE RewriteSubquery (EXISTS/NOT EXISTS -> LeftSemi/LeftAnti),
+ * leaving GpuBatchScan(GpuVortexScan) reading all 23-34 columns of catalog_sales/catalog_returns/
+ * web_sales/web_returns in Q16/Q94/Q10/Q35/Q69 even though only 1-2 columns are needed!
+ * This rule pushes exact ExprId column pruning down into GpuVortexScan with zero shim changes.
+ */
+object VortexColumnPruner {
+  import org.apache.spark.sql.catalyst.expressions.{AttributeReference, ExprId}
+  import org.apache.spark.sql.execution.SparkPlan
+  import org.apache.spark.sql.execution.adaptive.QueryStageExec
+  import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
+  import org.apache.spark.sql.rapids.execution.{GpuBroadcastExchangeExecBase, GpuHashJoin, GpuShuffleExchangeExecBase}
+
+  private def pruneVortexScan(
+      bse: com.nvidia.spark.rapids.shims.GpuBatchScanExecBase,
+      vs: GpuVortexScan,
+      needed: Set[ExprId]): SparkPlan = {
+    val rfRefs: Set[ExprId] = if (bse.productArity >= 3) {
+      bse.productElement(2) match {
+        case rfs: Seq[_] =>
+          rfs.collect { case e: org.apache.spark.sql.catalyst.expressions.Expression => e }
+            .flatMap(_.references.map(_.exprId)).toSet
+        case _ => Set.empty
+      }
+    } else Set.empty
+    val keep = needed ++ rfRefs
+    val outAttrs = bse.output.collect { case a: AttributeReference => a }
+    if (outAttrs.length != bse.output.length) return bse
+    val kept = outAttrs.filter(a => keep.contains(a.exprId))
+    if (kept.isEmpty || kept.length >= outAttrs.length) return bse
+    val keptFields = kept.flatMap { a =>
+      vs.requiredSchema.fields.find(_.name == a.name)
+    }
+    if (keptFields.length != kept.length) return bse
+    val prunedScan = vs.copy(requiredSchema = StructType(keptFields.toArray))
+    val args = bse.productIterator.map(_.asInstanceOf[AnyRef]).toArray
+    if (args.length >= 2) {
+      args(0) = kept
+      args(1) = prunedScan
+      bse.makeCopy(args).asInstanceOf[SparkPlan]
+    } else {
+      bse
+    }
+  }
+
+  private def walk(plan: SparkPlan, needed: Set[ExprId]): SparkPlan = {
+    val prunedSelf = plan match {
+      case q: QueryStageExec => q
+      case r: ReusedExchangeExec => r
+      case g @ (_: com.nvidia.spark.rapids.lenc.GpuGenericTableJitReduceExec |
+                _: com.nvidia.spark.rapids.lenc.GpuGenericHighCardJitAggExec) =>
+        // Preserve direct child output ordinals, but still recurse into subtrees below!
+        g.withNewChildren(g.children.map(ch => walk(ch, ch.outputSet.map(_.exprId).toSet)))
+      case bse: com.nvidia.spark.rapids.shims.GpuBatchScanExecBase =>
+        bse.scan match {
+          case vs: GpuVortexScan => pruneVortexScan(bse, vs, needed)
+          case _ => bse
+        }
+      case p: GpuProjectExec =>
+        val childNeed = p.projectList.flatMap(_.references.map(_.exprId)).toSet
+        p.withNewChildren(Seq(walk(p.child, childNeed)))
+      case f: GpuFilterExec =>
+        val childNeed = needed ++ f.condition.references.map(_.exprId)
+        f.withNewChildren(Seq(walk(f.child, childNeed)))
+      case c: GpuCoalesceBatches =>
+        c.withNewChildren(Seq(walk(c.child, needed)))
+      case sc: GpuShuffleCoalesceExec =>
+        sc.withNewChildren(Seq(walk(sc.child, needed)))
+      case s: GpuShuffleExchangeExecBase =>
+        val partRefs = s.expressions.flatMap(_.references.map(_.exprId)).toSet
+        s.withNewChildren(Seq(walk(s.child, needed ++ partRefs)))
+      case b: GpuBroadcastExchangeExecBase =>
+        val modeRefs = b.expressions.flatMap(_.references.map(_.exprId)).toSet
+        b.withNewChildren(Seq(walk(b.child, needed ++ modeRefs)))
+      case agg: GpuHashAggregateExec =>
+        val childNeed = (agg.groupingExpressions.flatMap(_.references) ++
+          agg.aggregateExpressions.flatMap(_.references)).map(_.exprId).toSet
+        agg.withNewChildren(Seq(walk(agg.child, childNeed)))
+      case j: GpuHashJoin =>
+        val jRefs = (j.leftKeys.flatMap(_.references) ++ j.rightKeys.flatMap(_.references) ++
+          j.condition.toSeq.flatMap(_.references)).map(_.exprId).toSet
+        val allNeed = needed ++ jRefs
+        val newChildren = j.children.map(ch => walk(ch, allNeed))
+        j.withNewChildren(newChildren)
+      case other =>
+        val newChildren = other.children.map(ch => walk(ch, ch.outputSet.map(_.exprId).toSet))
+        other.withNewChildren(newChildren)
+    }
+    prunedSelf.transformExpressions {
+      case sq: org.apache.spark.sql.execution.ScalarSubquery =>
+        sq.plan match {
+          case bse: org.apache.spark.sql.execution.BaseSubqueryExec =>
+            val prunedSub = bse.withNewChildren(
+              bse.children.map(ch => walk(ch, ch.outputSet.map(_.exprId).toSet)))
+              .asInstanceOf[org.apache.spark.sql.execution.BaseSubqueryExec]
+            sq.copy(plan = prunedSub)
+          case _ => sq
+        }
+    }
+  }
+
+  def prune(plan: SparkPlan): SparkPlan = {
+    val rootNeed = plan.outputSet.map(_.exprId).toSet
+    walk(plan, rootNeed)
   }
 }

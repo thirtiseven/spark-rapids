@@ -1010,6 +1010,7 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
         // plugin performs its final transformations of the plan. In this case, we 
         // need to apply any remaining rules that should have been applied.
         updatedPlan = SparkShimImpl.applyPostShimPlanRules(updatedPlan)
+        updatedPlan = com.nvidia.spark.rapids.vortex.VortexColumnPruner.prune(updatedPlan)
 
         updatedPlan = markGpuPlanningComplete(updatedPlan)
         if (rapidsConf.isAqeExchangeReuseFixupEnabled &&

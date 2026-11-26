@@ -1,1 +1,2 @@
 com.nvidia.spark.VortexDataSource
+com.nvidia.spark.VortexFileFormat

@@ -1609,8 +1609,17 @@ object GpuLencFusedAgg {
               case _ =>
             }
             val aggKinds = boundTerms.map(_.kind).toArray
+            val reduceInput: SparkPlan = basePlan match {
+              case bse: com.nvidia.spark.rapids.shims.GpuBatchScanExecBase =>
+                bse.scan match {
+                  case vs: com.nvidia.spark.rapids.vortex.GpuVortexScan if vs.files.length > 64 =>
+                    GpuCoalesceBatches(basePlan, TargetSize(256L * 1024L * 1024L))
+                  case _ => basePlan
+                }
+              case _ => basePlan
+            }
             GpuGenericTableJitReduceExec(
-              outAttrs, basePlan, inputOrds, dictLits, gkSlots, maxGroups,
+              outAttrs, reduceInput, inputOrds, dictLits, gkSlots, maxGroups,
               aggKinds, outBufToTerm, outBufModes, outTypes, cudaSrc, kname)
         }
     }

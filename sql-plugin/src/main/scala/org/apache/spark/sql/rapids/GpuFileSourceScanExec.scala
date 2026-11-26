@@ -725,6 +725,8 @@ object GpuFileSourceScanExec {
       GpuReadParquetFileFormat.tagSupport(meta)
     } else if (classOf[JsonFileFormat].isAssignableFrom(cls)) {
       GpuReadJsonFileFormat.tagSupport(meta)
+    } else if (classOf[com.nvidia.spark.VortexFileFormat].isAssignableFrom(cls)) {
+      com.nvidia.spark.rapids.vortex.GpuReadVortexFileFormat.tagSupport(meta)
     } else {
       meta.willNotWorkOnGpu(s"unsupported file format: ${cls.getCanonicalName}")
     }
@@ -743,6 +745,8 @@ object GpuFileSourceScanExec {
       new GpuReadParquetFileFormat
     } else if (classOf[JsonFileFormat].isAssignableFrom(cls)) {
       new GpuReadJsonFileFormat
+    } else if (classOf[com.nvidia.spark.VortexFileFormat].isAssignableFrom(cls)) {
+      new com.nvidia.spark.rapids.vortex.GpuReadVortexFileFormat
     } else {
       throw new IllegalArgumentException(s"${cls.getCanonicalName} is not supported")
     }

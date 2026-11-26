@@ -445,7 +445,7 @@ class AggHelper(
   } else {
     inputAttributes
   }
-  private val enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf)
+  private val enableAstJit = false
   val preStepBound =
     GpuBindReferences.bindGpuReferencesTiered(preStep.toList, preStepAttributes.toList,
       conf, metrics, enableAstJit = enableAstJit)
@@ -794,7 +794,7 @@ object GpuAggFinalPassIterator {
       modeInfo: AggregateModeInfo,
       conf: SQLConf,
       metrics: Map[String, GpuMetric]): BoundExpressionsModeAggregates = {
-    val enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf)
+    val enableAstJit = false
     val groupingAttributes = groupingExpressions.map(_.toAttribute)
     val aggBufferAttributes = groupingAttributes ++
       aggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)
@@ -2131,9 +2131,8 @@ case class GpuHashAggregateExec(
     val localEstimatedPreProcessGrowth = estimatedPreProcessGrowth
 
     val boundGroupExprs = GpuBindReferences.bindGpuReferencesTiered(groupingExprs,
-      inputAttrs, conf, allMetrics, enableAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf))
-    val precompileAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT.get(conf) &&
-      RapidsConf.PROJECT_AST_JIT_PRECOMPILE.get(conf)
+      inputAttrs, conf, allMetrics, enableAstJit = false)
+    val precompileAstJit = false
     val precompileSpeculative = RapidsConf.PROJECT_AST_JIT_PRECOMPILE_SPECULATIVE.get(conf)
     val precompileThreads = RapidsConf.PROJECT_AST_JIT_PRECOMPILE_THREADS.get(conf)
     val multiOutputAstJit = RapidsConf.ENABLE_PROJECT_AST_JIT_MULTI_OUTPUT.get(conf)

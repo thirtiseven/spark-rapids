@@ -119,9 +119,27 @@ object GpuAstJitExpression extends Logging {
     case _ => false
   }
 
+  private def isPureNullCheckTree(expr: Expression): Boolean = expr match {
+    case _: GpuIsNull | _: GpuIsNotNull => true
+    case a: org.apache.spark.sql.rapids.GpuAnd =>
+      isPureNullCheckTree(a.left) && isPureNullCheckTree(a.right)
+    case o: org.apache.spark.sql.rapids.GpuOr =>
+      isPureNullCheckTree(o.left) && isPureNullCheckTree(o.right)
+    case _ => false
+  }
+
+  private def valueOpCount(expression: Expression): Int = {
+    expression.collect {
+      case _: GpuIsNull | _: GpuIsNotNull => 0
+      case g: GpuExpression if g.selfIsAstJitOperator => 1
+    }.sum
+  }
+
   private[rapids] def canUseAstJit(expression: Expression): Boolean = expression match {
     case gpuExpression: GpuExpression =>
       isSupportedDataType(expression.dataType) &&
+        !isPureNullCheckTree(gpuExpression) &&
+        valueOpCount(gpuExpression) >= 2 &&
         gpuExpression.supportsAstJit && gpuExpression.containsAstJitTrigger
     case _ => false
   }

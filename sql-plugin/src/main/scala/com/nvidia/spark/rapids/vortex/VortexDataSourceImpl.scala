@@ -682,7 +682,10 @@ case class VortexScan(
   }
 
   override def estimateStatistics(): Statistics = new Statistics {
-    private val sz = math.max(activeGroups.map(_.fileSizes.sum).sum, 1L)
+    private val rawSz = math.max(activeGroups.map(_.fileSizes.sum).sum, 1L)
+    private val fullW = math.max(fullSchema.defaultSize, 1)
+    private val reqW = math.max(requiredSchema.defaultSize, 1)
+    private val sz = math.max((rawSz.toDouble * reqW / fullW).toLong, 1L)
     override def sizeInBytes(): java.util.OptionalLong = java.util.OptionalLong.of(sz)
     override def numRows(): java.util.OptionalLong = java.util.OptionalLong.empty()
   }
@@ -826,7 +829,10 @@ case class GpuVortexScan(
   }
 
   override def estimateStatistics(): Statistics = new Statistics {
-    private val sz = math.max(activeGroups.map(_.fileSizes.sum).sum, 1L)
+    private val rawSz = math.max(activeGroups.map(_.fileSizes.sum).sum, 1L)
+    private val fullW = math.max(fullSchema.defaultSize, 1)
+    private val reqW = math.max(requiredSchema.defaultSize, 1)
+    private val sz = math.max((rawSz.toDouble * reqW / fullW).toLong, 1L)
     override def sizeInBytes(): java.util.OptionalLong = java.util.OptionalLong.of(sz)
     override def numRows(): java.util.OptionalLong = java.util.OptionalLong.empty()
   }

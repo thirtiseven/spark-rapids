@@ -1089,6 +1089,22 @@ object GpuLencFusedAgg {
       }
     }
 
+    // On many-file zero-copy Vortex scans (>200 files) with low-card string group keys and modest
+    // agg count (e.g. SF1000 Q01 with 1,982 files), per-batch D2H sync stalls GPU pipelining;
+    // let AST-JIT + async GpuHashAggregate handle it cleanly without falling into Mode 2 high-card!
+    if (groupAttrs.nonEmpty && groupAttrs.length <= 2 &&
+        groupAttrs.forall(_.dataType == StringType) && rawTerms.length < 12) {
+      val manyFileVortex = basePlan match {
+        case bse: com.nvidia.spark.rapids.shims.GpuBatchScanExecBase =>
+          bse.scan match {
+            case vs: com.nvidia.spark.rapids.vortex.GpuVortexScan => vs.files.length > 200
+            case _ => false
+          }
+        case _ => false
+      }
+      if (manyFileVortex) return None
+    }
+
     // Mode 1: Low-Cardinality String GroupBy (1-2 string keys directly over LeafExecNode scan, e.g. Q1/U2!)
     // Restrict to direct LeafExecNode scans (not post-join high-card keys like Q21 s_name!).
     val isLeafScan = basePlan.isInstanceOf[LeafExecNode]
@@ -1140,6 +1156,27 @@ object GpuLencFusedAgg {
         val gkSlots = groupAttrs.map(a => ordToSlot(idToOrd(a.exprId))).toArray
         GenericJitReduceCodegen.generateLowCardKernel(boundFilter, gkSlots, maxGroups, boundTerms).map {
           case (cudaSrc, kname) =>
+            // Keep string group keys & literal-compared columns as zero-copy DICTIONARY32 directly
+            // from GpuVortexScan (eliminates thousands of redundant GPU dictionary::encode sorts on Q01!)
+            basePlan match {
+              case bse: com.nvidia.spark.rapids.shims.GpuBatchScanExecBase =>
+                bse.scan match {
+                  case vs: com.nvidia.spark.rapids.vortex.GpuVortexScan =>
+                    val strCols = scala.collection.mutable.HashSet[String]()
+                    groupAttrs.foreach { a =>
+                      if (a.dataType == StringType) strCols += a.name
+                    }
+                    inputOrds.zipWithIndex.foreach { case (ord, slot) =>
+                      if (slot < dictLits.length && dictLits(slot).nonEmpty &&
+                          baseOutput(ord).dataType == StringType) {
+                        strCols += baseOutput(ord).name
+                      }
+                    }
+                    if (strCols.nonEmpty) vs.addDict32Cols(strCols.toSet)
+                  case _ =>
+                }
+              case _ =>
+            }
             val aggKinds = boundTerms.map(_.kind).toArray
             GpuGenericTableJitReduceExec(
               outAttrs, basePlan, inputOrds, dictLits, gkSlots, maxGroups,

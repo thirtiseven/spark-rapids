@@ -446,6 +446,16 @@ case class GpuVortexScan(
     fileSizes: Array[Long],
     lateMatFilters: Array[Filter] = Array.empty) extends GpuScan with Batch with SupportsReportStatistics {
 
+  // Additional string columns requested as zero-copy DICTIONARY32 by downstream fused operators
+  // (e.g. GpuGenericTableJitReduceExec group-by keys such as l_returnflag / l_linestatus in Q01)
+  @volatile private var extraDict32Cols: Set[String] = Set.empty
+
+  def addDict32Cols(cols: Set[String]): Unit = {
+    if (cols.nonEmpty) {
+      extraDict32Cols = extraDict32Cols ++ cols
+    }
+  }
+
   override def readSchema(): StructType = requiredSchema
 
   override def description(): String =
@@ -466,7 +476,7 @@ case class GpuVortexScan(
 
   override def createReaderFactory(): PartitionReaderFactory = {
     val colNames = requiredSchema.fieldNames
-    val dict32Set = GpuDictionaryUtils.updateDriverDict32Cols(SQLConf.get)
+    val dict32Set = GpuDictionaryUtils.updateDriverDict32Cols(SQLConf.get) ++ extraDict32Cols
     val dict32Mask: Array[Byte] = if (dict32Set.isEmpty) {
       null
     } else {
@@ -546,7 +556,8 @@ class GpuVortexPartitionReader(
       if (readTypes(i) == StringType) 1.toByte else 0.toByte
     }
   private val payloadColNames: Array[String] = payloadColIndices.map(colNames)
-  private val payloadHasStrings: Boolean = payloadColIndices.exists(i => readTypes(i) == StringType)
+  private val payloadHasStrings: Boolean =
+    payloadColIndices.exists(i => readTypes(i) == StringType && (dict32Mask == null || dict32Mask(i) == 0))
   private val payloadDictMask: Array[Byte] =
     if (dict32Mask == null) null else payloadColIndices.map(dict32Mask)
 
@@ -677,9 +688,16 @@ class GpuVortexPartitionReader(
     }
     if (readTypes.isEmpty) return false
 
-    // Acquire GpuSemaphore BEFORE opTime.ns so opTime reflects actual scan work, not semaphore wait!
+    // Acquire GpuSemaphore BEFORE opening prefetch scan & opTime.ns:
+    // keeps active prefetched VRAM bounded to concurrentGpuTasks(6) x prefetch(1),
+    // while the 16-worker Tokio I/O pool overlaps file i+1 open+read with file i GPU decode!
     GpuSemaphore.acquireIfNecessary(TaskContext.get())
     opTime.ns {
+      if (!useLateMat && multiScan == null && fileIdx < filePaths.length) {
+        val rem = filePaths.slice(fileIdx, filePaths.length)
+        fileIdx = filePaths.length
+        multiScan = VortexNative.openMultiScan(rem, colNames, batchRows, 1)
+      }
       if (useLateMat) {
         val pending = new ArrayBuffer[CudfTable]()
         var accBytes = 0L
@@ -701,7 +719,7 @@ class GpuVortexPartitionReader(
           if (!useLateMat && fileIdx < filePaths.length && multiScan == null) {
             val rem = filePaths.slice(fileIdx, filePaths.length)
             fileIdx = filePaths.length
-            multiScan = VortexNative.openMultiScan(rem, colNames, batchRows, 0)
+            multiScan = VortexNative.openMultiScan(rem, colNames, batchRows, 1)
           }
           if (pending.nonEmpty) {
             val finalTbl = if (pending.length == 1) {

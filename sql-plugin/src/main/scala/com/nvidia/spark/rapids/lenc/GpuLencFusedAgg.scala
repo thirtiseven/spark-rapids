@@ -1129,8 +1129,16 @@ object GpuLencFusedAgg {
           GenericJitReduceCodegen.generateHighCardKernel(boundFilter, boundTerms).map {
             case (cudaSrc, kname) =>
               val aggKinds = boundTerms.map(_.kind).toArray
+              // Coalesce small uncoalesced Vortex zero-copy batches before Mode 2 high-card
+              // partial GroupBy so local hash aggregation merges across files (prevents 2x shuffle blowup on NF_J0048!)
+              val hcInput: SparkPlan = basePlan match {
+                case bse: com.nvidia.spark.rapids.shims.GpuBatchScanExecBase
+                    if bse.scan.isInstanceOf[com.nvidia.spark.rapids.vortex.GpuVortexScan] =>
+                  GpuCoalesceBatches(basePlan, TargetSize(256L * 1024L * 1024L))
+                case _ => basePlan
+              }
               GpuGenericHighCardJitAggExec(
-                outAttrs, basePlan, groupOrds, valOrds, dictLits, aggKinds, outBufToTerm,
+                outAttrs, hcInput, groupOrds, valOrds, dictLits, aggKinds, outBufToTerm,
                 outTypes, cudaSrc, kname)
           }
       }

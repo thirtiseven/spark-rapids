@@ -1665,7 +1665,16 @@ class VortexConverterImpl extends java.util.function.Function[Array[String], jav
                   withResource(merged) { tbl =>
                     if (!pqFile.exists() || pqFile.length() == 0L) {
                       withResource(CudfTable.writeParquetChunked(writeOpts, pqFile)) { w =>
-                        w.write(tbl)
+                        val totalRows = tbl.getRowCount
+                        val maxChunkRows = 16000000L
+                        if (totalRows <= maxChunkRows) {
+                          w.write(tbl)
+                        } else {
+                          val splitPts = (maxChunkRows until totalRows by maxChunkRows).map(_.toInt).toArray
+                          withResource(tbl.contiguousSplit(splitPts: _*)) { parts =>
+                            parts.foreach(ct => w.write(ct.getTable))
+                          }
+                        }
                       }
                     }
                     if (!vxFile.exists() || vxFile.length() == 0L) {

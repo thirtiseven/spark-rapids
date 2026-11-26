@@ -207,8 +207,7 @@ trait GpuPartitioning extends Partitioning {
     val nc = table.getNumberOfColumns
     while (i < nc) {
       val dt = table.getColumn(i).getType
-      if (dt.isNestedType || dt == ai.rapids.cudf.DType.DICTIONARY32 ||
-          dt.getTypeId == ai.rapids.cudf.DType.DTypeEnum.DECIMAL128) {
+      if (dt.isNestedType || dt.getTypeId == ai.rapids.cudf.DType.DTypeEnum.DECIMAL128) {
         return false
       }
       i += 1
@@ -294,7 +293,16 @@ trait GpuPartitioning extends Partitioning {
 
   def sliceInternalGpuOrCpuAndClose(numRows: Int, partitionIndexes: Array[Int],
       partitionColumns: Array[GpuColumnVector]): Array[(ColumnarBatch, Int)] = {
-    val decodedCols = if (partitionColumns.exists(
+    // Item 2: When LencGpuShuffle is active on the GPU slicing path, pass DICTIONARY32 straight
+    // into lenc_shuffle.cu (zero decode + zero re-encode!) unless another unsupported type forces Kudo.
+    val lencHandlesDict32 = usesKudoGPUSlicing && partitionColumns.nonEmpty &&
+      org.apache.spark.sql.internal.SQLConf.get
+        .getConfString("spark.rapids.sql.lenc.shuffleEnabled", "false").toBoolean &&
+      partitionColumns.forall { col =>
+        val dt = col.getBase.getType
+        !dt.isNestedType && dt.getTypeId != ai.rapids.cudf.DType.DTypeEnum.DECIMAL128
+      }
+    val decodedCols = if (!lencHandlesDict32 && partitionColumns.exists(
         _.getBase.getType == ai.rapids.cudf.DType.DICTIONARY32)) {
       withResource(partitionColumns) { cols =>
         cols.safeMap { col =>

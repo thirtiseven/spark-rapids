@@ -88,13 +88,21 @@ object GpuDictionaryUtils {
       return Set.empty
     }
     import org.apache.spark.sql.catalyst.expressions._
+    import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
     import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
+    import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
     import org.apache.spark.sql.types.StringType
 
     val predCols = mutable.HashSet.empty[String]
     val pureGroupCols = mutable.HashSet.empty[String]
+    val hashKeyCols = mutable.HashSet.empty[String]
+    val shuffleNonKeyGroupCols = mutable.HashSet.empty[String]
+    val lencShufOn = conf.getConfString("spark.rapids.sql.lenc.shuffleEnabled", "false").toBoolean
+    val jitOn = conf.getConfString("spark.rapids.sql.projectAstJitEnabled", "false").toBoolean ||
+      conf.getConfString("spark.rapids.sql.lenc.fusedAggEnabled", "false").toBoolean
 
     def inspectExpr(e: Expression): Unit = {
+      if (!jitOn) return
       e.foreach {
         case EqualTo(a: Attribute, l: Literal) if a.dataType == StringType && l.value != null =>
           predCols += a.name
@@ -109,10 +117,26 @@ object GpuDictionaryUtils {
       }
     }
 
+    // Track hash partitioning keys (never keep as DICTIONARY32 so hash_partition hashes UTF-8!)
+    // and String columns carried as non-key shuffle payload below an Aggregate (e.g. o_orderpriority in Q04).
     plan.foreach {
+      case shuf: ShuffleExchangeLike =>
+        shuf.outputPartitioning match {
+          case HashPartitioning(exprs, _) =>
+            exprs.foreach(_.references.foreach { a =>
+              if (a.dataType == StringType) hashKeyCols += a.name
+            })
+          case _ =>
+        }
       case agg: BaseAggregateExec =>
+        val hasShuffleBelow = agg.children.exists(_.find(_.isInstanceOf[ShuffleExchangeLike]).isDefined)
         agg.groupingExpressions.foreach {
-          case a: Attribute if a.dataType == StringType => pureGroupCols += a.name
+          case a: Attribute if a.dataType == StringType =>
+            if (lencShufOn && hasShuffleBelow) {
+              shuffleNonKeyGroupCols += a.name
+            } else {
+              pureGroupCols += a.name
+            }
           case _ =>
         }
         agg.aggregateExpressions.foreach(inspectExpr)
@@ -121,7 +145,7 @@ object GpuDictionaryUtils {
         p.expressions.foreach(inspectExpr)
     }
 
-    val chosen = (predCols -- pureGroupCols).toSet
+    val chosen = ((predCols ++ shuffleNonKeyGroupCols) -- pureGroupCols -- hashKeyCols).toSet
     driverDict32Cols = chosen
     chosen
   }

@@ -16,7 +16,7 @@
 
 package com.nvidia.spark.rapids
 
-import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue}
+import java.util.concurrent.ConcurrentHashMap
 
 import scala.collection.mutable
 
@@ -93,7 +93,7 @@ object GpuDictionaryUtils {
     import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
     import org.apache.spark.sql.types.StringType
 
-    val predCols = mutable.HashSet.empty[String]
+    val predLits = mutable.HashMap.empty[String, mutable.HashSet[String]]
     val pureGroupCols = mutable.HashSet.empty[String]
     val hashKeyCols = mutable.HashSet.empty[String]
     val shuffleNonKeyGroupCols = mutable.HashSet.empty[String]
@@ -101,18 +101,24 @@ object GpuDictionaryUtils {
     val jitOn = conf.getConfString("spark.rapids.sql.projectAstJitEnabled", "false").toBoolean ||
       conf.getConfString("spark.rapids.sql.lenc.fusedAggEnabled", "false").toBoolean
 
+    def addLit(colName: String, v: Any): Unit = {
+      if (v != null) {
+        predLits.getOrElseUpdate(colName, mutable.HashSet.empty[String]) += v.toString
+      }
+    }
+
     def inspectExpr(e: Expression): Unit = {
       if (!jitOn) return
       e.foreach {
         case EqualTo(a: Attribute, l: Literal) if a.dataType == StringType && l.value != null =>
-          predCols += a.name
+          addLit(a.name, l.value)
         case EqualTo(l: Literal, a: Attribute) if a.dataType == StringType && l.value != null =>
-          predCols += a.name
+          addLit(a.name, l.value)
         case InSet(a: Attribute, hset) if a.dataType == StringType && hset.nonEmpty =>
-          predCols += a.name
+          hset.foreach(addLit(a.name, _))
         case In(a: Attribute, list) if a.dataType == StringType && list.nonEmpty &&
             list.forall(_.isInstanceOf[Literal]) =>
-          predCols += a.name
+          list.foreach { case l: Literal => addLit(a.name, l.value); case _ => }
         case _ =>
       }
     }
@@ -145,7 +151,12 @@ object GpuDictionaryUtils {
         p.expressions.foreach(inspectExpr)
     }
 
-    val chosen = ((predCols ++ shuffleNonKeyGroupCols) -- pureGroupCols -- hashKeyCols).toSet
+    // Multi-branch predicate gate: only request Parquet DICTIONARY32 for string columns compared
+    // against >= 2 distinct literals (InSet / OR / multi-branch CASE WHEN such as TPC-H Q12/Q19,
+    // NF_J0048/NF_J0058, TPC-DS Q13/Q48/Q85). Avoids cudf::dictionary::unify_dictionaries overhead
+    // on single-literal predicates across thousands of small Hive-partitioned Parquet files!
+    val multiLitPredCols = predLits.collect { case (k, vs) if vs.size >= 2 => k }.toSet
+    val chosen = ((multiLitPredCols ++ shuffleNonKeyGroupCols) -- pureGroupCols -- hashKeyCols).toSet
     driverDict32Cols = chosen
     chosen
   }
@@ -224,21 +235,18 @@ object GpuAstJitProgramPool {
   final case class SchemaCol(ordinal: Int, dtype: DType, nullable: Boolean)
   final case class PoolKey(exprs: Vector[Expression], schema: Vector[SchemaCol])
 
-  private val MAX_KEYS = 256
-  private val MAX_PER_KEY = 8
-  private val pools = new ConcurrentHashMap[PoolKey, ConcurrentLinkedQueue[AstJitProgram]]()
+  // AstJitProgram.computeTable is read-only & thread-safe across concurrent GPU tasks as long as
+  // close() is only called at JVM shutdown. Sharing a single compiled program via computeIfAbsent
+  // eliminates 6-way concurrent NVRTC recompiles (e.g. TPC-DS Q66 24-branch DECIMAL Agg: 9 -> 1)!
+  private val MAX_KEYS = 4096
+  private val programs = new ConcurrentHashMap[PoolKey, AstJitProgram]()
 
   def clear(): Unit = {
-    val it = pools.values().iterator()
+    val it = programs.values().iterator()
     while (it.hasNext) {
-      val q = it.next()
-      var p = q.poll()
-      while (p != null) {
-        p.safeClose()
-        p = q.poll()
-      }
+      it.next().safeClose()
     }
-    pools.clear()
+    programs.clear()
   }
 
   Runtime.getRuntime.addShutdownHook(new Thread(() => clear()))
@@ -246,25 +254,26 @@ object GpuAstJitProgramPool {
   def withProgram[T](
       key: PoolKey,
       build: => AstJitProgram)(body: AstJitProgram => T): (T, Boolean) = {
-    val queue = pools.computeIfAbsent(key, _ => new ConcurrentLinkedQueue[AstJitProgram]())
-    val existing = queue.poll()
-    val hit = existing != null
-    val prog = if (hit) {
-      existing
-    } else {
+    val existing = programs.get(key)
+    if (existing != null) {
+      return (body(existing), true)
+    }
+    if (programs.size() >= MAX_KEYS) {
+      val tmp = build
+      try {
+        return (body(tmp), false)
+      } finally {
+        tmp.safeClose()
+      }
+    }
+    var builtHere = false
+    val prog = programs.computeIfAbsent(key, _ => {
+      builtHere = true
       val p = build
       p.noWarnLeakExpected()
       p
-    }
-    try {
-      (body(prog), hit)
-    } finally {
-      if (pools.size() > MAX_KEYS || queue.size() >= MAX_PER_KEY) {
-        prog.safeClose()
-      } else {
-        queue.offer(prog)
-      }
-    }
+    })
+    (body(prog), !builtHere)
   }
 }
 

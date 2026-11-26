@@ -53,7 +53,8 @@ case class VortexFileGroup(
     partVals: Array[Any],
     files: Array[String],
     fileSizes: Array[Long],
-    zone: Option[VortexZoneEntry] = None) extends Serializable
+    zone: Option[VortexZoneEntry] = None,
+    rowCount: Long = -1L) extends Serializable
 
 /** Evaluates Spark DSv2 partition filters (static & runtime DPP) against Hive partition values. */
 object VortexPartitionPruner {
@@ -201,7 +202,25 @@ object VortexPartitionPruner {
 object VortexSchemaIO {
   val SCHEMA_FILE = "_vortex_schema.json"
   val ZONEMAP_FILE = "_vortex_zonemap.tsv"
+  val STATS_FILE = "_vortex_stats.tsv"
   private val HIVE_DEFAULT_PART = "__HIVE_DEFAULT_PARTITION__"
+  private val discoverCache = new java.util.concurrent.ConcurrentHashMap[
+    (String, Long),
+    (StructType, StructType, Array[String], Array[DataType], Array[String], Array[VortexFileGroup])]()
+
+  private def loadStatsMap(root: File): Map[String, Long] = {
+    val sf = new File(root, STATS_FILE)
+    if (!sf.exists()) return Map.empty
+    val m = scala.collection.mutable.HashMap.empty[String, Long]
+    new String(Files.readAllBytes(sf.toPath), StandardCharsets.UTF_8)
+      .linesIterator.map(_.trim).filter(l => l.nonEmpty && !l.startsWith("#")).foreach { ln =>
+        val parts = ln.split("\t")
+        if (parts.length >= 3) {
+          scala.util.Try(parts(2).toLong).foreach(rc => m.put(parts(0), rc))
+        }
+      }
+    m.toMap
+  }
 
   def stripFileScheme(path: String): String = {
     if (path.startsWith("file://")) path.stripPrefix("file://")
@@ -243,7 +262,35 @@ object VortexSchemaIO {
     val clean = stripFileScheme(dirPath)
     val root = new File(clean)
     require(root.isDirectory, s"Not a directory: $clean")
+    val statsFile = new File(root, STATS_FILE)
+    val cacheKey = (root.getCanonicalPath, root.lastModified() ^ statsFile.lastModified())
+    val cached = discoverCache.get(cacheKey)
+    if (cached != null) return cached
+    val res = discoverTableUncached(clean, root)
+    if (discoverCache.size() >= 256) discoverCache.clear()
+    discoverCache.put(cacheKey, res)
+    res
+  }
+
+  private def discoverTableUncached(clean: String, root: File): (
+      StructType, StructType, Array[String], Array[DataType], Array[String], Array[VortexFileGroup]) = {
     val dataSchema = readDataSchema(clean)
+    val statsMap = loadStatsMap(root)
+    val rootPath = root.getCanonicalFile.toPath
+    def sumRows(fs: Array[File]): Long = {
+      if (statsMap.isEmpty || fs.isEmpty) return -1L
+      var tot = 0L
+      var i = 0
+      while (i < fs.length) {
+        val rel = rootPath.relativize(fs(i).getCanonicalFile.toPath).toString
+        statsMap.get(rel) match {
+          case Some(r) => tot += r
+          case None => return -1L
+        }
+        i += 1
+      }
+      tot
+    }
 
     val topEntries = Option(root.listFiles()).getOrElse(Array.empty)
     val topVortex = topEntries
@@ -270,7 +317,7 @@ object VortexSchemaIO {
                 val hn = parts(3) == "1"
                 groups += VortexFileGroup(
                   Array.empty, Array(f.getAbsolutePath), Array(f.length()),
-                  Some(VortexZoneEntry(mn, mx, hasMM, hn)))
+                  Some(VortexZoneEntry(mn, mx, hasMM, hn)), sumRows(Array(f)))
               }
             }
           }
@@ -280,7 +327,9 @@ object VortexSchemaIO {
         }
       }
       val grp = if (topVortex.nonEmpty) {
-        Array(VortexFileGroup(Array.empty, topVortex.map(_.getAbsolutePath), topVortex.map(_.length())))
+        Array(VortexFileGroup(
+          Array.empty, topVortex.map(_.getAbsolutePath), topVortex.map(_.length()),
+          None, sumRows(topVortex)))
       } else {
         Array.empty[VortexFileGroup]
       }
@@ -320,7 +369,7 @@ object VortexSchemaIO {
 
     val groups = rawGroups.map { case (kvs, vxs) =>
       val typedVals = partColTypes.indices.map(i => parseTyped(kvs(i)._2, partColTypes(i))).toArray
-      VortexFileGroup(typedVals, vxs.map(_.getAbsolutePath), vxs.map(_.length()))
+      VortexFileGroup(typedVals, vxs.map(_.getAbsolutePath), vxs.map(_.length()), None, sumRows(vxs))
     }.toArray
 
     (dataSchema, fullSchema, partColNames, partColTypes, Array.empty, groups)
@@ -686,8 +735,14 @@ case class VortexScan(
     private val fullW = math.max(fullSchema.defaultSize, 1)
     private val reqW = math.max(requiredSchema.defaultSize, 1)
     private val sz = math.max((rawSz.toDouble * reqW / fullW).toLong, 1L)
+    private val exactRows: java.util.OptionalLong =
+      if (activeGroups.nonEmpty && activeGroups.forall(_.rowCount >= 0L)) {
+        java.util.OptionalLong.of(activeGroups.map(_.rowCount).sum)
+      } else {
+        java.util.OptionalLong.empty()
+      }
     override def sizeInBytes(): java.util.OptionalLong = java.util.OptionalLong.of(sz)
-    override def numRows(): java.util.OptionalLong = java.util.OptionalLong.empty()
+    override def numRows(): java.util.OptionalLong = exactRows
   }
 
   override def planInputPartitions(): Array[InputPartition] = {
@@ -757,9 +812,12 @@ object VortexPartitionHelper {
     if (totalBytes <= 16L * 1024L * 1024L) {
       return Array(fileGroups)
     }
-    val targetParts = if (totalBytes > 512L * 1024L * 1024L) 32 else 16
+    val targetParts =
+      if (totalBytes > 8L * 1024L * 1024L * 1024L) 48
+      else if (totalBytes > 512L * 1024L * 1024L) 32
+      else 16
     val maxBytesPerTask = math.max(64L * 1024L * 1024L, totalBytes / targetParts)
-    val maxGroupsPerTask = math.max(1, math.min(128, (fileGroups.length + targetParts - 1) / targetParts))
+    val maxGroupsPerTask = math.max(1, (fileGroups.length + targetParts - 1) / targetParts)
     val out = new ArrayBuffer[Array[VortexFileGroup]]()
     val cur = new ArrayBuffer[VortexFileGroup]()
     var curBytes = 0L
@@ -833,8 +891,14 @@ case class GpuVortexScan(
     private val fullW = math.max(fullSchema.defaultSize, 1)
     private val reqW = math.max(requiredSchema.defaultSize, 1)
     private val sz = math.max((rawSz.toDouble * reqW / fullW).toLong, 1L)
+    private val exactRows: java.util.OptionalLong =
+      if (activeGroups.nonEmpty && activeGroups.forall(_.rowCount >= 0L)) {
+        java.util.OptionalLong.of(activeGroups.map(_.rowCount).sum)
+      } else {
+        java.util.OptionalLong.empty()
+      }
     override def sizeInBytes(): java.util.OptionalLong = java.util.OptionalLong.of(sz)
-    override def numRows(): java.util.OptionalLong = java.util.OptionalLong.empty()
+    override def numRows(): java.util.OptionalLong = exactRows
   }
 
   override def planInputPartitions(): Array[InputPartition] = {
@@ -953,9 +1017,27 @@ class GpuVortexHivePartitionedReader(
   private val numOutputBatches = metrics.getOrElse(NUM_OUTPUT_BATCHES, NoopMetric)
   private val targetCoalesceBytes = if (coalesceTargetBytes > 0L) coalesceTargetBytes else 128L * 1024L * 1024L
 
-  private var groupIdx = 0
+  // Flatten ALL surviving daily Hive files of this Spark task into ONE single MultiFileScan
+  // (1 reused CudaExecutionCtx + 16-worker off-GpuSemaphore Tokio host prefetch across all files!)
+  private val (allFiles, fileToGroup, avgFileBytes): (Array[String], Array[VortexFileGroup], Long) = {
+    val fs = new ArrayBuffer[String]()
+    val fg = new ArrayBuffer[VortexFileGroup]()
+    var totB = 0L
+    groups.foreach { g =>
+      var i = 0
+      while (i < g.files.length) {
+        fs += g.files(i)
+        fg += g
+        totB += (if (i < g.fileSizes.length) g.fileSizes(i) else 0L)
+        i += 1
+      }
+    }
+    val avg = if (fs.nonEmpty) totB / fs.length else 0L
+    (fs.toArray, fg.toArray, avg)
+  }
+  private val zeroCopyLargeFile = avgFileBytes >= 24L * 1024L * 1024L
   private var activeScan: VortexNative.MultiFileScan = _
-  private var activeGroup: VortexFileGroup = _
+  private var eof = false
 
   private def makePartScalar(v: Any, dt: DataType): Scalar = {
     if (v == null) {
@@ -968,16 +1050,45 @@ class GpuVortexHivePartitionedReader(
     }
   }
 
-  private def buildBatchTable(dataTbl: CudfTable, partVals: Array[Any]): CudfTable = {
-    val nRows = dataTbl.getRowCount.toInt
-    val cols = new Array[ColumnVector](outColSource.length)
+  private def buildBatchFromZeroCopy(cvs: Array[ColumnVector], partVals: Array[Any]): ColumnarBatch = {
+    val nRows = if (cvs.nonEmpty) cvs(0).getRowCount.toInt else 0
+    val gpuCols = new Array[org.apache.spark.sql.vectorized.ColumnVector](outColSource.length)
     var ok = false
     try {
       var i = 0
       while (i < outColSource.length) {
         outColSource(i) match {
           case Left(dIdx) =>
-            cols(i) = dataTbl.getColumn(dIdx).incRefCount()
+            gpuCols(i) = GpuColumnVector.from(cvs(dIdx), readTypes(i))
+            cvs(dIdx) = null
+          case Right(pIdx) =>
+            withResource(makePartScalar(partVals(pIdx), partColTypes(pIdx))) { s =>
+              gpuCols(i) = GpuColumnVector.from(ColumnVector.fromScalar(s, nRows), readTypes(i))
+            }
+        }
+        i += 1
+      }
+      val batch = new ColumnarBatch(gpuCols, nRows)
+      ok = true
+      batch
+    } finally {
+      cvs.foreach(c => if (c != null) c.close())
+      if (!ok) {
+        gpuCols.foreach(c => if (c != null) c.close())
+      }
+    }
+  }
+
+  private def buildTableFromZeroCopy(cvs: Array[ColumnVector], partVals: Array[Any]): CudfTable = {
+    val nRows = if (cvs.nonEmpty) cvs(0).getRowCount.toInt else 0
+    val cols = new Array[ColumnVector](outColSource.length)
+    try {
+      var i = 0
+      while (i < outColSource.length) {
+        outColSource(i) match {
+          case Left(dIdx) =>
+            cols(i) = cvs(dIdx)
+            cvs(dIdx) = null
           case Right(pIdx) =>
             withResource(makePartScalar(partVals(pIdx), partColTypes(pIdx))) { s =>
               cols(i) = ColumnVector.fromScalar(s, nRows)
@@ -985,10 +1096,9 @@ class GpuVortexHivePartitionedReader(
         }
         i += 1
       }
-      val t = new CudfTable(cols: _*)
-      ok = true
-      t
+      new CudfTable(cols: _*)
     } finally {
+      cvs.foreach(c => if (c != null) c.close())
       cols.foreach(c => if (c != null) c.close())
     }
   }
@@ -998,10 +1108,39 @@ class GpuVortexHivePartitionedReader(
       currentBatch.close()
       currentBatch = null
     }
-    if (groups.isEmpty || scanCols.isEmpty) return false
+    if (eof || allFiles.isEmpty || scanCols.isEmpty) return false
+
+    // Start pure-CPU off-GpuSemaphore Tokio host-segment prefetch BEFORE acquiring GpuSemaphore!
+    // Uses zero GPU VRAM until nextZeroCopyBatch exports under the semaphore.
+    if (activeScan == null) {
+      activeScan = VortexNative.openMultiScan(allFiles, scanCols, batchRows, 4)
+    }
 
     GpuSemaphore.acquireIfNecessary(TaskContext.get())
     opTime.ns {
+      if (zeroCopyLargeFile && readTypes.nonEmpty) {
+        while (true) {
+          val cvs = gpuDecodeTime.ns {
+            activeScan.nextZeroCopyBatch(scanDictMask)
+          }
+          if (cvs == null) {
+            eof = true
+            activeScan.safeClose()
+            activeScan = null
+            return false
+          }
+          val nr = if (cvs.nonEmpty) cvs(0).getRowCount else 0L
+          if (nr <= 0L) {
+            cvs.safeClose()
+          } else {
+            val fIdx = math.min(math.max(activeScan.getLastFileIndex(), 0), fileToGroup.length - 1)
+            currentBatch = buildBatchFromZeroCopy(cvs, fileToGroup(fIdx).partVals)
+            numOutputBatches += 1
+            return true
+          }
+        }
+      }
+
       val pending = new ArrayBuffer[CudfTable]()
       var accBytes = 0L
       var accRows = 0L
@@ -1010,38 +1149,27 @@ class GpuVortexHivePartitionedReader(
       try {
         while ((pending.isEmpty && emptyColRows == 0L) ||
             (canCoalesce && accBytes < targetCoalesceBytes && accRows < 4000000L)) {
-          if (activeScan == null) {
-            if (groupIdx >= groups.length) {
-              if (pending.nonEmpty || emptyColRows > 0L) {
-                return emitPending(pending, emptyColRows)
-              } else {
-                return false
-              }
-            }
-            activeGroup = groups(groupIdx)
-            groupIdx += 1
-            activeScan = VortexNative.openMultiScan(activeGroup.files, scanCols, batchRows, 1)
+          val cvs = gpuDecodeTime.ns {
+            activeScan.nextZeroCopyBatch(scanDictMask)
           }
-          val dataTbl = gpuDecodeTime.ns {
-            activeScan.nextCoalescedBatch(scanDictMask, targetCoalesceBytes)
-          }
-          if (dataTbl == null) {
+          if (cvs == null) {
+            eof = true
             activeScan.safeClose()
             activeScan = null
+            return emitPending(pending, emptyColRows)
+          }
+          val nr = if (cvs.nonEmpty) cvs(0).getRowCount else 0L
+          if (nr <= 0L) {
+            cvs.safeClose()
+          } else if (readTypes.isEmpty) {
+            cvs.safeClose()
+            emptyColRows += nr
           } else {
-            withResource(dataTbl) { dt =>
-              val nr = dt.getRowCount
-              if (nr > 0) {
-                if (readTypes.isEmpty) {
-                  emptyColRows += nr
-                } else {
-                  val fullT = buildBatchTable(dt, activeGroup.partVals)
-                  pending += fullT
-                  accBytes += fullT.getDeviceMemorySize
-                  accRows += nr
-                }
-              }
-            }
+            val fIdx = math.min(math.max(activeScan.getLastFileIndex(), 0), fileToGroup.length - 1)
+            val fullT = buildTableFromZeroCopy(cvs, fileToGroup(fIdx).partVals)
+            pending += fullT
+            accBytes += fullT.getDeviceMemorySize
+            accRows += nr
           }
         }
         emitPending(pending, emptyColRows)
@@ -1267,16 +1395,15 @@ class GpuVortexPartitionReader(
     }
     if (readTypes.isEmpty) return false
 
-    // Acquire GpuSemaphore BEFORE opening prefetch scan & opTime.ns:
-    // keeps active prefetched VRAM bounded to concurrentGpuTasks(6) x prefetch(1),
-    // while the 16-worker Tokio I/O pool overlaps file i+1 open+read with file i GPU decode!
+    // Start pure-CPU off-GpuSemaphore Tokio host-segment prefetch BEFORE acquiring GpuSemaphore!
+    if (!useLateMat && multiScan == null && fileIdx < filePaths.length) {
+      val rem = filePaths.slice(fileIdx, filePaths.length)
+      fileIdx = filePaths.length
+      multiScan = VortexNative.openMultiScan(rem, colNames, batchRows, 4)
+    }
+
     GpuSemaphore.acquireIfNecessary(TaskContext.get())
     opTime.ns {
-      if (!useLateMat && multiScan == null && fileIdx < filePaths.length) {
-        val rem = filePaths.slice(fileIdx, filePaths.length)
-        fileIdx = filePaths.length
-        multiScan = VortexNative.openMultiScan(rem, colNames, batchRows, 1)
-      }
       if (useLateMat) {
         val pending = new ArrayBuffer[CudfTable]()
         var accBytes = 0L
@@ -1453,8 +1580,11 @@ class VortexConverterImpl extends java.util.function.Function[Array[String], jav
     val opts = optsBuilder.build()
 
     // Preserve Hive col=val/ subdirectories automatically (1 clean .vortex file per leaf partition!)
+    // Also record exact per-file rowCount into _vortex_stats.tsv for exact CBO numRows statistics!
     val hasHiveDirs = pqFiles.exists(f => f.getParentFile.getCanonicalPath != srcRoot.getPath)
     val totalBytes = new java.util.concurrent.atomic.AtomicLong(0L)
+    val statsLines = new java.util.concurrent.ConcurrentLinkedQueue[String]()
+    val outRootPath = outDir.getCanonicalFile.toPath
     val pool = java.util.concurrent.Executors.newFixedThreadPool(math.max(1, numThreads))
     try {
       if (!hasHiveDirs) {
@@ -1462,12 +1592,18 @@ class VortexConverterImpl extends java.util.function.Function[Array[String], jav
           pool.submit(new Runnable {
             override def run(): Unit = {
               val outPath = new File(outDir, f"part-$i%05d.vortex")
-              if (!outPath.exists() || outPath.length() == 0L) {
+              val rc = if (!outPath.exists() || outPath.length() == 0L) {
                 withResource(CudfTable.readParquet(opts, pqFile)) { table =>
                   VortexNative.writeTable(table, colNames, outPath.getAbsolutePath)
+                  table.getRowCount
                 }
+              } else {
+                withResource(CudfTable.readParquet(opts, pqFile))(_.getRowCount)
               }
-              totalBytes.addAndGet(outPath.length())
+              val fsz = outPath.length()
+              totalBytes.addAndGet(fsz)
+              val rel = outRootPath.relativize(outPath.getCanonicalFile.toPath).toString
+              statsLines.add(s"$rel\t$fsz\t$rc")
             }
           })
         }
@@ -1481,25 +1617,37 @@ class VortexConverterImpl extends java.util.function.Function[Array[String], jav
               val partOutDir = outDir.toPath.resolve(rel).toFile
               partOutDir.mkdirs()
               val outPath = new File(partOutDir, "part-00000.vortex")
-              if (!outPath.exists() || outPath.length() == 0L) {
+              val rc = if (!outPath.exists() || outPath.length() == 0L) {
                 if (filesInPart.length == 1) {
                   withResource(CudfTable.readParquet(opts, filesInPart(0))) { table =>
                     VortexNative.writeTable(table, colNames, outPath.getAbsolutePath)
+                    table.getRowCount
                   }
                 } else {
                   withResource(filesInPart.safeMap(f => CudfTable.readParquet(opts, f))) { tbls =>
                     withResource(CudfTable.concatenate(tbls: _*)) { merged =>
                       VortexNative.writeTable(merged, colNames, outPath.getAbsolutePath)
+                      merged.getRowCount
                     }
                   }
                 }
+              } else {
+                filesInPart.map(f => withResource(CudfTable.readParquet(opts, f))(_.getRowCount)).sum
               }
-              totalBytes.addAndGet(outPath.length())
+              val fsz = outPath.length()
+              totalBytes.addAndGet(fsz)
+              val outRel = outRootPath.relativize(outPath.getCanonicalFile.toPath).toString
+              statsLines.add(s"$outRel\t$fsz\t$rc")
             }
           })
         }
         futures.foreach(_.get())
       }
+      val sortedStats = statsLines.toArray(new Array[String](0)).sorted
+      val header = "#REL_PATH\tBYTES\tROW_COUNT\n"
+      Files.write(
+        Paths.get(vortexDir, VortexSchemaIO.STATS_FILE),
+        (header + sortedStats.mkString("\n") + "\n").getBytes(StandardCharsets.UTF_8))
     } finally {
       pool.shutdown()
     }

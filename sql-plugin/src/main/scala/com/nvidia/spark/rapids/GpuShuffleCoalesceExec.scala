@@ -390,15 +390,10 @@ class KudoGpuTableOperator(dataTypes: Array[DataType])
       // one host allocation per batch instead of one per table, and every
       // pinned allocation serializes on a single lock.
       val spillables = columns.map(_.spillableKudoTable)
-      // Detect LSHF lightweight-encoded shuffle frames via 4-byte magic in first non-empty payload
+      // Detect LSHF lightweight-encoded shuffle frames via zero-copy 4-byte magic peek
       val isLencFrame = {
         val firstNonEmpty = spillables.find(_.header.getTotalDataLen >= 16)
-        firstNonEmpty.exists { skt =>
-          withResource(HostMemoryBuffer.allocate(skt.header.getTotalDataLen)) { tmp =>
-            skt.materializeInto(tmp, 0L)
-            tmp.getInt(0L) == 0x4648534C // "LSHF"
-          }
-        }
+        firstNonEmpty.exists(_.peekMagicInt() == 0x4648534C) // "LSHF"
       }
       if (isLencFrame) {
         // Stage ONLY 8-byte-aligned LSHF payloads (strip Kudo headers -> guaranteed 8B GPU alignment!)

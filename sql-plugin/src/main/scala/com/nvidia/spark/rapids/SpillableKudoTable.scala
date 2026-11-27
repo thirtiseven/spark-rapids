@@ -43,6 +43,15 @@ class SpillableKudoTable(val header: KudoTableHeader,
     }
   }
 
+  /** Zero-copy O(1) peek of the first 4 payload bytes (avoids allocating & copying the whole buffer). */
+  def peekMagicInt(): Int = {
+    if (shb == null || length < 4L) {
+      0
+    } else {
+      Arm.withResource(shb.getHostBuffer())(_.getInt(0L))
+    }
+  }
+
   override def toString: String =
     "SpillableKudoTable{header=" + this.header + ", shb=" + this.shb + '}'
 

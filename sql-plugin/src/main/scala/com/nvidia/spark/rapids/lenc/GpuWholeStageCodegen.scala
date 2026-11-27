@@ -20,7 +20,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 import scala.collection.mutable
 
-import ai.rapids.cudf.{ColumnVector, ColumnView, OutOfBoundsPolicy, Scalar, Table => CudfTable}
+import ai.rapids.cudf.{ColumnVector, ColumnView, DType, OutOfBoundsPolicy, Scalar, Table => CudfTable}
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.GpuMetric._
@@ -37,27 +37,26 @@ import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.datasources.FilePartition
 import org.apache.spark.sql.execution.rapids.shims.FilePartitionShims
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.rapids.{GpuAdd, GpuAnd, GpuContains, GpuDivide, GpuEqualTo, GpuFileSourceScanExec, GpuGreaterThan, GpuGreaterThanOrEqual, GpuLessThan, GpuLessThanOrEqual, GpuMultiply, GpuNot, GpuOr, GpuStartsWith, GpuSubstring, GpuSubtract}
+import org.apache.spark.sql.rapids.{GpuContains, GpuEqualTo, GpuFileSourceScanExec, GpuStartsWith, GpuSubstring}
 import org.apache.spark.sql.rapids.execution.{GpuBroadcastHashJoinExecBase, GpuBroadcastHelper, GpuShuffleExchangeExecBase}
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
-import org.apache.spark.unsafe.types.UTF8String
 
 /**
- * Thin Whole-Stage GPU Codegen physical-plan matcher & NVRTC stage-body generator backed by
- * libcudf's cudf::whole_stage execution primitives (pluggable Sources + L2 LUT/Hash multi-way
- * Broadcast Probe + Native Single-Pass GPU Open-Addressing Hash-Agg Sink with auto-flush).
- *
- * Eliminates cudf::gather wide-table materialization AND cudf::groupby::get_groups sorting on:
- *   - K = 1..6 Star Broadcast Equi-Join + Filter + Project + Partial Hash-Agg (including
- *     broadcast-dimension String group keys via per-task dictionary encoding + tiny final gather!)
- *   - K = 0 Standalone Partial Hash-Agg (1..4 fixed-width group keys) over any child plan.
+ * Whole-Stage GPU Codegen physical-plan planner backed by `StageIR` (Produce/Consume pipeline IR)
+ * and libcudf's `cudf::whole_stage` execution engine (pluggable Raw/Vortex/CONSTANT/LSHF Sources,
+ * L2 LUT/Hash multi-way Broadcast/Shuffled probes, Expand(ROLLUP), native GPU Open-Addressing
+ * Hash-Agg Sink, MaterializeSink, and ShufflePartitionSink).
  */
 object GpuWholeStageCodegenRewrite {
+
+  import StageIR._
+
   private val MAX_DIMS = 6
   private val MAX_FACT_COLS = 24
-  private val MAX_DIM_COLS = 16
+  private val MAX_DIM_COLS = 24
   private val MAX_GROUP_KEYS = 8
+  private val MAX_AGGS = 32
 
   private def isJoinKeyType(dt: DataType): Boolean = dt match {
     case IntegerType | LongType | DateType => true
@@ -65,7 +64,19 @@ object GpuWholeStageCodegenRewrite {
   }
 
   private def isFixedGroupKeyType(dt: DataType): Boolean = dt match {
-    case ByteType | ShortType | IntegerType | LongType | DateType => true
+    case BooleanType | ByteType | ShortType | IntegerType | LongType | DateType => true
+    case d: DecimalType if d.precision <= 18 => true
+    case _ => false
+  }
+
+  private def isPartitionConstType(dt: DataType): Boolean = dt match {
+    case BooleanType | ByteType | ShortType | IntegerType | LongType | DateType => true
+    case _ => false
+  }
+
+  private def isCodegenLeafType(dt: DataType): Boolean = dt match {
+    case BooleanType | ByteType | ShortType | IntegerType | LongType |
+         FloatType | DoubleType | DateType => true
     case d: DecimalType if d.precision <= 18 => true
     case _ => false
   }
@@ -79,19 +90,27 @@ object GpuWholeStageCodegenRewrite {
     case j: GpuAstJitExpression => j.child
   }
 
-  private def extractProjectMap(projList: Seq[NamedExpression]): Map[ExprId, Expression] = {
-    projList.collect {
+  private def extractProjectMap(projectList: Seq[NamedExpression]): Map[ExprId, Expression] = {
+    projectList.collect {
       case a: GpuAlias => a.exprId -> unwrapJit(a.child)
       case a: Alias => a.exprId -> unwrapJit(a.child)
     }.toMap
   }
 
-  private def isPassThroughProject(projList: Seq[NamedExpression]): Option[Map[ExprId, Attribute]] = {
+  private def isPassThroughProject(projectList: Seq[NamedExpression]): Option[Map[ExprId, Attribute]] = {
     val m = mutable.HashMap.empty[ExprId, Attribute]
-    projList.foreach {
+    projectList.foreach {
       case a: Attribute => m.put(a.exprId, a)
-      case GpuAlias(a: Attribute, _) => m.put(a.exprId, a)
-      case Alias(a: Attribute, _) => m.put(a.exprId, a)
+      case a: Alias =>
+        a.child match {
+          case attr: Attribute => m.put(a.exprId, attr)
+          case _ => return None
+        }
+      case g: GpuAlias =>
+        g.child match {
+          case attr: Attribute => m.put(g.exprId, attr)
+          case _ => return None
+        }
       case _ => return None
     }
     Some(m.toMap)
@@ -111,14 +130,14 @@ object GpuWholeStageCodegenRewrite {
 
   /**
    * Checks if `plan` is a V1 GpuFileSourceScanExec backed by GpuReadVortexFileFormat whose
-   * compressed segments (FSST / FastLanes BitPacked+FoR / ALP / Dict) can be streamed directly
-   * into libcudf cudf::whole_stage without HBM decompression!
+   * compressed segments (FSST / FastLanes BitPacked+FoR / ALP / Dict) + optional scalar Hive
+   * partition CONSTANT columns can stream directly into libcudf cudf::whole_stage!
    */
   private[lenc] def isDirectCompressedVortexScan(plan: SparkPlan): Boolean = plan match {
     case fsse: GpuFileSourceScanExec =>
       fsse.relation.fileFormat.isInstanceOf[com.nvidia.spark.rapids.vortex.GpuReadVortexFileFormat] &&
-        fsse.relation.partitionSchema.isEmpty &&
         !fsse.bucketedScan &&
+        fsse.relation.partitionSchema.fields.forall(f => isPartitionConstType(f.dataType)) &&
         !fsse.partitionFilters.exists(_.find(_.isInstanceOf[org.apache.spark.sql.catalyst.expressions.PlanExpression[_]]).isDefined)
     case _ => false
   }
@@ -131,28 +150,18 @@ object GpuWholeStageCodegenRewrite {
     }.isDefined
   }
 
-  /**
-   * Unwinds 0..MAX_DIMS Inner BuildRight single-key GpuBroadcastHashJoins below an optional
-   * post-join Project/Filter, plus an optional fact-side Filter at the bottom.
-   */
-  private case class StageColRef(
-      tableIdx: Int,     // -1 = fact table, 0..K-1 = broadcast dim table
-      colOrd: Int,       // ordinal in that table's output
-      dataType: DataType,
-      isDimStrDict: Boolean = false)
-
+  /** Unwinds a star-join + optional filter/project chain into clean StageIR operators! */
   private def tryFuseWholeStageAgg(agg: GpuHashAggregateExec): Option[SparkPlan] = {
-    if (agg.aggregateExpressions.isEmpty || !agg.aggregateExpressions.forall(_.mode == Partial)) {
+    if (agg.aggregateExpressions.isEmpty ||
+        !agg.aggregateExpressions.forall(_.mode == Partial) ||
+        agg.aggregateExpressions.exists(_.isDistinct) ||
+        agg.groupingExpressions.length > MAX_GROUP_KEYS) {
       return None
     }
-    if (agg.groupingExpressions.length > MAX_GROUP_KEYS) {
-      return None
-    }
-    if (agg.groupingExpressions.exists(_.isInstanceOf[GpuAlias])) {
+    if (agg.groupingExpressions.exists(g => !isFixedGroupKeyType(g.dataType) && g.dataType != StringType)) {
       return None
     }
 
-    // 1. Peel optional GpuCoalesceBatches -> GpuProjectExec -> GpuFilterExec above join chain
     var cur = peelCoalesce(agg.child)
     var topProjMap = Map.empty[ExprId, Expression]
     cur match {
@@ -169,7 +178,6 @@ object GpuWholeStageCodegenRewrite {
       case _ =>
     }
 
-    // 2. Unwind K = 0..MAX_DIMS Inner BuildRight single-key GpuBroadcastHashJoins
     val joins = mutable.ArrayBuffer.empty[GpuBroadcastHashJoinExecBase]
     val midAliasMaps = mutable.ArrayBuffer.empty[Map[ExprId, Attribute]]
     var keep = true
@@ -199,7 +207,6 @@ object GpuWholeStageCodegenRewrite {
       }
     }
 
-    // Peel optional fact-side GpuFilterExec at bottom of stream chain
     var factFilterOpt: Option[Expression] = None
     cur match {
       case f: GpuFilterExec =>
@@ -209,12 +216,6 @@ object GpuWholeStageCodegenRewrite {
     }
     val factPlan = cur
 
-    // Cost-based admission:
-    //   1. K == 0 Global Agg directly over V1 Vortex (zero-HBM FastLanes BitPacked+FoR / ALP / FSST!)
-    //      or containing string predicates (GpuContains / GpuStartsWith / GpuEqualTo).
-    //   2. K >= 2 multi-way star-join + low/medium-card agg (0..4 group keys originating from
-    //      broadcast dimensions so the open-addressing hash table stays L2-resident with zero
-    //      overflow flushes, avoiding high-card fact-key regressions like 300M-group Q65/Q73!).
     val directVortex = isDirectCompressedVortexScan(factPlan)
     if (joins.isEmpty) {
       if (agg.groupingExpressions.nonEmpty) return None
@@ -226,7 +227,6 @@ object GpuWholeStageCodegenRewrite {
       return None
     }
 
-    // Resolve alias chains through midAliasMaps
     def resolveAttr(a: Attribute): Attribute = {
       var curA = a
       var changed = true
@@ -236,31 +236,27 @@ object GpuWholeStageCodegenRewrite {
         guard += 1
         midAliasMaps.foreach { m =>
           m.get(curA.exprId).foreach { nextA =>
-            if (nextA.exprId != curA.exprId) {
-              curA = nextA
-              changed = true
-            }
+            if (nextA.exprId != curA.exprId) { curA = nextA; changed = true }
           }
         }
       }
       curA
     }
 
-    // Order dims bottom-to-top (0..K-1)
+    def rewriteAliases(e: Expression): Expression = e.transformUp {
+      case a: Attribute => resolveAttr(a)
+    }
+
     val orderedJoins = joins.reverse.toArray
     val k = orderedJoins.length
     val dimPlans = orderedJoins.map(_.right)
 
-    val factOut = factPlan.output
-    val factIdToOrd = factOut.zipWithIndex.map { case (a, i) => a.exprId -> i }.toMap
+    val factIdToOrd = factPlan.output.zipWithIndex.map { case (a, i) => a.exprId -> i }.toMap
     val dimIdToLoc = mutable.HashMap.empty[ExprId, (Int, Int)]
     dimPlans.zipWithIndex.foreach { case (dp, dIdx) =>
-      dp.output.zipWithIndex.foreach { case (a, ord) =>
-        dimIdToLoc.put(a.exprId, (dIdx, ord))
-      }
+      dp.output.zipWithIndex.foreach { case (a, ord) => dimIdToLoc.put(a.exprId, (dIdx, ord)) }
     }
 
-    // Every broadcast probe key must originate from factPlan (star schema) or an earlier dim!
     val probeKeySrcTbl = new Array[Int](k)
     val probeKeySrcOrd = new Array[Int](k)
     val dimKeyOrds = new Array[Int](k)
@@ -284,73 +280,62 @@ object GpuWholeStageCodegenRewrite {
       dimKeyOrds(d) = dOrd
     }
 
-    // 3. Extract aggregate terms & output buffer mapping (reusing battle-tested GpuLencFusedAgg contract!)
-    val (rawTerms0, outBufToTerm, outBufModes) =
+    val (rawTerms, outBufToTerm, outBufModes) =
       GpuLencFusedAgg.extractAggTermsAndBufferMap(agg.aggregateExpressions, topProjMap).getOrElse(return None)
-    val rawTerms = rawTerms0.map(t => t.copy(inputExpr = t.inputExpr.map(unwrapJit)))
-    val resultExprs = agg.resultExpressions
-    if (resultExprs.length != agg.groupingExpressions.length + outBufToTerm.length) {
+    if (rawTerms.isEmpty || rawTerms.length > MAX_AGGS) return None
+
+    val groupExprs = agg.groupingExpressions.map(g => rewriteAliases(GpuLencFusedAgg.inlineProjectMap(g, topProjMap)))
+    val factAttrIds = factIdToOrd.keySet
+    if (k >= 1 && groupExprs.exists(ge => ge.references.exists(a => factAttrIds.contains(a.exprId)))) {
       return None
     }
 
-    // Inline topProjMap into grouping expressions
-    val groupExprs = agg.groupingExpressions.map { ge =>
-      GpuLencFusedAgg.inlineProjectMap(unwrapJit(ge), topProjMap)
-    }
-
-    // Validate every group key: either fixed-width expr OR broadcast-dim StringType attribute / substring(dimStr, pos, len)!
+    // Identify Broadcast-Dim String / Substring(String, pos, len) group keys
     val groupKeyIsDimStr = new Array[Boolean](groupExprs.length)
-    val groupKeyDimStrRef = new Array[(Int, Int, Int, Int)](groupExprs.length) // (dimIdx, colOrd, substrStart0, substrLen)
-    groupExprs.zipWithIndex.foreach { case (ge, gi) =>
-      if (isFixedGroupKeyType(ge.dataType)) {
-        groupKeyIsDimStr(gi) = false
-      } else if (ge.dataType == StringType) {
+    val groupKeyDimStrRef = new Array[(Int, Int, Int, Int)](groupExprs.length)
+    val nativeKeyTypes = new Array[DataType](groupExprs.length)
+    for (gi <- groupExprs.indices) {
+      val ge = groupExprs(gi)
+      if (ge.dataType == StringType) {
         ge match {
           case a: Attribute =>
-            val ra = resolveAttr(a)
-            dimIdToLoc.get(ra.exprId) match {
+            dimIdToLoc.get(a.exprId) match {
               case Some((dIdx, ord)) =>
                 groupKeyIsDimStr(gi) = true
                 groupKeyDimStrRef(gi) = (dIdx, ord, 0, -1)
+                nativeKeyTypes(gi) = IntegerType
               case None => return None
             }
-          case GpuSubstring(a: Attribute, GpuLiteral(pos: Int, IntegerType), GpuLiteral(len: Int, IntegerType))
-              if pos >= 1 && len >= 0 =>
-            val ra = resolveAttr(a)
-            dimIdToLoc.get(ra.exprId) match {
+          case GpuSubstring(a: Attribute, GpuLiteral(posObj, IntegerType), GpuLiteral(lenObj, IntegerType))
+              if posObj != null && lenObj != null =>
+            val pos1 = posObj.asInstanceOf[Int]
+            val slen = lenObj.asInstanceOf[Int]
+            if (pos1 < 1 || slen < 0) return None
+            dimIdToLoc.get(a.exprId) match {
               case Some((dIdx, ord)) =>
                 groupKeyIsDimStr(gi) = true
-                groupKeyDimStrRef(gi) = (dIdx, ord, pos - 1, len)
+                groupKeyDimStrRef(gi) = (dIdx, ord, pos1 - 1, slen)
+                nativeKeyTypes(gi) = IntegerType
               case None => return None
             }
           case _ => return None
         }
       } else {
-        return None
+        nativeKeyTypes(gi) = ge.dataType
       }
     }
 
-    // 4. Collect all referenced fact & dim columns into compact slot tables (fact_cols[], dim_cols[])
-    val factSlotMap = mutable.LinkedHashMap.empty[Int, Int] // factOrd -> factSlot
-    // (dIdx, ord, isStrDict, substrStart0, substrLen) -> dimSlot
+    val factSlotMap = mutable.LinkedHashMap.empty[Int, Int]
     val dimSlotMap = mutable.LinkedHashMap.empty[(Int, Int, Boolean, Int, Int), Int]
-
     def allocFactSlot(ord: Int): Int = factSlotMap.getOrElseUpdate(ord, factSlotMap.size)
     def allocDimSlot(dIdx: Int, ord: Int, isStrDict: Boolean, ss0: Int = 0, ssl: Int = -1): Int =
       dimSlotMap.getOrElseUpdate((dIdx, ord, isStrDict, ss0, ssl), dimSlotMap.size)
 
-    // Allocate slots for all probe keys
-    val probeKeyFactOrDimSlot = new Array[(Int, Int)](k) // (srcTbl: -1=fact or prevD, slot)
     for (d <- 0 until k) {
-      if (probeKeySrcTbl(d) == -1) {
-        probeKeyFactOrDimSlot(d) = (-1, allocFactSlot(probeKeySrcOrd(d)))
-      } else {
-        probeKeyFactOrDimSlot(d) =
-          (probeKeySrcTbl(d), allocDimSlot(probeKeySrcTbl(d), probeKeySrcOrd(d), isStrDict = false))
-      }
+      if (probeKeySrcTbl(d) == -1) allocFactSlot(probeKeySrcOrd(d))
+      else allocDimSlot(probeKeySrcTbl(d), probeKeySrcOrd(d), isStrDict = false)
     }
 
-    // Map every Attribute inside an expression to a StageColRef slot!
     def collectExprCols(e: Expression, allowDim: Boolean): Boolean = {
       var ok = true
       e.foreach {
@@ -374,14 +359,12 @@ object GpuWholeStageCodegenRewrite {
       ok
     }
 
-    if (factFilterOpt.exists(e => !collectExprCols(e, allowDim = false))) return None
-    if (postFilterOpt.exists(e => !collectExprCols(e, allowDim = true))) return None
-    // Require star-join group keys to originate from broadcast dimension tables (bounded cardinality)
-    // so open-addressing hash-agg stays L2-resident without overflow flush churn on fact-table IDs.
-    val factAttrIds = factIdToOrd.keySet
-    if (k >= 1 && groupExprs.exists(ge => ge.references.exists(a => factAttrIds.contains(resolveAttr(a).exprId)))) {
-      return None
-    }
+    val factFilterClean = factFilterOpt.map(rewriteAliases)
+    val postFilterClean = postFilterOpt.map(rewriteAliases)
+    val cleanTerms = rawTerms.map(t => t.copy(inputExpr = t.inputExpr.map(rewriteAliases)))
+
+    if (factFilterClean.exists(e => !collectExprCols(e, allowDim = false))) return None
+    if (postFilterClean.exists(e => !collectExprCols(e, allowDim = true))) return None
     groupExprs.zipWithIndex.foreach { case (ge, gi) =>
       if (groupKeyIsDimStr(gi)) {
         val (dIdx, ord, ss0, ssl) = groupKeyDimStrRef(gi)
@@ -390,80 +373,61 @@ object GpuWholeStageCodegenRewrite {
         return None
       }
     }
-    rawTerms.foreach { t =>
+    cleanTerms.foreach { t =>
       if (t.inputExpr.exists(e => !collectExprCols(e, allowDim = true))) return None
     }
+    if (factSlotMap.size > MAX_FACT_COLS || dimSlotMap.size > MAX_DIM_COLS) return None
 
-    if (factSlotMap.size > MAX_FACT_COLS || dimSlotMap.size > MAX_DIM_COLS) {
-      return None
+    // Build initial VarEnv (fact columns) + clean Produce/Consume StageOp chain!
+    val initialEnv: VarEnv = factSlotMap.map { case (ord, slot) =>
+      val attr = factPlan.output(ord)
+      attr.exprId -> FactCol(slot, attr.dataType)
+    }.toMap
+
+    val ops = mutable.ArrayBuffer.empty[StageOp]
+    factFilterClean.foreach(fe => ops += FilterOp(fe))
+    for (d <- 0 until k) {
+      val keyAttr = resolveAttr(orderedJoins(d).leftKeys.head.asInstanceOf[Attribute])
+      val dBindings = dimSlotMap.collect {
+        case ((dIdx, ord, false, _, _), slot) if dIdx == d =>
+          val a = dimPlans(d).output(ord)
+          (a.exprId, slot, a.dataType)
+      }.toSeq
+      ops += HashProbeOp(d, keyAttr, dBindings, JoinInner)
     }
+    postFilterClean.foreach(pe => ops += FilterOp(pe))
 
-    // 5. Generate NVRTC Whole-Stage CUDA kernel body calling libcudf cudf::whole_stage preamble!
-    val factOrds = factSlotMap.keys.toArray
-    val dimColSpecs = dimSlotMap.keys.toArray // (dIdx, ord, isStrDict, ss0, ssl)
-    val dimSlotLookup = dimSlotMap.toMap
-    val factSlotLookup = factSlotMap.toMap
-
-    def attrAccess(a: Attribute): Option[(String, String, DataType)] = {
-      val ra = resolveAttr(a)
-      factIdToOrd.get(ra.exprId).flatMap(factSlotLookup.get).map { fSlot =>
-        (s"a->fact_cols[$fSlot]", "row", ra.dataType)
-      }.orElse {
-        dimIdToLoc.get(ra.exprId).flatMap { case (dIdx, ord) =>
-          dimSlotLookup.get((dIdx, ord, false, 0, -1)).map { dSlot =>
-            (s"a->dim_cols[$dSlot]", s"d$dIdx", ra.dataType)
-          }
-        }
-      }
-    }
-
-    val cudaBodyOpt = WholeStageKernelGen.generateStarJoinAggBody(
-      k = k,
-      probeKeySpecs = probeKeyFactOrDimSlot.zipWithIndex.map { case ((srcT, slot), d) =>
-        val dt = orderedJoins(d).leftKeys.head.dataType
-        (srcT, slot, dt)
-      },
-      factFilterOpt = factFilterOpt,
-      postFilterOpt = postFilterOpt,
-      groupExprs = groupExprs,
-      groupKeyDimStrSlot = groupExprs.indices.map { gi =>
-        if (groupKeyIsDimStr(gi)) {
-          val (dIdx, ord, ss0, ssl) = groupKeyDimStrRef(gi)
-          Some((dIdx, dimSlotLookup((dIdx, ord, true, ss0, ssl))))
-        } else None
-      }.toArray,
-      aggTerms = rawTerms,
-      attrAccess = attrAccess)
-
-    val (cudaBody, kernelName) = cudaBodyOpt.getOrElse(return None)
-
-    val outAttrs = resultExprs.map(_.toAttribute)
-    val outTypes = resultExprs.map(_.dataType).toArray
-    val nativeKeyTypes = groupExprs.zipWithIndex.map { case (ge, gi) =>
-      if (groupKeyIsDimStr(gi)) IntegerType else ge.dataType
-    }.toArray
-    val aggKinds = rawTerms.map(_.kind).toArray
-    val groupKeyDimStrSlotIdx = groupExprs.indices.map { gi =>
+    val gkDimStrSlot = Array.tabulate(groupExprs.length) { gi =>
       if (groupKeyIsDimStr(gi)) {
         val (dIdx, ord, ss0, ssl) = groupKeyDimStrRef(gi)
-        dimSlotLookup((dIdx, ord, true, ss0, ssl))
+        dimSlotMap((dIdx, ord, true, ss0, ssl))
       } else -1
-    }.toArray
+    }
+    val gkDimIdx = Array.tabulate(groupExprs.length) { gi =>
+      if (groupKeyIsDimStr(gi)) groupKeyDimStrRef(gi)._1 else -1
+    }
+
+    val aggSink = HashAggSink(groupExprs, gkDimStrSlot, gkDimIdx, cleanTerms)
+    val (cudaBody, kernelName) = StageCompiler.compileAgg(initialEnv, ops.toSeq, aggSink).getOrElse(return None)
+
+    val outAttrs = agg.output
+    val outTypes = outAttrs.map(_.dataType).toArray
+    val dimSpecs = dimSlotMap.keys.toArray
 
     Some(GpuWholeStageStarJoinAggExec(
       output = outAttrs,
       factPlan = factPlan,
       dimPlans = dimPlans.toSeq,
-      factOrds = factOrds,
+      factOrds = factSlotMap.keys.toArray,
       dimKeyOrds = dimKeyOrds,
-      dimColTableIdx = dimColSpecs.map(_._1),
-      dimColOrd = dimColSpecs.map(_._2),
-      dimColIsStrDict = dimColSpecs.map(_._3),
-      dimColSubstrStart0 = dimColSpecs.map(_._4),
-      dimColSubstrLen = dimColSpecs.map(_._5),
+      dimColTableIdx = dimSpecs.map(_._1),
+      dimColOrd = dimSpecs.map(_._2),
+      dimColIsStrDict = dimSpecs.map(_._3),
+      dimColSubstrStart0 = dimSpecs.map(_._4),
+      dimColSubstrLen = dimSpecs.map(_._5),
       nativeKeyTypes = nativeKeyTypes,
-      groupKeyDimStrSlotIdx = groupKeyDimStrSlotIdx,
-      aggKinds = aggKinds,
+      groupKeyDimStrSlotIdx = gkDimStrSlot,
+      aggKinds = cleanTerms.map(_.kind).toArray,
       outBufToTerm = outBufToTerm,
       outBufModes = outBufModes,
       outTypes = outTypes,
@@ -471,21 +435,10 @@ object GpuWholeStageCodegenRewrite {
       kernelName = kernelName))
   }
 
-  private def isCodegenLeafType(dt: DataType): Boolean = dt match {
-    case BooleanType | ByteType | ShortType | IntegerType | LongType |
-         FloatType | DoubleType | DateType => true
-    case d: DecimalType if d.precision <= 18 => true
-    case _ => false
-  }
-
   /**
-   * Phase 4 (Pillar 4-Write): Fuses Stage (Filter + 0..6 BroadcastHashJoin + Project) directly
-   * into Spark Murmur3 HashPartition Scatter right below GpuShuffleExchangeExec so LSHF Shuffle
-   * receives pre-partitioned columns without intermediate Filter/Project/HashPartition HBM tables!
+   * Opt-in Fused Stage -> Spark Murmur3 HashPartition Scatter compiled via `StageIR`.
    */
   private def tryFuseWholeStageShuffle(shuf: GpuShuffleExchangeExecBase): Option[SparkPlan] = {
-    // Opt-in flag (spark.rapids.sql.lenc.fusedShuffleWriteEnabled) so AQE broadcast-join
-    // reordering (e.g. TPC-H Q08) is never disturbed by hiding BroadcastHashJoin inside Shuffle.
     if (!SQLConf.get.getConfString("spark.rapids.sql.lenc.fusedShuffleWriteEnabled", "false").toBoolean) {
       return None
     }
@@ -503,48 +456,11 @@ object GpuWholeStageCodegenRewrite {
 
     var cur = peelCoalesce(shuf.child)
     var topProjMap = Map.empty[ExprId, Expression]
-    var hadProj = false
     cur match {
       case p: GpuProjectExec =>
         topProjMap = extractProjectMap(p.projectList)
         cur = peelCoalesce(p.child)
-        hadProj = true
       case _ =>
-    }
-    var postFilterOpt: Option[Expression] = None
-    cur match {
-      case f: GpuFilterExec =>
-        postFilterOpt = Some(GpuLencFusedAgg.inlineProjectMap(unwrapJit(f.condition), topProjMap))
-        cur = peelCoalesce(f.child)
-      case _ =>
-    }
-    val joins = mutable.ArrayBuffer.empty[GpuBroadcastHashJoinExecBase]
-    val midAliasMaps = mutable.ArrayBuffer.empty[Map[ExprId, Attribute]]
-    var keep = true
-    while (keep && joins.length < MAX_DIMS) {
-      cur match {
-        case bhj: GpuBroadcastHashJoinExecBase
-            if bhj.joinType == Inner &&
-               bhj.buildSide == GpuBuildRight &&
-               bhj.condition.isEmpty &&
-               bhj.leftKeys.length == 1 &&
-               bhj.rightKeys.length == 1 &&
-               isJoinKeyType(bhj.leftKeys.head.dataType) &&
-               bhj.leftKeys.head.dataType == bhj.rightKeys.head.dataType &&
-               bhj.leftKeys.head.isInstanceOf[Attribute] &&
-               bhj.rightKeys.head.isInstanceOf[Attribute] &&
-               GpuFusedStarJoinRewrite.resolveBroadcastExchange(bhj.right).isDefined =>
-          joins += bhj
-          cur = peelCoalesce(bhj.left)
-        case p: GpuProjectExec if joins.nonEmpty =>
-          isPassThroughProject(p.projectList) match {
-            case Some(am) =>
-              midAliasMaps += am
-              cur = peelCoalesce(p.child)
-            case None => keep = false
-          }
-        case _ => keep = false
-      }
     }
     var factFilterOpt: Option[Expression] = None
     cur match {
@@ -553,127 +469,49 @@ object GpuWholeStageCodegenRewrite {
         cur = peelCoalesce(f.child)
       case _ =>
     }
-    // Only rewrite when we actually fuse at least 1 BroadcastJoin OR a Filter+Project!
-    if (joins.isEmpty && factFilterOpt.isEmpty && postFilterOpt.isEmpty) {
-      return None
-    }
+    // Keep K == 0 only so AQE dynamic broadcast-join optimization is never disturbed!
+    if (factFilterOpt.isEmpty) return None
     val factPlan = cur
-
-    def resolveAttr(a: Attribute): Attribute = {
-      var curA = a
-      var changed = true
-      var guard = 0
-      while (changed && guard < 16) {
-        changed = false
-        guard += 1
-        midAliasMaps.foreach { m =>
-          m.get(curA.exprId).foreach { nextA =>
-            if (nextA.exprId != curA.exprId) { curA = nextA; changed = true }
-          }
-        }
-      }
-      curA
-    }
-
-    val orderedJoins = joins.reverse.toArray
-    val k = orderedJoins.length
-    val dimPlans = orderedJoins.map(_.right)
     val factIdToOrd = factPlan.output.zipWithIndex.map { case (a, i) => a.exprId -> i }.toMap
-    val dimIdToLoc = mutable.HashMap.empty[ExprId, (Int, Int)]
-    dimPlans.zipWithIndex.foreach { case (dp, dIdx) =>
-      dp.output.zipWithIndex.foreach { case (a, ord) => dimIdToLoc.put(a.exprId, (dIdx, ord)) }
-    }
-
-    val probeKeySrcTbl = new Array[Int](k)
-    val probeKeySrcOrd = new Array[Int](k)
-    val dimKeyOrds = new Array[Int](k)
-    for (d <- 0 until k) {
-      val lk = resolveAttr(orderedJoins(d).leftKeys.head.asInstanceOf[Attribute])
-      val rk = orderedJoins(d).rightKeys.head.asInstanceOf[Attribute]
-      factIdToOrd.get(lk.exprId) match {
-        case Some(ord) => probeKeySrcTbl(d) = -1; probeKeySrcOrd(d) = ord
-        case None =>
-          dimIdToLoc.get(lk.exprId) match {
-            case Some((prevD, ord)) if prevD < d => probeKeySrcTbl(d) = prevD; probeKeySrcOrd(d) = ord
-            case _ => return None
-          }
-      }
-      val dOrd = dimPlans(d).output.indexWhere(_.exprId == rk.exprId)
-      if (dOrd < 0) return None
-      dimKeyOrds(d) = dOrd
-    }
-
     val factSlotMap = mutable.LinkedHashMap.empty[Int, Int]
-    val dimSlotMap = mutable.LinkedHashMap.empty[(Int, Int), Int]
     def allocFact(ord: Int): Int = factSlotMap.getOrElseUpdate(ord, factSlotMap.size)
-    def allocDim(dIdx: Int, ord: Int): Int = dimSlotMap.getOrElseUpdate((dIdx, ord), dimSlotMap.size)
-
-    val probeSlots = new Array[(Int, Int, DataType)](k)
-    for (d <- 0 until k) {
-      val dt = orderedJoins(d).leftKeys.head.dataType
-      if (probeKeySrcTbl(d) == -1) probeSlots(d) = (-1, allocFact(probeKeySrcOrd(d)), dt)
-      else probeSlots(d) = (probeKeySrcTbl(d), allocDim(probeKeySrcTbl(d), probeKeySrcOrd(d)), dt)
-    }
 
     val outExprs = shuf.output.map(a => GpuLencFusedAgg.inlineProjectMap(a, topProjMap))
     val partExprs = hp.children.map(e => GpuLencFusedAgg.inlineProjectMap(e, topProjMap))
 
-    def collectCols(e: Expression, allowDim: Boolean): Boolean = {
+    def collectCols(e: Expression): Boolean = {
       var ok = true
       e.foreach {
         case a: Attribute =>
-          val ra = resolveAttr(a)
-          factIdToOrd.get(ra.exprId) match {
-            case Some(ord) =>
-              if (!isCodegenLeafType(ra.dataType) && ra.dataType != StringType) ok = false
-              else allocFact(ord)
-            case None if allowDim =>
-              dimIdToLoc.get(ra.exprId) match {
-                case Some((dIdx, ord)) =>
-                  if (!isCodegenLeafType(ra.dataType) && ra.dataType != StringType) ok = false
-                  else allocDim(dIdx, ord)
-                case None => ok = false
-              }
-            case None => ok = false
+          factIdToOrd.get(a.exprId) match {
+            case Some(ord) if isCodegenLeafType(a.dataType) || a.dataType == StringType => allocFact(ord)
+            case _ => ok = false
           }
         case _ =>
       }
       ok
     }
+    if (!collectCols(factFilterOpt.get)) return None
+    if (outExprs.exists(e => !collectCols(e))) return None
+    if (partExprs.exists(e => !collectCols(e))) return None
+    if (factSlotMap.size > MAX_FACT_COLS) return None
 
-    if (factFilterOpt.exists(e => !collectCols(e, allowDim = false))) return None
-    if (postFilterOpt.exists(e => !collectCols(e, allowDim = true))) return None
-    if (outExprs.exists(e => !collectCols(e, allowDim = true))) return None
-    if (partExprs.exists(e => !collectCols(e, allowDim = true))) return None
-    if (factSlotMap.size > MAX_FACT_COLS || dimSlotMap.size > MAX_DIM_COLS) return None
+    val initialEnv: VarEnv = factSlotMap.map { case (ord, slot) =>
+      val a = factPlan.output(ord)
+      a.exprId -> FactCol(slot, a.dataType)
+    }.toMap
+    val ops = Seq(FilterOp(factFilterOpt.get))
+    val (countBody, scatterBody) = StageCompiler.compileTwoPass(
+      initialEnv, ops, Some(partExprs), outExprs).getOrElse(return None)
 
-    val fLookup = factSlotMap.toMap
-    val dLookup = dimSlotMap.toMap
-    def attrAccess(a: Attribute): Option[(String, String, DataType)] = {
-      val ra = resolveAttr(a)
-      factIdToOrd.get(ra.exprId).flatMap(fLookup.get).map { fSlot =>
-        (s"a->fact_cols[$fSlot]", "row", ra.dataType)
-      }.orElse {
-        dimIdToLoc.get(ra.exprId).flatMap { case (dIdx, ord) =>
-          dLookup.get((dIdx, ord)).map { dSlot =>
-            (s"a->dim_cols[$dSlot]", s"d$dIdx", ra.dataType)
-          }
-        }
-      }
-    }
-
-    val (countBody, scatterBody) = WholeStageKernelGen.generatePartitionScatterBodies(
-      k, probeSlots, factFilterOpt, postFilterOpt, partExprs, outExprs, attrAccess).getOrElse(return None)
-
-    val dimSpecs = dimSlotMap.keys.toArray
     val fusedChild = GpuWholeStageFusedPartitionExec(
       output = shuf.output,
       factPlan = factPlan,
-      dimPlans = dimPlans.toSeq,
+      dimPlans = Seq.empty,
       factOrds = factSlotMap.keys.toArray,
-      dimKeyOrds = dimKeyOrds,
-      dimColTableIdx = dimSpecs.map(_._1),
-      dimColOrd = dimSpecs.map(_._2),
+      dimKeyOrds = Array.empty,
+      dimColTableIdx = Array.empty,
+      dimColOrd = Array.empty,
       outTypes = shuf.output.map(_.dataType).toArray,
       numPartitions = hp.numPartitions,
       countCudaBody = countBody,
@@ -683,633 +521,39 @@ object GpuWholeStageCodegenRewrite {
   }
 }
 
-private object WholeStageKernelGen {
-  private def cType(dt: DataType): Option[String] = dt match {
-    case BooleanType => Some("bool")
-    case ByteType | ShortType | IntegerType | DateType => Some("int32_t")
-    case LongType => Some("int64_t")
-    case FloatType => Some("float")
-    case DoubleType => Some("double")
-    case d: DecimalType if d.precision <= 18 => Some("int64_t")
-    case _ => None
-  }
-
-  private def pow10i64(n: Int): Long = {
-    var r = 1L
-    var i = 0
-    while (i < n) { r *= 10L; i += 1 }
-    r
-  }
-
-  private def emitExpr(
-      e: Expression,
-      stmts: mutable.ArrayBuffer[String],
-      nextId: () => Int,
-      attrAccess: Attribute => Option[(String, String, DataType)]): Option[(String, String)] = {
-    e match {
-      case GpuLiteral(v, dt) =>
-        if (v == null) {
-          cType(dt).map(ct => (s"($ct)0", "false"))
-        } else dt match {
-          case BooleanType => Some((if (v.asInstanceOf[Boolean]) "true" else "false", "true"))
-          case ByteType | ShortType | IntegerType | DateType =>
-            Some((s"((int32_t)${v.asInstanceOf[Number].intValue()})", "true"))
-          case LongType => Some((s"((int64_t)${v.asInstanceOf[Number].longValue()}LL)", "true"))
-          case FloatType =>
-            val f = v.asInstanceOf[Number].floatValue()
-            if (f.isNaN || f.isInfinite) None else Some((s"((float)${f}f)", "true"))
-          case DoubleType =>
-            val d = v.asInstanceOf[Number].doubleValue()
-            if (d.isNaN || d.isInfinite) None else Some((s"((double)$d)", "true"))
-          case d: DecimalType if d.precision <= 18 =>
-            val unscaled = v.asInstanceOf[Decimal].toUnscaledLong
-            Some((s"((int64_t)${unscaled}LL)", "true"))
-          case _ => None
-        }
-
-      case a: Attribute =>
-        attrAccess(a).flatMap { case (srcExpr, rowVar, dt) =>
-          val id = nextId()
-          val vn = s"v$id"
-          val ok = s"ok$id"
-          stmts += s"bool $ok = ws_valid($srcExpr, $rowVar);"
-          dt match {
-            case BooleanType =>
-              stmts += s"bool $vn = $ok ? (ws_load_i32($srcExpr, $rowVar) != 0) : false;"
-              Some((vn, ok))
-            case ByteType | ShortType | IntegerType | DateType =>
-              stmts += s"int32_t $vn = $ok ? ws_load_i32($srcExpr, $rowVar) : 0;"
-              Some((vn, ok))
-            case LongType =>
-              stmts += s"int64_t $vn = $ok ? ws_load_i64($srcExpr, $rowVar) : 0LL;"
-              Some((vn, ok))
-            case FloatType =>
-              stmts += s"float $vn = $ok ? ws_load_f32($srcExpr, $rowVar) : 0.0f;"
-              Some((vn, ok))
-            case DoubleType =>
-              stmts += s"double $vn = $ok ? ws_load_f64($srcExpr, $rowVar) : 0.0;"
-              Some((vn, ok))
-            case d: DecimalType if d.precision <= 18 =>
-              stmts += s"int64_t $vn = $ok ? ws_load_i64($srcExpr, $rowVar) : 0LL;"
-              Some((vn, ok))
-            case _ => None
-          }
-        }
-
-      case u: GpuUnscaledValue =>
-        emitExpr(u.child, stmts, nextId, attrAccess)
-
-      case p: GpuPromotePrecision =>
-        emitExpr(p.child, stmts, nextId, attrAccess)
-
-      case co: GpuCheckOverflow if co.nullOnOverflow && co.dataType.isInstanceOf[DecimalType] &&
-          co.dataType.asInstanceOf[DecimalType].precision <= 18 =>
-        emitExpr(co.child, stmts, nextId, attrAccess)
-
-      case c: GpuCast if !c.ansiMode =>
-        val ch = c.child
-        val toDt = c.dataType
-        emitExpr(ch, stmts, nextId, attrAccess).flatMap { case (cv, cok) =>
-          (ch.dataType, toDt) match {
-            case (fromDt, td) if fromDt == td => Some((cv, cok))
-            case (fd: DecimalType, DoubleType) if fd.precision <= 18 =>
-              val scaleDiv = math.pow(10.0, fd.scale)
-              Some((s"((double)($cv) / $scaleDiv)", cok))
-            case (fd: DecimalType, td: DecimalType) if fd.precision <= 18 && td.precision <= 18 =>
-              if (fd.scale == td.scale) Some((s"((int64_t)($cv))", cok))
-              else if (td.scale > fd.scale) Some((s"((int64_t)($cv) * ${pow10i64(td.scale - fd.scale)}LL)", cok))
-              else None
-            case (ByteType | ShortType | IntegerType | LongType, td: DecimalType) if td.precision <= 18 =>
-              val mult = pow10i64(td.scale)
-              Some((s"((int64_t)($cv) * ${mult}LL)", cok))
-            case (_, DoubleType) => Some((s"((double)($cv))", cok))
-            case (_, FloatType) => Some((s"((float)($cv))", cok))
-            case (_, LongType) => Some((s"((int64_t)($cv))", cok))
-            case (_, IntegerType) => Some((s"((int32_t)($cv))", cok))
-            case _ => None
-          }
-        }
-
-      case GpuIsNull(ch) =>
-        emitExpr(ch, stmts, nextId, attrAccess).map { case (_, cok) => (s"(!$cok)", "true") }
-
-      case GpuIsNotNull(ch) =>
-        emitExpr(ch, stmts, nextId, attrAccess).map { case (_, cok) => (cok, "true") }
-
-      case GpuNot(ch) =>
-        emitExpr(ch, stmts, nextId, attrAccess).map { case (cv, cok) => (s"(!$cv)", cok) }
-
-      case GpuAnd(l, r) =>
-        for {
-          (lv, lok) <- emitExpr(l, stmts, nextId, attrAccess)
-          (rv, rok) <- emitExpr(r, stmts, nextId, attrAccess)
-        } yield {
-          val id = nextId()
-          val vn = s"andv$id"
-          val ok = s"andok$id"
-          stmts += s"bool $ok = ($lok && $rok) || ($lok && !$lv) || ($rok && !$rv);"
-          stmts += s"bool $vn = ($lok && $lv) && ($rok && $rv);"
-          (vn, ok)
-        }
-
-      case GpuOr(l, r) =>
-        for {
-          (lv, lok) <- emitExpr(l, stmts, nextId, attrAccess)
-          (rv, rok) <- emitExpr(r, stmts, nextId, attrAccess)
-        } yield {
-          val id = nextId()
-          val vn = s"orv$id"
-          val ok = s"orok$id"
-          stmts += s"bool $ok = ($lok && $rok) || ($lok && $lv) || ($rok && $rv);"
-          stmts += s"bool $vn = ($lok && $lv) || ($rok && $rv);"
-          (vn, ok)
-        }
-
-      case GpuEqualTo(a: Attribute, GpuLiteral(v: UTF8String, StringType)) if v != null =>
-        emitStrPred("ws_str_equals", a, v.toString, stmts, nextId, attrAccess)
-      case GpuEqualTo(GpuLiteral(v: UTF8String, StringType), a: Attribute) if v != null =>
-        emitStrPred("ws_str_equals", a, v.toString, stmts, nextId, attrAccess)
-      case GpuStartsWith(a: Attribute, GpuLiteral(v: UTF8String, StringType)) if v != null =>
-        emitStrPred("ws_str_starts_with", a, v.toString, stmts, nextId, attrAccess)
-      case GpuContains(a: Attribute, GpuLiteral(v: UTF8String, StringType)) if v != null && v.numBytes() <= 64 =>
-        emitStrPred("ws_str_contains", a, v.toString, stmts, nextId, attrAccess)
-      case GpuEqualTo(l, r) => emitCmp("==", l, r, stmts, nextId, attrAccess)
-      case GpuLessThan(l, r) => emitCmp("<", l, r, stmts, nextId, attrAccess)
-      case GpuLessThanOrEqual(l, r) => emitCmp("<=", l, r, stmts, nextId, attrAccess)
-      case GpuGreaterThan(l, r) => emitCmp(">", l, r, stmts, nextId, attrAccess)
-      case GpuGreaterThanOrEqual(l, r) => emitCmp(">=", l, r, stmts, nextId, attrAccess)
-
-      case ins: GpuInSet if ins.list.size <= 32 =>
-        val ch = ins.child
-        emitExpr(ch, stmts, nextId, attrAccess).flatMap { case (cv, cok) =>
-          val lits = ins.list.filter(_ != null).map { v =>
-            ch.dataType match {
-              case ByteType | ShortType | IntegerType | DateType =>
-                s"((int32_t)${v.asInstanceOf[Number].intValue()})"
-              case LongType => s"((int64_t)${v.asInstanceOf[Number].longValue()}LL)"
-              case d: DecimalType if d.precision <= 18 =>
-                s"((int64_t)${v.asInstanceOf[Decimal].toUnscaledLong}LL)"
-              case _ => return None
-            }
-          }
-          if (lits.isEmpty) None
-          else {
-            val id = nextId()
-            val vn = s"inv$id"
-            val checks = lits.map(lit => s"(($cv) == $lit)").mkString(" || ")
-            stmts += s"bool $vn = $cok && ($checks);"
-            Some((vn, cok))
-          }
-        }
-
-      case a: GpuAdd if !a.failOnError => emitBinArith("+", a.left, a.right, a.dataType, stmts, nextId, attrAccess)
-      case s: GpuSubtract if !s.failOnError => emitBinArith("-", s.left, s.right, s.dataType, stmts, nextId, attrAccess)
-      case m: GpuMultiply if !m.failOnError => emitBinArith("*", m.left, m.right, m.dataType, stmts, nextId, attrAccess)
-      case d: GpuDivide if !d.failOnError && (d.dataType == DoubleType || d.dataType == FloatType) =>
-        for {
-          (lv, lok) <- emitExpr(d.left, stmts, nextId, attrAccess)
-          (rv, rok) <- emitExpr(d.right, stmts, nextId, attrAccess)
-        } yield {
-          val id = nextId()
-          val ct = if (d.dataType == DoubleType) "double" else "float"
-          val vn = s"div$id"
-          val ok = s"divok$id"
-          stmts += s"bool $ok = ($lok) && ($rok) && (($rv) != 0);"
-          stmts += s"$ct $vn = $ok ? (($ct)($lv) / ($ct)($rv)) : ($ct)0;"
-          (vn, ok)
-        }
-
-      case GpuIf(pred, tv, fv) =>
-        for {
-          ct <- cType(e.dataType)
-          (pv, pok) <- emitExpr(pred, stmts, nextId, attrAccess)
-          (tval, tok) <- emitExpr(tv, stmts, nextId, attrAccess)
-          (fval, fok) <- emitExpr(fv, stmts, nextId, attrAccess)
-        } yield {
-          val id = nextId()
-          val vn = s"ifv$id"
-          val ok = s"ifok$id"
-          stmts += s"bool $ok = ($pok && $pv) ? ($tok) : ($fok);"
-          stmts += s"$ct $vn = ($pok && $pv) ? ($ct)($tval) : ($ct)($fval);"
-          (vn, ok)
-        }
-
-      case cw: GpuCaseWhen =>
-        cType(cw.dataType).flatMap { ct =>
-          val id = nextId()
-          val vn = s"cwv$id"
-          val ok = s"cwok$id"
-          val hit = s"cwhit$id"
-          stmts += s"$ct $vn = ($ct)0; bool $ok = false; bool $hit = false;"
-          cw.branches.foreach { case (cond, br) =>
-            val cRes = emitExpr(cond, stmts, nextId, attrAccess)
-            if (cRes.isEmpty) return None
-            val (cv, cok) = cRes.get
-            stmts += s"if (!$hit && ($cok) && ($cv)) {"
-            val bStmts = mutable.ArrayBuffer.empty[String]
-            val bRes = emitExpr(br, bStmts, nextId, attrAccess)
-            if (bRes.isEmpty) return None
-            val (bv, bok) = bRes.get
-            stmts ++= bStmts.map("  " + _)
-            stmts += s"  $vn = ($ct)($bv); $ok = ($bok); $hit = true;"
-            stmts += "}"
-          }
-          cw.elseValue.foreach { ev =>
-            stmts += s"if (!$hit) {"
-            val eStmts = mutable.ArrayBuffer.empty[String]
-            val eRes = emitExpr(ev, eStmts, nextId, attrAccess)
-            if (eRes.isEmpty) return None
-            val (evv, eok) = eRes.get
-            stmts ++= eStmts.map("  " + _)
-            stmts += s"  $vn = ($ct)($evv); $ok = ($eok);"
-            stmts += "}"
-          }
-          Some((vn, ok))
-        }
-
-      case _ => None
-    }
-  }
-
-  private def escapeCString(s: String): String = {
-    val sb = new StringBuilder(s.length + 8)
-    s.getBytes(java.nio.charset.StandardCharsets.UTF_8).foreach { b =>
-      val u = b & 0xFF
-      if (u >= 32 && u < 127 && u != '"' && u != '\\') sb.append(u.toChar)
-      else sb.append(f"\\x$u%02x")
-    }
-    sb.toString()
-  }
-
-  private def emitStrPred(
-      fnName: String,
-      a: Attribute,
-      lit: String,
-      stmts: mutable.ArrayBuffer[String],
-      nextId: () => Int,
-      attrAccess: Attribute => Option[(String, String, DataType)]): Option[(String, String)] = {
-    attrAccess(a).filter(_._3 == StringType).map { case (srcExpr, rowVar, _) =>
-      val id = nextId()
-      val ok = s"sok$id"
-      val vn = s"sv$id"
-      val bytesLen = lit.getBytes(java.nio.charset.StandardCharsets.UTF_8).length
-      val esc = escapeCString(lit)
-      stmts += s"bool $ok = ws_valid($srcExpr, $rowVar);"
-      stmts += "bool " + vn + " = " + ok + " && " + fnName + "(" + srcExpr + ", " + rowVar + ", \"" + esc + "\", " + bytesLen + "u);"
-      (vn, ok)
-    }
-  }
-
-  private def emitCmp(
-      op: String,
-      l: Expression,
-      r: Expression,
-      stmts: mutable.ArrayBuffer[String],
-      nextId: () => Int,
-      attrAccess: Attribute => Option[(String, String, DataType)]): Option[(String, String)] = {
-    if (l.dataType != r.dataType) return None
-    for {
-      (lv, lok) <- emitExpr(l, stmts, nextId, attrAccess)
-      (rv, rok) <- emitExpr(r, stmts, nextId, attrAccess)
-    } yield {
-      val id = nextId()
-      val ok = s"cok$id"
-      val vn = s"cv$id"
-      stmts += s"bool $ok = ($lok) && ($rok);"
-      stmts += s"bool $vn = $ok && (($lv) $op ($rv));"
-      (vn, ok)
-    }
-  }
-
-  private def emitBinArith(
-      op: String,
-      l: Expression,
-      r: Expression,
-      outDt: DataType,
-      stmts: mutable.ArrayBuffer[String],
-      nextId: () => Int,
-      attrAccess: Attribute => Option[(String, String, DataType)]): Option[(String, String)] = {
-    // Only allow exact matching decimal scale on +/-, and unscaled scale sum on * when <= 18
-    outDt match {
-      case od: DecimalType =>
-        if (od.precision > 18) return None
-        (l.dataType, r.dataType) match {
-          case (ld: DecimalType, rd: DecimalType) if ld.precision <= 18 && rd.precision <= 18 =>
-            if ((op == "+" || op == "-") && (ld.scale != od.scale || rd.scale != od.scale)) return None
-            if (op == "*" && (ld.scale + rd.scale != od.scale)) return None
-          case _ => return None
-        }
-      case _ =>
-    }
-    for {
-      ct <- cType(outDt)
-      (lv, lok) <- emitExpr(l, stmts, nextId, attrAccess)
-      (rv, rok) <- emitExpr(r, stmts, nextId, attrAccess)
-    } yield {
-      val id = nextId()
-      val ok = s"aok$id"
-      val vn = s"av$id"
-      stmts += s"bool $ok = ($lok) && ($rok);"
-      if (outDt.isInstanceOf[DecimalType] && op == "*") {
-        stmts += s"int64_t $vn = $ok ? (int64_t)((__int128)($lv) * (__int128)($rv)) : 0LL;"
-      } else {
-        stmts += s"$ct $vn = $ok ? (($ct)($lv) $op ($ct)($rv)) : ($ct)0;"
-      }
-      (vn, ok)
-    }
-  }
-
-  def generateStarJoinAggBody(
-      k: Int,
-      probeKeySpecs: Array[(Int, Int, DataType)],
-      factFilterOpt: Option[Expression],
-      postFilterOpt: Option[Expression],
-      groupExprs: Seq[Expression],
-      groupKeyDimStrSlot: Array[Option[(Int, Int)]],
-      aggTerms: Seq[GenericAggTerm],
-      attrAccess: Attribute => Option[(String, String, DataType)]): Option[(String, String)] = {
-    val kname = "ws_star_join_agg"
-    var idCounter = 0
-    val nextId = () => { idCounter += 1; idCounter }
-
-    val sb = new StringBuilder()
-    sb.append("extern \"C\" __global__ void " + kname + "(const WsStageArgs* a) {\n")
-    sb.append("  uint32_t n = a->num_rows;\n")
-    sb.append("  uint32_t na = a->num_aggs;\n")
-    sb.append("  for (uint32_t row = blockIdx.x * blockDim.x + threadIdx.x; row < n; row += gridDim.x * blockDim.x) {\n")
-    sb.append("    uint32_t prog_cnt = a->row_progress[row];\n")
-    sb.append("    if (prog_cnt == 0xFFFFFFFFu) continue;\n")
-
-    // 1. Fact-side filter (before probing any dimension table!)
-    factFilterOpt.foreach { fe =>
-      val fStmts = mutable.ArrayBuffer.empty[String]
-      val fRes = emitExpr(fe, fStmts, nextId, attrAccess)
-      if (fRes.isEmpty) return None
-      val (fv, fok) = fRes.get
-      fStmts.foreach(s => sb.append(s"    $s\n"))
-      sb.append(s"    if (!(($fok) && ($fv))) { a->row_progress[row] = 0xFFFFFFFFu; continue; }\n")
-    }
-
-    sb.append("    uint32_t match_idx = 0u;\n")
-    sb.append("    bool row_overflow = false;\n")
-
-    // 2. Nested K-way Broadcast Equi-Join Probe loops (supports both L2 LUT and 1:N Chained Hash!)
-    var indent = "    "
-    for (d <- 0 until k) {
-      val (srcTbl, slot, dt) = probeKeySpecs(d)
-      val srcRef = if (srcTbl == -1) s"a->fact_cols[$slot]" else s"a->dim_cols[$slot]"
-      val rowRef = if (srcTbl == -1) "row" else s"d$srcTbl"
-      sb.append(s"${indent}if (ws_valid($srcRef, $rowRef)) {\n")
-      indent += "  "
-      val loadCall = if (dt == LongType) s"ws_load_i64($srcRef, $rowRef)" else s"(int64_t)ws_load_i32($srcRef, $rowRef)"
-      sb.append(s"${indent}int64_t pk$d = $loadCall;\n")
-      sb.append(s"${indent}for (int32_t d$d = ws_probe_first(a->dims[$d], pk$d); d$d >= 0 && !row_overflow; d$d = ws_probe_next(a->dims[$d], d$d)) {\n")
-      indent += "  "
-    }
-
-    // 3. Post-join filter (if any)
-    postFilterOpt.foreach { pe =>
-      val pStmts = mutable.ArrayBuffer.empty[String]
-      val pRes = emitExpr(pe, pStmts, nextId, attrAccess)
-      if (pRes.isEmpty) return None
-      val (pv, pok) = pRes.get
-      pStmts.foreach(s => sb.append(s"$indent$s\n"))
-      sb.append(s"${indent}if (!(($pok) && ($pv))) continue;\n")
-    }
-
-    // Exact 1:N overflow-retry skip guard (zero double-counting!)
-    sb.append(s"${indent}if (match_idx < prog_cnt) { ++match_idx; continue; }\n")
-
-    // 4. Compute composite group key (up to 8 x 64-bit keys + null_bits)
-    sb.append(s"${indent}uint64_t gkeys[WS_MAX_GROUP_KEYS];\n")
-    sb.append(s"${indent}uint8_t nbits = 0u;\n")
-    groupExprs.zipWithIndex.foreach { case (ge, gi) =>
-      groupKeyDimStrSlot(gi) match {
-        case Some((dIdx, dSlot)) =>
-          sb.append(s"${indent}if (ws_valid(a->dim_cols[$dSlot], d$dIdx)) { gkeys[$gi] = (uint64_t)(int64_t)ws_load_i32(a->dim_cols[$dSlot], d$dIdx); } else { gkeys[$gi] = 0ULL; nbits |= (uint8_t)(1u << $gi); }\n")
-        case None =>
-          val gStmts = mutable.ArrayBuffer.empty[String]
-          val gRes = emitExpr(ge, gStmts, nextId, attrAccess)
-          if (gRes.isEmpty) return None
-          val (gv, gok) = gRes.get
-          gStmts.foreach(s => sb.append(s"$indent$s\n"))
-          sb.append(s"${indent}if ($gok) { gkeys[$gi] = (uint64_t)(int64_t)($gv); } else { gkeys[$gi] = 0ULL; nbits |= (uint8_t)(1u << $gi); }\n")
-      }
-    }
-
-    // 5. Upsert into Native GPU Open-Addressing Hash-Agg Sink (returns -1 on >65% load -> host flushes!)
-    sb.append(s"${indent}int32_t slot = ws_hash_agg_upsert_n(a, gkeys, nbits);\n")
-    sb.append(s"${indent}if (slot < 0) { a->row_progress[row] = match_idx; row_overflow = true; break; }\n")
-    sb.append(s"${indent}uint32_t base = (uint32_t)slot * na;\n")
-
-    // 6. Compute aggregate inputs in registers and atomically update slot accumulators!
-    aggTerms.zipWithIndex.foreach { case (t, ai) =>
-      t.kind match {
-        case GenericJitReduceCodegen.AGG_COUNT_I64 =>
-          t.inputExpr match {
-            case None =>
-              sb.append(s"${indent}atomicAdd(&a->ht_cnt[base + $ai], 1ULL);\n")
-            case Some(ie) =>
-              val st = mutable.ArrayBuffer.empty[String]
-              val iRes = emitExpr(ie, st, nextId, attrAccess)
-              if (iRes.isEmpty) return None
-              val (_, iok) = iRes.get
-              sb.append(s"${indent}{\n")
-              st.foreach(s => sb.append(s"$indent  $s\n"))
-              sb.append(s"${indent}  if ($iok) atomicAdd(&a->ht_cnt[base + $ai], 1ULL);\n")
-              sb.append(s"${indent}}\n")
-          }
-        case GenericJitReduceCodegen.AGG_SUM_F64 =>
-          val st = mutable.ArrayBuffer.empty[String]
-          val iRes = t.inputExpr.flatMap(emitExpr(_, st, nextId, attrAccess))
-          if (iRes.isEmpty) return None
-          val (iv, iok) = iRes.get
-          sb.append(s"${indent}{\n")
-          st.foreach(s => sb.append(s"$indent  $s\n"))
-          sb.append(s"${indent}  if ($iok) { atomicAdd(&a->ht_f64[base + $ai], (double)($iv)); atomicAdd(&a->ht_cnt[base + $ai], 1ULL); }\n")
-          sb.append(s"${indent}}\n")
-        case GenericJitReduceCodegen.AGG_SUM_I64 =>
-          val st = mutable.ArrayBuffer.empty[String]
-          val iRes = t.inputExpr.flatMap(emitExpr(_, st, nextId, attrAccess))
-          if (iRes.isEmpty) return None
-          val (iv, iok) = iRes.get
-          sb.append(s"${indent}{\n")
-          st.foreach(s => sb.append(s"$indent  $s\n"))
-          sb.append(s"${indent}  if ($iok) { atomicAdd((unsigned long long*)&a->ht_i64[base + $ai], (unsigned long long)(int64_t)($iv)); atomicAdd(&a->ht_cnt[base + $ai], 1ULL); }\n")
-          sb.append(s"${indent}}\n")
-        case GenericJitReduceCodegen.AGG_MIN_F64 =>
-          val st = mutable.ArrayBuffer.empty[String]
-          val iRes = t.inputExpr.flatMap(emitExpr(_, st, nextId, attrAccess))
-          if (iRes.isEmpty) return None
-          val (iv, iok) = iRes.get
-          sb.append(s"${indent}{\n")
-          st.foreach(s => sb.append(s"$indent  $s\n"))
-          sb.append(s"${indent}  if ($iok) { ws_atomic_min_f64(&a->ht_f64[base + $ai], (double)($iv)); atomicAdd(&a->ht_cnt[base + $ai], 1ULL); }\n")
-          sb.append(s"${indent}}\n")
-        case GenericJitReduceCodegen.AGG_MAX_F64 =>
-          val st = mutable.ArrayBuffer.empty[String]
-          val iRes = t.inputExpr.flatMap(emitExpr(_, st, nextId, attrAccess))
-          if (iRes.isEmpty) return None
-          val (iv, iok) = iRes.get
-          sb.append(s"${indent}{\n")
-          st.foreach(s => sb.append(s"$indent  $s\n"))
-          sb.append(s"${indent}  if ($iok) { ws_atomic_max_f64(&a->ht_f64[base + $ai], (double)($iv)); atomicAdd(&a->ht_cnt[base + $ai], 1ULL); }\n")
-          sb.append(s"${indent}}\n")
-        case GenericJitReduceCodegen.AGG_MIN_I64 =>
-          val st = mutable.ArrayBuffer.empty[String]
-          val iRes = t.inputExpr.flatMap(emitExpr(_, st, nextId, attrAccess))
-          if (iRes.isEmpty) return None
-          val (iv, iok) = iRes.get
-          sb.append(s"${indent}{\n")
-          st.foreach(s => sb.append(s"$indent  $s\n"))
-          sb.append(s"${indent}  if ($iok) { ws_atomic_min_i64(&a->ht_i64[base + $ai], (long long)(int64_t)($iv)); atomicAdd(&a->ht_cnt[base + $ai], 1ULL); }\n")
-          sb.append(s"${indent}}\n")
-        case GenericJitReduceCodegen.AGG_MAX_I64 =>
-          val st = mutable.ArrayBuffer.empty[String]
-          val iRes = t.inputExpr.flatMap(emitExpr(_, st, nextId, attrAccess))
-          if (iRes.isEmpty) return None
-          val (iv, iok) = iRes.get
-          sb.append(s"${indent}{\n")
-          st.foreach(s => sb.append(s"$indent  $s\n"))
-          sb.append(s"${indent}  if ($iok) { ws_atomic_max_i64(&a->ht_i64[base + $ai], (long long)(int64_t)($iv)); atomicAdd(&a->ht_cnt[base + $ai], 1ULL); }\n")
-          sb.append(s"${indent}}\n")
-        case _ => return None
-      }
-    }
-
-    sb.append(s"${indent}++match_idx;\n")
-
-    // Close nested K-way probe loops
-    for (_ <- 0 until k) {
-      indent = indent.dropRight(2)
-      sb.append(s"$indent}\n")
-      indent = indent.dropRight(2)
-      sb.append(s"$indent}\n")
-    }
-    sb.append("    if (!row_overflow) { a->row_progress[row] = 0xFFFFFFFFu; }\n")
-    sb.append("  }\n}\n")
-    Some((sb.toString(), kname))
-  }
-
-  def generatePartitionScatterBodies(
-      k: Int,
-      probeKeySpecs: Array[(Int, Int, DataType)],
-      factFilterOpt: Option[Expression],
-      postFilterOpt: Option[Expression],
-      partExprs: Seq[Expression],
-      outExprs: Seq[Expression],
-      attrAccess: Attribute => Option[(String, String, DataType)]): Option[(String, String)] = {
-    def emitOne(isScatter: Boolean): Option[String] = {
-      val kname = if (isScatter) "ws_part_scatter" else "ws_part_count"
-      var idCounter = 0
-      val nextId = () => { idCounter += 1; idCounter }
-      val sb = new StringBuilder()
-      sb.append("extern \"C\" __global__ void " + kname + "(const WsPartScatterArgs* a) {\n")
-      sb.append("  uint32_t n = a->num_rows;\n")
-      sb.append("  for (uint32_t row = blockIdx.x * blockDim.x + threadIdx.x; row < n; row += gridDim.x * blockDim.x) {\n")
-
-      factFilterOpt.foreach { fe =>
-        val st = mutable.ArrayBuffer.empty[String]
-        val res = emitExpr(fe, st, nextId, attrAccess)
-        if (res.isEmpty) return None
-        val (fv, fok) = res.get
-        st.foreach(s => sb.append(s"    $s\n"))
-        sb.append(s"    if (!(($fok) && ($fv))) continue;\n")
-      }
-
-      var indent = "    "
-      for (d <- 0 until k) {
-        val (srcTbl, slot, dt) = probeKeySpecs(d)
-        val srcRef = if (srcTbl == -1) s"a->fact_cols[$slot]" else s"a->dim_cols[$slot]"
-        val rowRef = if (srcTbl == -1) "row" else s"d$srcTbl"
-        sb.append(s"${indent}if (ws_valid($srcRef, $rowRef)) {\n")
-        indent += "  "
-        val loadCall = if (dt == LongType) s"ws_load_i64($srcRef, $rowRef)" else s"(int64_t)ws_load_i32($srcRef, $rowRef)"
-        sb.append(s"${indent}int64_t pk$d = $loadCall;\n")
-        sb.append(s"${indent}for (int32_t d$d = ws_probe_first(a->dims[$d], pk$d); d$d >= 0; d$d = ws_probe_next(a->dims[$d], d$d)) {\n")
-        indent += "  "
-      }
-
-      postFilterOpt.foreach { pe =>
-        val st = mutable.ArrayBuffer.empty[String]
-        val res = emitExpr(pe, st, nextId, attrAccess)
-        if (res.isEmpty) return None
-        val (pv, pok) = res.get
-        st.foreach(s => sb.append(s"$indent$s\n"))
-        sb.append(s"${indent}if (!(($pok) && ($pv))) continue;\n")
-      }
-
-      // Compute exact Spark Murmur3_x86_32 (seed = 42) hash across partition expressions
-      sb.append(s"${indent}uint32_t h = 42u;\n")
-      partExprs.foreach { pe =>
-        val st = mutable.ArrayBuffer.empty[String]
-        val res = emitExpr(pe, st, nextId, attrAccess)
-        if (res.isEmpty) return None
-        val (pv, pok) = res.get
-        st.foreach(s => sb.append(s"$indent$s\n"))
-        if (pe.dataType == LongType) {
-          sb.append(s"${indent}if ($pok) h = ws_spark_murmur3_i64((int64_t)($pv), h);\n")
-        } else {
-          sb.append(s"${indent}if ($pok) h = ws_spark_murmur3_i32((int32_t)($pv), h);\n")
-        }
-      }
-      sb.append(s"${indent}int32_t pid = ws_spark_part_id(h, (int32_t)a->num_parts);\n")
-
-      if (!isScatter) {
-        sb.append(s"${indent}atomicAdd(&a->part_counts[pid], 1u);\n")
-      } else {
-        sb.append(s"${indent}uint32_t dst = atomicAdd(&a->part_counts[pid], 1u);\n")
-        outExprs.zipWithIndex.foreach { case (oe, ci) =>
-          val st = mutable.ArrayBuffer.empty[String]
-          val res = emitExpr(oe, st, nextId, attrAccess)
-          if (res.isEmpty) return None
-          val (ov, ook) = res.get
-          sb.append(s"${indent}{\n")
-          st.foreach(s => sb.append(s"$indent  $s\n"))
-          val storeStmt = oe.dataType match {
-            case BooleanType | ByteType => s"((int8_t*)a->out_data[$ci])[dst] = (int8_t)($ov);"
-            case ShortType => s"((int16_t*)a->out_data[$ci])[dst] = (int16_t)($ov);"
-            case IntegerType | DateType => s"((int32_t*)a->out_data[$ci])[dst] = (int32_t)($ov);"
-            case LongType => s"((int64_t*)a->out_data[$ci])[dst] = (int64_t)($ov);"
-            case FloatType => s"((float*)a->out_data[$ci])[dst] = (float)($ov);"
-            case DoubleType => s"((double*)a->out_data[$ci])[dst] = (double)($ov);"
-            case d: DecimalType if d.precision <= 9 => s"((int32_t*)a->out_data[$ci])[dst] = (int32_t)($ov);"
-            case d: DecimalType if d.precision <= 18 => s"((int64_t*)a->out_data[$ci])[dst] = (int64_t)($ov);"
-            case _ => return None
-          }
-          sb.append(s"$indent  if ($ook) { $storeStmt atomicOr(&a->out_masks[$ci][dst >> 5], 1u << (dst & 31u)); }\n")
-          sb.append(s"${indent}}\n")
-        }
-      }
-
-      for (_ <- 0 until k) {
-        indent = indent.dropRight(2)
-        sb.append(s"$indent}\n")
-        indent = indent.dropRight(2)
-        sb.append(s"$indent}\n")
-      }
-      sb.append("  }\n}\n")
-      Some(sb.toString())
-    }
-    for {
-      c <- emitOne(isScatter = false)
-      s <- emitOne(isScatter = true)
-    } yield (c, s)
-  }
-}
-
 private object WholeStageProgramPool {
   private val cache = new ConcurrentHashMap[String, WholeStageNative.Program]()
 
   def getProgram(cudaBody: String, kernelName: String): WholeStageNative.Program = {
-    val key = kernelName + "\n" + cudaBody
-    cache.computeIfAbsent(key, _ => WholeStageNative.compileProgram(cudaBody, kernelName))
+    val key = kernelName + ":" + cudaBody
+    var p = cache.get(key)
+    if (p == null) {
+      val created = WholeStageNative.compileProgram(cudaBody, kernelName)
+      val existing = cache.putIfAbsent(key, created)
+      if (existing != null) {
+        created.close()
+        p = existing
+      } else {
+        p = created
+      }
+    }
+    p
   }
 }
 
 /**
- * Whole-Stage GPU operator fusing 0..6 Broadcast Equi-Joins + Filter + Project + Native GPU
- * Open-Addressing Hash-Agg Sink into ONE single NVRTC kernel across all batches of a Spark task!
+ * Serializable per-task compressed Vortex file split specification including optional
+ * zero-HBM Hive partition CONSTANT column values (`source_kind::CONSTANT`).
+ */
+final case class CompressedVortexSplitSpec(
+    paths: Array[String],
+    partConstVals: Array[Long],
+    partConstNulls: Array[Byte])
+
+/**
+ * Whole-Stage GPU Star-Join + Native Open-Addressing Hash-Agg Exec backed by libcudf
+ * `cudf::whole_stage` and compiled via `StageIR`. Supports both standard columnar inputs
+ * and direct zero-HBM compressed Vortex (non-partitioned & Hive-partitioned!) streaming.
  */
 case class GpuWholeStageStarJoinAggExec(
     output: Seq[Attribute],
@@ -1342,14 +586,19 @@ case class GpuWholeStageStarJoinAggExec(
     throw new IllegalStateException("GpuWholeStageStarJoinAggExec executes columnar on GPU only")
 
   override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
-    OP_TIME_LEGACY -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME_LEGACY),
-    JOIN_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_JOIN_TIME)
+    OP_TIME_LEGACY -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME_LEGACY)
   )
 
-  private def gatherDictStrings(keysCv: ColumnVector, codeCv: ColumnVector): ColumnVector = {
+  private def gatherDictStrings(keysCv: ColumnVector, codesCv: ColumnView): ColumnVector = {
     val nKeys = keysCv.getRowCount.toInt
     val gatherMap = withResource(Scalar.fromInt(nKeys)) { oob =>
-      codeCv.replaceNulls(oob)
+      if (codesCv.getType == DType.INT32) {
+        codesCv.replaceNulls(oob)
+      } else {
+        withResource(codesCv.castTo(DType.INT32)) { c32 =>
+          c32.replaceNulls(oob)
+        }
+      }
     }
     withResource(gatherMap) { gm =>
       withResource(new CudfTable(keysCv)) { keyTbl =>
@@ -1368,30 +617,103 @@ case class GpuWholeStageStarJoinAggExec(
       obm: Array[Int],
       obModes: Array[Byte],
       oTypes: Array[DataType]): ColumnarBatch = {
-    val hasStrKeys = gkDimStrSlots.exists(_ >= 0)
-    if (!hasStrKeys) {
-      GenericReduceBatchBuilder.projectBuffers(rawTbl, numKeys, obm, obModes, oTypes)
-    } else {
-      val totalOut = numKeys + obm.length
-      val cols = (0 until totalOut).safeMap { i =>
-        if (i < numKeys && gkDimStrSlots(i) >= 0) {
-          val keysCv = dimStrDictKeys(gkDimStrSlots(i))
-          val codeCv = rawTbl.getColumn(i)
-          GpuColumnVector.from(gatherDictStrings(keysCv, codeCv), StringType)
-        } else {
-          GenericReduceBatchBuilder.projectSingleColumn(
-            rawTbl, i, numKeys, obm, obModes, oTypes)
-        }
+    val totalOut = numKeys + obm.length
+    val cols = (0 until totalOut).safeMap { i =>
+      if (i < numKeys && gkDimStrSlots(i) >= 0) {
+        val keysCv = dimStrDictKeys(gkDimStrSlots(i))
+        val codeCv = rawTbl.getColumn(i)
+        GpuColumnVector.from(gatherDictStrings(keysCv, codeCv), StringType)
+      } else {
+        GenericReduceBatchBuilder.projectSingleColumn(rawTbl, i, numKeys, obm, obModes, oTypes)
       }
-      new ColumnarBatch(cols.toArray, rawTbl.getRowCount.toInt)
+    }.toArray
+    new ColumnarBatch(cols.asInstanceOf[Array[org.apache.spark.sql.vectorized.ColumnVector]], rawTbl.getRowCount.toInt)
+  }
+
+  private def extractScalarPartValue(row: InternalRow, ord: Int, dt: DataType): (Long, Byte) = {
+    if (row.isNullAt(ord)) (0L, 1.toByte)
+    else dt match {
+      case BooleanType => (if (row.getBoolean(ord)) 1L else 0L, 0.toByte)
+      case ByteType => (row.getByte(ord).toLong, 0.toByte)
+      case ShortType => (row.getShort(ord).toLong, 0.toByte)
+      case IntegerType | DateType => (row.getInt(ord).toLong, 0.toByte)
+      case LongType => (row.getLong(ord), 0.toByte)
+      case _ => (0L, 1.toByte)
     }
+  }
+
+  private def elemWidthOf(dt: DataType): Int = dt match {
+    case BooleanType | ByteType => 1
+    case ShortType => 2
+    case IntegerType | DateType => 4
+    case LongType => 8
+    case _ => 4
+  }
+
+  private def buildCompressedVortexPlan(
+      fsse: GpuFileSourceScanExec,
+      fOrds: Array[Int]): Option[(Array[CompressedVortexSplitSpec], Array[String], Array[Int], Array[Int], Array[Int])] = {
+    val partSchema = fsse.relation.partitionSchema
+    val partNameToIdx = partSchema.fields.zipWithIndex.map { case (f, i) => f.name -> i }.toMap
+
+    val fileColNamesBuf = mutable.ArrayBuffer.empty[String]
+    val fileColSlotsBuf = mutable.ArrayBuffer.empty[Int]
+    val partConstSlotsBuf = mutable.ArrayBuffer.empty[Int]
+    val partConstWidthsBuf = mutable.ArrayBuffer.empty[Int]
+    val partOrdInRowBuf = mutable.ArrayBuffer.empty[(Int, DataType)]
+
+    fOrds.zipWithIndex.foreach { case (ord, slotIdx) =>
+      val attr = fsse.output(ord)
+      partNameToIdx.get(attr.name) match {
+        case Some(pIdx) =>
+          partConstSlotsBuf += slotIdx
+          partConstWidthsBuf += elemWidthOf(attr.dataType)
+          partOrdInRowBuf += ((pIdx, attr.dataType))
+        case None =>
+          fileColNamesBuf += attr.name
+          fileColSlotsBuf += slotIdx
+      }
+    }
+    // Need at least 1 Vortex file column so Vortex yields exact batch row counts
+    if (fileColNamesBuf.isEmpty) return None
+
+    val nPart = partOrdInRowBuf.length
+    val splits = fsse.inputRDD.partitions.collect {
+      case fp: FilePartition =>
+        val pfs = FilePartitionShims.getFiles(fp)
+        val paths = new Array[String](pfs.length)
+        val pVals = new Array[Long](pfs.length * nPart)
+        val pNulls = new Array[Byte](pfs.length * nPart)
+        var fi = 0
+        while (fi < pfs.length) {
+          val pf = pfs(fi)
+          paths(fi) = new java.net.URI(pf.filePath.toString).getPath
+          var pi = 0
+          while (pi < nPart) {
+            val (pOrd, pDt) = partOrdInRowBuf(pi)
+            val (v, isNull) = extractScalarPartValue(pf.partitionValues, pOrd, pDt)
+            pVals(fi * nPart + pi) = v
+            pNulls(fi * nPart + pi) = isNull
+            pi += 1
+          }
+          fi += 1
+        }
+        CompressedVortexSplitSpec(paths, pVals, pNulls)
+    }.filter(_.paths.nonEmpty)
+
+    if (splits.isEmpty) None
+    else Some((
+      splits,
+      fileColNamesBuf.toArray,
+      fileColSlotsBuf.toArray,
+      partConstSlotsBuf.toArray,
+      partConstWidthsBuf.toArray))
   }
 
   override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     val opTime = allMetrics.getOrElse(OP_TIME_LEGACY, NoopMetric)
     val numOutputRows = allMetrics.getOrElse(NUM_OUTPUT_ROWS, NoopMetric)
     val numOutputBatches = allMetrics.getOrElse(NUM_OUTPUT_BATCHES, NoopMetric)
-
     val k = dimPlans.length
     val bcasts = dimPlans.map { dp =>
       GpuFusedStarJoinRewrite.resolveBroadcastExchange(dp)
@@ -1399,7 +721,6 @@ case class GpuWholeStageStarJoinAggExec(
         .executeColumnarBroadcast[Any]()
     }.toArray
     val dimSchemas = dimPlans.map(_.schema).toArray
-
     val fOrds = factOrds
     val dKeyOrds = dimKeyOrds
     val dColTbl = dimColTableIdx
@@ -1417,30 +738,21 @@ case class GpuWholeStageStarJoinAggExec(
     val kName = kernelName
     val numKeys = nativeKeyTypes.length
 
-    // Phase 2 + Phase 3-Vortex: When factPlan is a direct non-partitioned V1 Vortex scan,
-    // stream compressed Vortex segments (FSST / FastLanes BitPacked+FoR / ALP / Dict) straight
-    // into libcudf cudf::whole_stage WITHOUT decompressing to HBM!
-    val directVortexSplitsOpt: Option[(Array[Array[String]], Array[String])] =
+    val directVortexOpt =
       if (GpuWholeStageCodegenRewrite.isDirectCompressedVortexScan(factPlan)) {
-        val fsse = factPlan.asInstanceOf[GpuFileSourceScanExec]
-        val splits = fsse.inputRDD.partitions.collect {
-          case fp: FilePartition =>
-            FilePartitionShims.getFiles(fp).map(pf => new java.net.URI(pf.filePath.toString).getPath)
-        }.filter(_.nonEmpty)
-        val colNames = fOrds.map(o => fsse.output(o).name)
-        if (splits.nonEmpty) Some((splits, colNames)) else None
+        buildCompressedVortexPlan(factPlan.asInstanceOf[GpuFileSourceScanExec], fOrds)
       } else None
 
-    def runCompressedVortexTask(
-        paths: Array[String],
-        colNames: Array[String]): Iterator[ColumnarBatch] = {
+    def runTask(
+        vortexSplitOpt: Option[(CompressedVortexSplitSpec, Array[String], Array[Int], Array[Int], Array[Int])],
+        batchIter: Iterator[ColumnarBatch]): Option[ColumnarBatch] = {
       val nKeyDTypes = nKeyTypes.map(GpuColumnVector.getNonNestedRapidsType)
       val dimBatches = new Array[ColumnarBatch](k)
       val probeTables = new Array[WholeStageNative.ProbeTable](k)
       val dimEncodedCols = new Array[ColumnVector](dColTbl.length)
       val dimStrDictKeys = new Array[ColumnVector](dColTbl.length)
       var taskState: WholeStageNative.HashAggTask = null
-      var outBatch: ColumnarBatch = null
+      var outBatch: Option[ColumnarBatch] = None
       try {
         GpuSemaphore.acquireIfNecessary(TaskContext.get())
         var anyDimEmpty = false
@@ -1461,13 +773,14 @@ case class GpuWholeStageStarJoinAggExec(
         }
         val prog = WholeStageProgramPool.getProgram(srcBody, kName)
         if (anyDimEmpty) {
+          while (batchIter.hasNext) { withResource(batchIter.next()) { _ => } }
           if (numKeys == 0) {
             taskState = prog.openHashAggTask(nKeyDTypes, aKinds, 1)
             withResource(taskState.finish()) { r =>
               if (r.getRowCount > 0) {
                 numOutputRows += r.getRowCount
                 numOutputBatches += 1
-                outBatch = GenericReduceBatchBuilder.projectBuffers(r, 0, obm, obModes, oTypes)
+                outBatch = Some(GenericReduceBatchBuilder.projectBuffers(r, 0, obm, obModes, oTypes))
               }
             }
           }
@@ -1487,19 +800,52 @@ case class GpuWholeStageStarJoinAggExec(
             }
           }
           val probeHandles = probeTables.map(_.getNativeHandle)
-          opTime.ns {
-            val initCap = if (numKeys == 0) 1 else 262144
-            taskState = prog.openHashAggTask(nKeyDTypes, aKinds, initCap)
-            VortexNative.streamCompressedPathsToWholeStageAgg(
-              paths, colNames, taskState, probeHandles, dimViews)
-            withResource(taskState.finish()) { r =>
-              if (r.getRowCount > 0) {
-                numOutputRows += r.getRowCount
-                numOutputBatches += 1
-                outBatch = buildBatchFromWholeStageTable(
-                  r, dimStrDictKeys, numKeys, gkDimStrSlots, obm, obModes, oTypes)
+          val initCap = if (numKeys == 0) 1 else 262144
+          vortexSplitOpt match {
+            case Some((sp, fColNames, fColSlots, pConstSlots, pConstWidths)) =>
+              opTime.ns {
+                taskState = prog.openHashAggTask(nKeyDTypes, aKinds, initCap)
+                VortexNative.streamCompressedPathsToWholeStageAgg(
+                  sp.paths, fColNames, fOrds.length, fColSlots, pConstSlots, pConstWidths,
+                  sp.partConstVals, sp.partConstNulls, taskState, probeHandles, dimViews)
+                withResource(taskState.finish()) { r =>
+                  if (r.getRowCount > 0) {
+                    numOutputRows += r.getRowCount
+                    numOutputBatches += 1
+                    outBatch = Some(buildBatchFromWholeStageTable(
+                      r, dimStrDictKeys, numKeys, gkDimStrSlots, obm, obModes, oTypes))
+                  }
+                }
               }
-            }
+            case None =>
+              while (batchIter.hasNext) {
+                withResource(batchIter.next()) { b =>
+                  if (b.numRows() > 0) {
+                    opTime.ns {
+                      if (taskState == null) {
+                        taskState = prog.openHashAggTask(nKeyDTypes, aKinds, initCap)
+                      }
+                      val factViews = fOrds.map(o => b.column(o).asInstanceOf[GpuColumnVector].getBase.asInstanceOf[ColumnView])
+                      taskState.addBatch(factViews, b.numRows(), probeHandles, dimViews)
+                    }
+                  }
+                }
+              }
+              if (taskState == null && numKeys == 0) {
+                taskState = prog.openHashAggTask(nKeyDTypes, aKinds, 1)
+              }
+              if (taskState != null) {
+                opTime.ns {
+                  withResource(taskState.finish()) { r =>
+                    if (r.getRowCount > 0) {
+                      numOutputRows += r.getRowCount
+                      numOutputBatches += 1
+                      outBatch = Some(buildBatchFromWholeStageTable(
+                        r, dimStrDictKeys, numKeys, gkDimStrSlots, obm, obModes, oTypes))
+                    }
+                  }
+                }
+              }
           }
         }
       } finally {
@@ -1509,147 +855,57 @@ case class GpuWholeStageStarJoinAggExec(
         probeTables.foreach(p => if (p != null) p.safeClose())
         dimBatches.foreach(db => if (db != null) db.safeClose())
       }
-      if (outBatch != null) Iterator.single(outBatch) else Iterator.empty
+      outBatch
     }
 
-    directVortexSplitsOpt match {
-      case Some((fileSplits, colNames)) =>
-        sparkContext.parallelize(fileSplits.toSeq, fileSplits.length).mapPartitions { spIter =>
-          spIter.flatMap(paths => runCompressedVortexTask(paths, colNames))
-        }
-      case None =>
-        factPlan.executeColumnar().mapPartitions { iter =>
-      new Iterator[ColumnarBatch] {
-        private var finished = false
-        private var pending: ColumnarBatch = _
-        Option(TaskContext.get()).foreach { tc =>
-          tc.addTaskCompletionListener[Unit](_ => {
-            if (pending != null) {
-              pending.safeClose()
+    directVortexOpt match {
+      case Some((splits, fColNames, fColSlots, pConstSlots, pConstWidths)) =>
+        sparkContext.parallelize(splits.toSeq, splits.length).mapPartitions { spIter =>
+          new Iterator[ColumnarBatch] {
+            private var pending: ColumnarBatch = _
+            Option(TaskContext.get()).foreach { tc =>
+              tc.addTaskCompletionListener[Unit](_ => if (pending != null) { pending.safeClose(); pending = null })
+            }
+            override def hasNext: Boolean = {
+              while (pending == null && spIter.hasNext) {
+                val sp = spIter.next()
+                runTask(Some((sp, fColNames, fColSlots, pConstSlots, pConstWidths)), Iterator.empty)
+                  .foreach(b => pending = b)
+              }
+              pending != null
+            }
+            override def next(): ColumnarBatch = {
+              if (!hasNext) throw new NoSuchElementException("empty whole-stage vortex result")
+              val out = pending
               pending = null
+              out
             }
-          })
-        }
-
-        private def computeOnce(): Unit = {
-          finished = true
-          val nKeyDTypes = nKeyTypes.map(GpuColumnVector.getNonNestedRapidsType)
-          val dimBatches = new Array[ColumnarBatch](k)
-          val probeTables = new Array[WholeStageNative.ProbeTable](k)
-          val dimEncodedCols = new Array[ColumnVector](dColTbl.length)
-          val dimStrDictKeys = new Array[ColumnVector](dColTbl.length)
-          var taskState: WholeStageNative.HashAggTask = null
-          try {
-            // 1. Deserialize broadcast dims & build L2 LUT / Chained Hash Probe tables ONCE per task!
-            var anyDimEmpty = false
-            if (k > 0) {
-              GpuSemaphore.acquireIfNecessary(TaskContext.get())
-              opTime.ns {
-                var d = 0
-                while (d < k && !anyDimEmpty) {
-                  val db = GpuBroadcastHelper.getBroadcastBatch(bcasts(d), dimSchemas(d))
-                  dimBatches(d) = db
-                  if (db.numRows() == 0) {
-                    anyDimEmpty = true
-                  } else {
-                    val keyCv = db.column(dKeyOrds(d)).asInstanceOf[GpuColumnVector].getBase
-                    probeTables(d) = WholeStageNative.buildProbeTable(keyCv)
-                  }
-                  d += 1
-                }
-              }
-            }
-
-            if (anyDimEmpty) {
-              // Drain upstream iterator cleanly
-              while (iter.hasNext) { withResource(iter.next()) { _ => } }
-              if (numKeys == 0) {
-                // Global aggregate on 0 surviving rows emits 1 row of initial values (e.g. COUNT=0, SUM=NULL)
-                val prog = WholeStageProgramPool.getProgram(srcBody, kName)
-                taskState = prog.openHashAggTask(nKeyDTypes, aKinds, 64)
-                withResource(taskState.finish()) { r =>
-                  if (r.getRowCount > 0) {
-                    numOutputRows += r.getRowCount
-                    numOutputBatches += 1
-                    pending = GenericReduceBatchBuilder.projectBuffers(r, 0, obm, obModes, oTypes)
-                  }
-                }
-              }
-              return
-            }
-
-            // Build dim payload ColumnView array (dictionary-encoding any broadcast String group keys!)
-            val dimViews = new Array[ColumnView](dColTbl.length)
-            if (dColTbl.nonEmpty) {
-              opTime.ns {
-                for (i <- dColTbl.indices) {
-                  val baseCv = dimBatches(dColTbl(i)).column(dColOrd(i)).asInstanceOf[GpuColumnVector].getBase
-                  if (dColIsStr(i)) {
-                    val pair = WholeStageNative.encodeDimStringDict(baseCv, dColSs0(i), dColSsl(i))
-                    dimEncodedCols(i) = pair(0)
-                    dimStrDictKeys(i) = pair(1)
-                    dimViews(i) = dimEncodedCols(i)
-                  } else {
-                    dimViews(i) = baseCv
-                  }
-                }
-              }
-            }
-
-            val probeHandles = probeTables.map(_.getNativeHandle)
-            val prog = WholeStageProgramPool.getProgram(srcBody, kName)
-
-            // 2. Stream ALL fact batches through ONE persistent Native GPU Open-Addressing Hash-Agg Sink!
-            while (iter.hasNext) {
-              withResource(iter.next()) { b =>
-                if (b.numRows() > 0) {
-                  opTime.ns {
-                    if (taskState == null) {
-                      val initCap = if (numKeys == 0) 1 else 262144
-                      taskState = prog.openHashAggTask(nKeyDTypes, aKinds, initCap)
-                    }
-                    val factViews = fOrds.map(o => b.column(o).asInstanceOf[GpuColumnVector].getBase.asInstanceOf[ColumnView])
-                    taskState.addBatch(factViews, b.numRows(), probeHandles, dimViews)
-                  }
-                }
-              }
-            }
-
-            // 3. Compact & emit ONE partial-aggregate ColumnarBatch per Spark Task!
-            if (taskState != null) {
-              opTime.ns {
-                withResource(taskState.finish()) { r =>
-                  if (r.getRowCount > 0) {
-                    numOutputRows += r.getRowCount
-                    numOutputBatches += 1
-                    pending = buildBatchFromWholeStageTable(
-                      r, dimStrDictKeys, numKeys, gkDimStrSlots, obm, obModes, oTypes)
-                  }
-                }
-              }
-            }
-          } finally {
-            if (taskState != null) taskState.close()
-            dimEncodedCols.foreach(c => if (c != null) c.safeClose())
-            dimStrDictKeys.foreach(c => if (c != null) c.safeClose())
-            probeTables.foreach(p => if (p != null) p.safeClose())
-            dimBatches.foreach(db => if (db != null) db.safeClose())
           }
         }
 
-        override def hasNext: Boolean = {
-          if (!finished) computeOnce()
-          pending != null
+      case None =>
+        factPlan.executeColumnar().mapPartitions { iter =>
+          new Iterator[ColumnarBatch] {
+            private var finished = false
+            private var pending: ColumnarBatch = _
+            Option(TaskContext.get()).foreach { tc =>
+              tc.addTaskCompletionListener[Unit](_ => if (pending != null) { pending.safeClose(); pending = null })
+            }
+            override def hasNext: Boolean = {
+              if (!finished) {
+                finished = true
+                runTask(None, iter).foreach(b => pending = b)
+              }
+              pending != null
+            }
+            override def next(): ColumnarBatch = {
+              if (!hasNext) throw new NoSuchElementException("empty whole-stage agg result")
+              val out = pending
+              pending = null
+              out
+            }
+          }
         }
-
-        override def next(): ColumnarBatch = {
-          if (!hasNext) throw new NoSuchElementException("empty whole-stage agg result")
-          val out = pending
-          pending = null
-          out
-        }
-      }
-    }
     }
   }
 
@@ -1658,9 +914,7 @@ case class GpuWholeStageStarJoinAggExec(
 }
 
 /**
- * Phase 4 (Pillar 4-Write): Fuses Stage (Filter + 0..6 BroadcastHashJoin + Project) directly
- * into Spark Murmur3 HashPartition Scatter right underneath GpuShuffleExchangeExec so LSHF
- * Shuffle receives pre-partitioned output columns without intermediate HBM tables!
+ * Opt-in Fused Stage -> Spark Murmur3 HashPartition Scatter right underneath GpuShuffleExchangeExec.
  */
 case class GpuWholeStageFusedPartitionExec(
     output: Seq[Attribute],
@@ -1689,10 +943,6 @@ case class GpuWholeStageFusedPartitionExec(
     OP_TIME_LEGACY -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME_LEGACY)
   )
 
-  /**
-   * Executes Filter + BroadcastProbe + Project + Murmur3 Partition Scatter in ONE fused GPU pass,
-   * returning `(partitionedColumnarBatch, splits)` directly to GpuShuffleExchangeExec!
-   */
   def executePrePartitioned(): RDD[(ColumnarBatch, Array[Int])] = {
     val opTime = allMetrics.getOrElse(OP_TIME_LEGACY, NoopMetric)
     val numOutputRows = allMetrics.getOrElse(NUM_OUTPUT_ROWS, NoopMetric)
@@ -1723,6 +973,13 @@ case class GpuWholeStageFusedPartitionExec(
         private var anyEmpty = false
         private var closed = false
         private var nextItem: (ColumnarBatch, Array[Int]) = _
+
+        Option(TaskContext.get()).foreach { tc =>
+          tc.addTaskCompletionListener[Unit](_ => {
+            if (nextItem != null) { nextItem._1.safeClose(); nextItem = null }
+            cleanup()
+          })
+        }
 
         private def cleanup(): Unit = {
           if (!closed) {
@@ -1780,7 +1037,6 @@ case class GpuWholeStageFusedPartitionExec(
                       numOutputRows += tbl.getRowCount
                       numOutputBatches += 1
                       val outBatch = GpuColumnVector.from(tbl, oTypes)
-                      // Convert exclusive ends [end_0, ..., end_{P-1}] to start offsets [0, end_0, ..., end_{P-2}]
                       val starts = new Array[Int](nParts)
                       var p = 1
                       while (p < nParts) { starts(p) = splits(p - 1); p += 1 }

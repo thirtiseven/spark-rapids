@@ -169,6 +169,10 @@ object GenericJitReduceCodegen {
       |    int32_t code = (int32_t)unpack_for(c, row);
       |    return (c.dict_remap != nullptr) ? c.dict_remap[code] : code;
       |  }
+      |  if (c.mode == 4) return (int32_t)((const uint8_t*)c.raw_ptr)[row];
+      |  if (c.mode == 5) return (int32_t)((const uint16_t*)c.raw_ptr)[row];
+      |  if (c.mode == 6) return (int32_t)((const int8_t*)c.raw_ptr)[row];
+      |  if (c.mode == 7) return (int32_t)((const int16_t*)c.raw_ptr)[row];
       |  return ((const int32_t*)c.raw_ptr)[row];
       |}
       |__device__ __forceinline__ float read_f32(const JitColDesc& c, uint32_t row) {
@@ -1537,11 +1541,15 @@ object GpuLencFusedAgg {
           GenericJitReduceCodegen.generateHighCardKernel(None, boundTerms).map {
             case (cudaSrc, kname) =>
               val aggKinds = boundTerms.map(_.kind).toArray
-              val hcInput: SparkPlan = mode2Plan match {
-                case fsse: org.apache.spark.sql.rapids.GpuFileSourceScanExec
-                    if fsse.relation.fileFormat.isInstanceOf[com.nvidia.spark.rapids.vortex.GpuReadVortexFileFormat] =>
-                  GpuCoalesceBatches(mode2Plan, TargetSize(256L * 1024L * 1024L))
-                case _ => mode2Plan
+              val hasVortexScan = mode2Plan.find {
+                case fsse: org.apache.spark.sql.rapids.GpuFileSourceScanExec =>
+                  fsse.relation.fileFormat.isInstanceOf[com.nvidia.spark.rapids.vortex.GpuReadVortexFileFormat]
+                case _ => false
+              }.isDefined
+              val hcInput: SparkPlan = if (hasVortexScan) {
+                GpuCoalesceBatches(mode2Plan, TargetSize(512L * 1024L * 1024L))
+              } else {
+                mode2Plan
               }
               GpuGenericHighCardJitAggExec(
                 outAttrs, hcInput, groupOrds, valOrds, dictLits, aggKinds, outBufToTerm,

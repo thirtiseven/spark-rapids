@@ -723,36 +723,86 @@ object JoinImpl {
    * @param nullEquality if nulls should eb equal or not
    * @return the gather map to use for the left table
    */
+  private def copyGatherMapToColumn(gm: GatherMap, nRows: Int): ai.rapids.cudf.ColumnVector = {
+    withResource(gm.toColumnView(0, nRows)) { view =>
+      view.copyToColumnVector()
+    }
+  }
+
+  private def buildSeqIndexTable(nRows: Int): Table = {
+    withResource(ai.rapids.cudf.Scalar.fromInt(0)) { zero =>
+      withResource(ai.rapids.cudf.ColumnVector.sequence(zero, nRows)) { allIdx =>
+        new Table(allIdx)
+      }
+    }
+  }
+
+  private def leftSemiHashJoinJitBuildRight(
+      leftKeys: Table, rightKeys: Table,
+      leftTable: Table, rightTable: Table,
+      compiledCondition: CompiledExpression,
+      nullEquality: NullEquality): GatherMapsResult = {
+    val eqMaps = JoinPrimitives.hashInnerJoin(leftKeys, rightKeys, nullEquality == NullEquality.EQUAL)
+    val filtered = withResource(eqMaps) { maps =>
+      filterGatherMapsMaybeJit(
+        maps(0), maps(1), leftTable, rightTable, compiledCondition, ai.rapids.cudf.JoinKind.INNER)
+    }
+    val passCol = withResource(filtered) { fm =>
+      val nPass = fm(0).getRowCount.toInt
+      if (nPass == 0) null else copyGatherMapToColumn(fm(0), nPass)
+    }
+    if (passCol == null) {
+      GatherMapsResult.makeFromLeft(new GatherMap(ai.rapids.cudf.DeviceMemoryBuffer.allocate(0L)))
+    } else {
+      withResource(passCol) { col =>
+        withResource(new Table(col)) { passTbl =>
+          withResource(passTbl.groupBy(0).aggregate()) { uniqTbl =>
+            val uniqCol = uniqTbl.getColumn(0)
+            val nUniq = uniqCol.getRowCount
+            val dataBuf = uniqCol.getDeviceBufferFor(ai.rapids.cudf.BufferType.DATA)
+            GatherMapsResult.makeFromLeft(new GatherMap(dataBuf.sliceWithCopy(0L, nUniq * 4L)))
+          }
+        }
+      }
+    }
+  }
+
+  private def leftAntiHashJoinJitBuildRight(
+      leftKeys: Table, rightKeys: Table,
+      leftTable: Table, rightTable: Table,
+      compiledCondition: CompiledExpression,
+      nullEquality: NullEquality): GatherMapsResult = {
+    val eqMaps = JoinPrimitives.hashInnerJoin(leftKeys, rightKeys, nullEquality == NullEquality.EQUAL)
+    val filtered = withResource(eqMaps) { maps =>
+      filterGatherMapsMaybeJit(
+        maps(0), maps(1), leftTable, rightTable, compiledCondition, ai.rapids.cudf.JoinKind.INNER)
+    }
+    val passCol = withResource(filtered) { fm =>
+      val nPass = fm(0).getRowCount.toInt
+      if (nPass == 0) null else copyGatherMapToColumn(fm(0), nPass)
+    }
+    val leftRows = leftKeys.getRowCount.toInt
+    withResource(buildSeqIndexTable(leftRows)) { allTbl =>
+      if (passCol == null) {
+        val dataBuf = allTbl.getColumn(0).getDeviceBufferFor(ai.rapids.cudf.BufferType.DATA)
+        GatherMapsResult.makeFromLeft(new GatherMap(dataBuf.sliceWithCopy(0L, leftRows.toLong * 4L)))
+      } else {
+        withResource(passCol) { col =>
+          withResource(new Table(col)) { passTbl =>
+            GatherMapsResult.makeFromLeft(allTbl.leftAntiJoinGatherMap(passTbl, false))
+          }
+        }
+      }
+    }
+  }
+
   def leftSemiHashJoinBuildRight(leftKeys: Table, rightKeys: Table,
                                  leftTable: Table, rightTable: Table,
                                  compiledCondition: CompiledExpression,
                                  nullEquality: NullEquality): GatherMapsResult = {
     if (hasJitHandle(compiledCondition)) {
-      val eqMaps = JoinPrimitives.hashInnerJoin(leftKeys, rightKeys, nullEquality == NullEquality.EQUAL)
-      val filtered = withResource(eqMaps) { maps =>
-        filterGatherMapsMaybeJit(
-          maps(0), maps(1), leftTable, rightTable, compiledCondition, ai.rapids.cudf.JoinKind.INNER)
-      }
-      withResource(filtered) { fm =>
-        val nPass = fm(0).getRowCount.toInt
-        if (nPass == 0) {
-          GatherMapsResult.makeFromLeft(new GatherMap(ai.rapids.cudf.DeviceMemoryBuffer.allocate(0L)))
-        } else {
-          withResource(fm(0).toColumnView(0, nPass)) { passView =>
-            withResource(passView.copyToColumnVector()) { passCol =>
-              withResource(new Table(passCol)) { passTbl =>
-                withResource(passTbl.groupBy(0).aggregate()) { uniqTbl =>
-                  val uniqCol = uniqTbl.getColumn(0)
-                  val nUniq = uniqCol.getRowCount
-                  val dataBuf = uniqCol.getDeviceBufferFor(ai.rapids.cudf.BufferType.DATA)
-                  val buf = dataBuf.sliceWithCopy(0L, nUniq * 4L)
-                  GatherMapsResult.makeFromLeft(new GatherMap(buf))
-                }
-              }
-            }
-          }
-        }
-      }
+      leftSemiHashJoinJitBuildRight(
+        leftKeys, rightKeys, leftTable, rightTable, compiledCondition, nullEquality)
     } else {
       val leftRet = Table.mixedLeftSemiJoinGatherMap(leftKeys, rightKeys, leftTable, rightTable,
         compiledCondition, nullEquality)
@@ -789,35 +839,8 @@ object JoinImpl {
                                  compiledCondition: CompiledExpression,
                                  nullEquality: NullEquality): GatherMapsResult = {
     if (hasJitHandle(compiledCondition)) {
-      val eqMaps = JoinPrimitives.hashInnerJoin(leftKeys, rightKeys, nullEquality == NullEquality.EQUAL)
-      val filtered = withResource(eqMaps) { maps =>
-        filterGatherMapsMaybeJit(
-          maps(0), maps(1), leftTable, rightTable, compiledCondition, ai.rapids.cudf.JoinKind.INNER)
-      }
-      val leftRows = leftKeys.getRowCount.toInt
-      withResource(filtered) { fm =>
-        withResource(ai.rapids.cudf.Scalar.fromInt(0)) { zero =>
-          withResource(ai.rapids.cudf.ColumnVector.sequence(zero, leftRows)) { allIdx =>
-            withResource(new Table(allIdx)) { allTbl =>
-              val nPass = fm(0).getRowCount.toInt
-              if (nPass == 0) {
-                val dataBuf = allIdx.getDeviceBufferFor(ai.rapids.cudf.BufferType.DATA)
-                val buf = dataBuf.sliceWithCopy(0L, leftRows.toLong * 4L)
-                GatherMapsResult.makeFromLeft(new GatherMap(buf))
-              } else {
-                withResource(fm(0).toColumnView(0, nPass)) { passView =>
-                  withResource(passView.copyToColumnVector()) { passCol =>
-                    withResource(new Table(passCol)) { passTbl =>
-                      val antiMap = allTbl.leftAntiJoinGatherMap(passTbl, false)
-                      GatherMapsResult.makeFromLeft(antiMap)
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
+      leftAntiHashJoinJitBuildRight(
+        leftKeys, rightKeys, leftTable, rightTable, compiledCondition, nullEquality)
     } else {
       val leftRet = Table.mixedLeftAntiJoinGatherMap(leftKeys, rightKeys, leftTable, rightTable,
         compiledCondition, nullEquality)

@@ -1505,14 +1505,15 @@ object GpuLencFusedAgg {
       }
     }
 
-    // Mode 1: Low-Cardinality String GroupBy (1-2 string keys directly over LeafExecNode scan, e.g. Q1/U2!)
-    // Restrict to direct LeafExecNode scans (not post-join high-card keys like Q21 s_name!).
+    // Mode 1: Low-Cardinality non-nullable String GroupBy (1-2 string keys directly over LeafExecNode scan, e.g. Q1/U2!)
+    // Nullable string group keys fall through to Mode 2 / GpuHashAggregateExec which preserve NULL groups natively.
     val isLeafScan = basePlan.isInstanceOf[LeafExecNode]
     val preferHighCard = !isLeafScan ||
       groupAttrs.length >= 3 ||
-      groupAttrs.exists(_.dataType != StringType) ||
+      groupAttrs.exists(a => a.dataType != StringType || a.nullable) ||
       rawTerms.length >= 12
-    if (!preferHighCard && groupAttrs.length <= 2 && groupAttrs.forall(_.dataType == StringType)) {
+    if (!preferHighCard && groupAttrs.length <= 2 &&
+        groupAttrs.forall(a => a.dataType == StringType && !a.nullable)) {
       val m1 = tryBuildGlobalOrLowCard(
         outAttrs, outTypes, groupAttrs, filterExprOpt, rawTerms, outBufToTerm, outBufModes,
         basePlan.output, basePlan)

@@ -209,9 +209,12 @@ object GpuWholeStageCodegenRewrite {
     }
     val factPlan = cur
 
-    // Allow K >= 1 Star-Join+Agg, OR K == 0 Global Agg when either:
-    //   (a) directly over a V1 Vortex scan (zero-HBM FastLanes BitPacked+FoR / ALP / FSST!), or
-    //   (b) contains string predicates (GpuContains / GpuStartsWith / GpuEqualTo -> zero-HBM FSST!).
+    // Cost-based admission:
+    //   1. K == 0 Global Agg directly over V1 Vortex (zero-HBM FastLanes BitPacked+FoR / ALP / FSST!)
+    //      or containing string predicates (GpuContains / GpuStartsWith / GpuEqualTo).
+    //   2. K >= 2 multi-way star-join + low/medium-card agg (0..4 group keys originating from
+    //      broadcast dimensions so the open-addressing hash table stays L2-resident with zero
+    //      overflow flushes, avoiding high-card fact-key regressions like 300M-group Q65/Q73!).
     val directVortex = isDirectCompressedVortexScan(factPlan)
     if (joins.isEmpty) {
       if (agg.groupingExpressions.nonEmpty) return None
@@ -219,6 +222,8 @@ object GpuWholeStageCodegenRewrite {
         agg.aggregateExpressions.exists(hasStringPredicate) ||
         topProjMap.values.exists(hasStringPredicate)
       if (!directVortex && !anyStrPred) return None
+    } else if (joins.length < 2 || agg.groupingExpressions.length > 4) {
+      return None
     }
 
     // Resolve alias chains through midAliasMaps
@@ -371,6 +376,12 @@ object GpuWholeStageCodegenRewrite {
 
     if (factFilterOpt.exists(e => !collectExprCols(e, allowDim = false))) return None
     if (postFilterOpt.exists(e => !collectExprCols(e, allowDim = true))) return None
+    // Require star-join group keys to originate from broadcast dimension tables (bounded cardinality)
+    // so open-addressing hash-agg stays L2-resident without overflow flush churn on fact-table IDs.
+    val factAttrIds = factIdToOrd.keySet
+    if (k >= 1 && groupExprs.exists(ge => ge.references.exists(a => factAttrIds.contains(resolveAttr(a).exprId)))) {
+      return None
+    }
     groupExprs.zipWithIndex.foreach { case (ge, gi) =>
       if (groupKeyIsDimStr(gi)) {
         val (dIdx, ord, ss0, ssl) = groupKeyDimStrRef(gi)
@@ -1511,6 +1522,14 @@ case class GpuWholeStageStarJoinAggExec(
       new Iterator[ColumnarBatch] {
         private var finished = false
         private var pending: ColumnarBatch = _
+        Option(TaskContext.get()).foreach { tc =>
+          tc.addTaskCompletionListener[Unit](_ => {
+            if (pending != null) {
+              pending.safeClose()
+              pending = null
+            }
+          })
+        }
 
         private def computeOnce(): Unit = {
           finished = true

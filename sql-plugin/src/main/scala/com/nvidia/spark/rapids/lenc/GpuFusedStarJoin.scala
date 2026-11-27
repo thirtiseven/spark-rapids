@@ -474,15 +474,27 @@ case class GpuFusedStarJoinExec(
         private val buildTables = new Array[LencNative.StarJoinBuildTable](k)
         private var initialized = false
         private var anyEmpty = false
+        private var curFactBatch: ColumnarBatch = _
+        private var curFactTable: CudfTable = _
+        private var curRowOffset: Int = 0
+        private var curChunkRows: Int = Int.MaxValue
+        private var maxDimStrBytesPerRow: Long = 0L
         private var nextOut: ColumnarBatch = _
         private var closed = false
 
         TaskContext.get().addTaskCompletionListener[Unit](_ => cleanup())
 
+        private def releaseCurFact(): Unit = {
+          if (curFactTable != null) { curFactTable.safeClose(); curFactTable = null }
+          if (curFactBatch != null) { curFactBatch.safeClose(); curFactBatch = null }
+          curRowOffset = 0
+        }
+
         private def cleanup(): Unit = {
           if (!closed) {
             closed = true
             if (nextOut != null) { nextOut.safeClose(); nextOut = null }
+            releaseCurFact()
             streamBuf.close()
             buildTables.foreach(bt => if (bt != null) bt.safeClose())
             dimTables.foreach(dt => if (dt != null) dt.safeClose())
@@ -508,46 +520,90 @@ case class GpuFusedStarJoinExec(
                 val dCols = (0 until db.numCols()).map(c =>
                   db.column(c).asInstanceOf[GpuColumnVector].getBase)
                 dimTables(d) = new CudfTable(dCols: _*)
+                // Estimate max string column bytes/row so chunked gather never hits 2 GiB overflow!
+                var o = 0
+                while (o < ost.length) {
+                  if (ost(o) == d && outTypes(o) == StringType) {
+                    val cv = dCols(osc(o))
+                    val avgB = (cv.getDeviceMemorySize / math.max(db.numRows().toLong, 1L)) + 16L
+                    maxDimStrBytesPerRow = math.max(maxDimStrBytesPerRow, avgB)
+                  }
+                  o += 1
+                }
               }
             }
             d += 1
           }
         }
 
+        private def computeChunkRows(fb: ColumnarBatch): Int = {
+          val n = fb.numRows()
+          if (n <= 0) return 1
+          var maxStrB = maxDimStrBytesPerRow
+          var o = 0
+          while (o < ost.length) {
+            if (ost(o) < 0 && outTypes(o) == StringType) {
+              val cv = fb.column(osc(o)).asInstanceOf[GpuColumnVector].getBase
+              val avgB = (cv.getDeviceMemorySize / math.max(n.toLong, 1L)) + 16L
+              maxStrB = math.max(maxStrB, avgB)
+            }
+            o += 1
+          }
+          if (maxStrB <= 0L) {
+            n
+          } else {
+            // Keep each gathered string column safely under 512 MiB (4x safety margin below 2 GiB!)
+            val cap = ((512L * 1024L * 1024L) / math.max(maxStrB * 2L, 32L)).toInt
+            math.max(65536, math.min(n, cap))
+          }
+        }
+
         override def hasNext: Boolean = {
           if (nextOut != null) return true
           if (closed) return false
-          while (streamBuf.hasNext) {
-            // Peek first stream batch BEFORE acquiring GpuSemaphore on init!
-            if (!initialized) {
-              streamBuf.head
-              initBuildTables()
-            }
-            if (anyEmpty) {
-              // Drain remaining input batches cleanly and finish
-              withResource(streamBuf.next()) { _ => }
-            } else {
-              val outOpt = opTime.ns {
-                withResource(streamBuf.next()) { fb =>
-                  if (fb.numRows() == 0) None
-                  else {
-                    val fCols = (0 until fb.numCols()).map(c =>
-                      fb.column(c).asInstanceOf[GpuColumnVector].getBase)
-                    withResource(new CudfTable(fCols: _*)) { fTbl =>
-                      val resTbl = joinTime.ns {
-                        LencNative.runStarJoinMaterialize(
-                          fTbl, pOrds, buildTables, dimTables, nnOrds, ost, osc)
-                      }
-                      withResource(resTbl) { rt =>
-                        if (rt.getRowCount > 0) {
-                          numOutputRows += rt.getRowCount
-                          numOutputBatches += 1
-                          Some(GpuColumnVector.from(rt, outTypes))
-                        } else None
-                      }
-                    }
-                  }
+          while (curFactBatch != null || streamBuf.hasNext) {
+            if (curFactBatch == null) {
+              // Peek first stream batch BEFORE acquiring GpuSemaphore on init!
+              if (!initialized) {
+                streamBuf.head
+                initBuildTables()
+              }
+              if (anyEmpty) {
+                withResource(streamBuf.next()) { _ => }
+              } else {
+                val fb = streamBuf.next()
+                if (fb.numRows() <= 0) {
+                  fb.safeClose()
+                } else {
+                  curFactBatch = fb
+                  val fCols = (0 until fb.numCols()).map(c =>
+                    fb.column(c).asInstanceOf[GpuColumnVector].getBase)
+                  curFactTable = new CudfTable(fCols: _*)
+                  curRowOffset = 0
+                  curChunkRows = computeChunkRows(fb)
                 }
+              }
+            }
+            if (curFactBatch != null) {
+              val totalRows = curFactBatch.numRows()
+              val start = curRowOffset
+              val end = math.min(totalRows, start + curChunkRows)
+              curRowOffset = end
+              val outOpt = opTime.ns {
+                val resTbl = joinTime.ns {
+                  LencNative.runStarJoinMaterialize(
+                    curFactTable, start, end, pOrds, buildTables, dimTables, nnOrds, ost, osc)
+                }
+                withResource(resTbl) { rt =>
+                  if (rt.getRowCount > 0) {
+                    numOutputRows += rt.getRowCount
+                    numOutputBatches += 1
+                    Some(GpuColumnVector.from(rt, outTypes))
+                  } else None
+                }
+              }
+              if (curRowOffset >= totalRows) {
+                releaseCurFact()
               }
               if (outOpt.isDefined) {
                 nextOut = outOpt.get

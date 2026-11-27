@@ -169,10 +169,10 @@ object GenericJitReduceCodegen {
       |    int32_t code = (int32_t)unpack_for(c, row);
       |    return (c.dict_remap != nullptr) ? c.dict_remap[code] : code;
       |  }
-      |  if (c.mode == 4) return (int32_t)((const uint8_t*)c.raw_ptr)[row];
-      |  if (c.mode == 5) return (int32_t)((const uint16_t*)c.raw_ptr)[row];
-      |  if (c.mode == 6) return (int32_t)((const int8_t*)c.raw_ptr)[row];
-      |  if (c.mode == 7) return (int32_t)((const int16_t*)c.raw_ptr)[row];
+      |  if (c.mode == 4) return (int32_t)((const unsigned char*)c.raw_ptr)[row];
+      |  if (c.mode == 5) return (int32_t)((const unsigned short*)c.raw_ptr)[row];
+      |  if (c.mode == 6) return (int32_t)((const signed char*)c.raw_ptr)[row];
+      |  if (c.mode == 7) return (int32_t)((const short*)c.raw_ptr)[row];
       |  return ((const int32_t*)c.raw_ptr)[row];
       |}
       |__device__ __forceinline__ float read_f32(const JitColDesc& c, uint32_t row) {

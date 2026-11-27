@@ -1493,9 +1493,14 @@ object GpuLencFusedAgg {
     // Mode 0: Global Conditional Reduce (0 group keys)
     if (gpuGrouping.isEmpty) {
       // Let GpuWholeStageCodegenRewrite fuse direct non-partitioned V1 Vortex global aggs so
-      // compressed FastLanes BitPacked+FoR / ALP / FSST segments execute directly in GPU registers!
-      if (GpuWholeStageCodegenRewrite.isDirectCompressedVortexScan(basePlan)) {
-        return None
+      // compressed FastLanes BitPacked+FoR / ALP / FSST segments execute directly in GPU registers
+      // (while >256 tiny Hive daily partition files like Q9 stay on Route A-Deep 8-stream merge!).
+      basePlan match {
+        case fsse: org.apache.spark.sql.rapids.GpuFileSourceScanExec
+            if GpuWholeStageCodegenRewrite.isDirectCompressedVortexScan(fsse) &&
+               fsse.relation.partitionSchema.isEmpty =>
+          return None
+        case _ =>
       }
       return tryBuildGlobalOrLowCard(
         outAttrs, outTypes, Seq.empty, filterExprOpt, rawTerms, outBufToTerm, outBufModes,

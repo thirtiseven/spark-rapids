@@ -947,6 +947,11 @@ case class GpuWholeStageStarJoinAggExec(
         CompressedVortexSplitSpec(paths, pVals, pNulls)
     }.filter(_.paths.nonEmpty)
 
+    // Cost guard: for >256 tiny Hive daily partition files (e.g. Q9 1,823 daily partitions),
+    // Route A-Deep 8-stream multi-file merge beats per-file compressed streaming + sync!
+    val totalFiles = splits.map(_.paths.length).sum
+    if (partSchema.nonEmpty && totalFiles > 256) return None
+
     if (splits.isEmpty) None
     else Some((
       splits,

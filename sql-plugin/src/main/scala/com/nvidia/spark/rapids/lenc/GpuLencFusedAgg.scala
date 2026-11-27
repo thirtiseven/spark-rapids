@@ -865,7 +865,7 @@ object GenericJitReduceCodegen {
     } else {
       val sb = new StringBuilder("int32_t gid = 0;\n")
       groupKeySlots.foreach { s =>
-        sb.append(s"    { int32_t gk = read_i32(a->cols[$s], row); gid = gid * (int32_t)(a->cols[$s].dict_size > 0 ? a->cols[$s].dict_size : 1) + gk; }\n")
+        sb.append(s"    { int32_t gk = (!col_valid(a->cols[$s], row)) ? ((a->cols[$s].dict_remap != nullptr) ? a->cols[$s].dict_remap[a->cols[$s].rle_num_runs] : -1) : read_i32(a->cols[$s], row); if (gk < 0) continue; gid = gid * (int32_t)(a->cols[$s].dict_size > 0 ? a->cols[$s].dict_size : 1) + gk; }\n")
       }
       sb.append("    if (gid < 0 || gid >= a->max_groups) continue;")
       sb.toString()
@@ -1492,6 +1492,11 @@ object GpuLencFusedAgg {
 
     // Mode 0: Global Conditional Reduce (0 group keys)
     if (gpuGrouping.isEmpty) {
+      // Let GpuWholeStageCodegenRewrite fuse direct non-partitioned V1 Vortex global aggs so
+      // compressed FastLanes BitPacked+FoR / ALP / FSST segments execute directly in GPU registers!
+      if (GpuWholeStageCodegenRewrite.isDirectCompressedVortexScan(basePlan)) {
+        return None
+      }
       return tryBuildGlobalOrLowCard(
         outAttrs, outTypes, Seq.empty, filterExprOpt, rawTerms, outBufToTerm, outBufModes,
         basePlan.output, basePlan)
@@ -1505,15 +1510,14 @@ object GpuLencFusedAgg {
       }
     }
 
-    // Mode 1: Low-Cardinality non-nullable String GroupBy (1-2 string keys directly over LeafExecNode scan, e.g. Q1/U2!)
-    // Nullable string group keys fall through to Mode 2 / GpuHashAggregateExec which preserve NULL groups natively.
+    // Mode 1: Low-Cardinality String GroupBy (1-2 string keys directly over LeafExecNode scan, e.g. Q1/U2!)
+    // Preserves SQL NULL string groups natively via kNullGroupKeySentinel in JitReduceTaskAccumulator!
     val isLeafScan = basePlan.isInstanceOf[LeafExecNode]
     val preferHighCard = !isLeafScan ||
       groupAttrs.length >= 3 ||
-      groupAttrs.exists(a => a.dataType != StringType || a.nullable) ||
+      groupAttrs.exists(_.dataType != StringType) ||
       rawTerms.length >= 12
-    if (!preferHighCard && groupAttrs.length <= 2 &&
-        groupAttrs.forall(a => a.dataType == StringType && !a.nullable)) {
+    if (!preferHighCard && groupAttrs.length <= 2 && groupAttrs.forall(_.dataType == StringType)) {
       val m1 = tryBuildGlobalOrLowCard(
         outAttrs, outTypes, groupAttrs, filterExprOpt, rawTerms, outBufToTerm, outBufModes,
         basePlan.output, basePlan)

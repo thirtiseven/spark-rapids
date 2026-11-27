@@ -285,25 +285,67 @@ abstract class GpuShuffleExchangeExecBase(
   lazy val shuffleDependencyColumnar : ShuffleDependency[Int, ColumnarBatch, ColumnarBatch] = {
     val descendantOpTimeMetrics = getDescendantOpTimeMetrics
     val opTimeNewShuffleWrite = allMetrics.get(OP_TIME_NEW_SHUFFLE_WRITE)
-    val shuffleOutputPartitioning =
-      gpuOutputPartitioningForShuffle(inputBatchRDD.getNumPartitions)
-    
-    val dependency = GpuShuffleExchangeExecBase.prepareBatchShuffleDependency(
-      inputBatchRDD,
-      child.output,
-      shuffleOutputPartitioning,
-      sparkTypes,
-      serializer,
-      useGPUShuffle,
-      useMultiThreadedShuffle,
-      rangeInputBatchingEnabled,
-      allMetrics,
-      writeMetrics,
-      additionalMetrics,
-      opTimeNewShuffleWrite,
-      descendantOpTimeMetrics,
-      enableOpTimeTrackingRdd,
-      rangeBoundaryPlan)
+    val dependency = child match {
+      case fp: com.nvidia.spark.rapids.lenc.GpuWholeStageFusedPartitionExec =>
+        val prePartRdd = fp.executePrePartitioned()
+        val shuffleOutputPartitioning =
+          gpuOutputPartitioningForShuffle(prePartRdd.getNumPartitions)
+        shuffleOutputPartitioning.setupDebugMetrics(allMetrics)
+        val partitionTime = allMetrics(GpuShuffleExchangeExecBase.METRIC_SHUFFLE_PARTITION_TIME)
+        val fusedRdd: RDD[Product2[Int, ColumnarBatch]] = prePartRdd.mapPartitions { iter =>
+          new AbstractIterator[Product2[Int, ColumnarBatch]] {
+            private var partitioned: Array[(ColumnarBatch, Int)] = _
+            private var at = 0
+            private val pair = new MutablePair[Int, ColumnarBatch]()
+            private def fill(): Unit = {
+              while ((partitioned == null || at >= partitioned.length) && iter.hasNext) {
+                if (partitioned != null) { partitioned.map(_._1).safeClose(); partitioned = null }
+                val (batch, starts) = iter.next()
+                partitionTime.ns {
+                  val nRows = batch.numRows()
+                  val cols = GpuColumnVector.extractColumns(batch)
+                  cols.foreach(_.incRefCount())
+                  batch.close()
+                  partitioned = shuffleOutputPartitioning.sliceInternalGpuOrCpuAndClose(nRows, starts, cols)
+                  at = 0
+                }
+              }
+            }
+            override def hasNext: Boolean = { fill(); partitioned != null && at < partitioned.length }
+            override def next(): Product2[Int, ColumnarBatch] = {
+              fill()
+              val (cb, pid) = partitioned(at)
+              at += 1
+              pair.update(pid, cb)
+            }
+          }
+        }
+        val dep = new ShuffleDependency[Int, ColumnarBatch, ColumnarBatch](
+          fusedRdd,
+          new BatchPartitionIdPassthrough(shuffleOutputPartitioning.numPartitions),
+          serializer,
+          shuffleWriterProcessor = ShuffleExchangeExec.createShuffleWriteProcessor(writeMetrics))
+        dep
+      case _ =>
+        val shuffleOutputPartitioning =
+          gpuOutputPartitioningForShuffle(inputBatchRDD.getNumPartitions)
+        GpuShuffleExchangeExecBase.prepareBatchShuffleDependency(
+          inputBatchRDD,
+          child.output,
+          shuffleOutputPartitioning,
+          sparkTypes,
+          serializer,
+          useGPUShuffle,
+          useMultiThreadedShuffle,
+          rangeInputBatchingEnabled,
+          allMetrics,
+          writeMetrics,
+          additionalMetrics,
+          opTimeNewShuffleWrite,
+          descendantOpTimeMetrics,
+          enableOpTimeTrackingRdd,
+          rangeBoundaryPlan)
+    }
     UcxShuffleReclaimAdmission.admit(this, dependency)
     dependency
   }

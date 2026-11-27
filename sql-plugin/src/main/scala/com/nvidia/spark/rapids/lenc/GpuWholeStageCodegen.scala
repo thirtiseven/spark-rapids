@@ -30,7 +30,7 @@ import com.nvidia.spark.rapids.jni.{VortexNative, WholeStageNative}
 import org.apache.spark.TaskContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, ExprId, Expression, NamedExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, ExprId, Expression, Literal, NamedExpression}
 import org.apache.spark.sql.catalyst.expressions.aggregate.Partial
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.execution.SparkPlan
@@ -55,8 +55,9 @@ object GpuWholeStageCodegenRewrite {
   private val MAX_DIMS = 6
   private val MAX_FACT_COLS = 24
   private val MAX_DIM_COLS = 24
-  private val MAX_GROUP_KEYS = 8
+  private val MAX_GROUP_KEYS = 12
   private val MAX_AGGS = 32
+  private val MAX_EXPAND_BRANCHES = 16
 
   private def isJoinKeyType(dt: DataType): Boolean = dt match {
     case IntegerType | LongType | DateType => true
@@ -170,10 +171,29 @@ object GpuWholeStageCodegenRewrite {
         cur = peelCoalesce(p.child)
       case _ =>
     }
+    var expandOpt: Option[GpuExpandExec] = None
+    var preExpandProjMap = Map.empty[ExprId, Expression]
+    cur match {
+      case ex: GpuExpandExec
+          if ex.projections.length >= 2 && ex.projections.length <= MAX_EXPAND_BRANCHES &&
+             ex.output.length <= MAX_FACT_COLS =>
+        expandOpt = Some(ex)
+        cur = peelCoalesce(ex.child)
+        cur match {
+          case p: GpuProjectExec =>
+            preExpandProjMap = extractProjectMap(p.projectList)
+            cur = peelCoalesce(p.child)
+          case _ =>
+        }
+      case _ =>
+    }
     var postFilterOpt: Option[Expression] = None
     cur match {
-      case f: GpuFilterExec =>
+      case f: GpuFilterExec if expandOpt.isEmpty =>
         postFilterOpt = Some(GpuLencFusedAgg.inlineProjectMap(unwrapJit(f.condition), topProjMap))
+        cur = peelCoalesce(f.child)
+      case f: GpuFilterExec =>
+        postFilterOpt = Some(unwrapJit(f.condition))
         cur = peelCoalesce(f.child)
       case _ =>
     }
@@ -217,13 +237,14 @@ object GpuWholeStageCodegenRewrite {
     val factPlan = cur
 
     val directVortex = isDirectCompressedVortexScan(factPlan)
+    val maxGkAllowed = if (expandOpt.isDefined) MAX_GROUP_KEYS else 4
     if (joins.isEmpty) {
       if (agg.groupingExpressions.nonEmpty) return None
       val anyStrPred = factFilterOpt.exists(hasStringPredicate) || postFilterOpt.exists(hasStringPredicate) ||
         agg.aggregateExpressions.exists(hasStringPredicate) ||
         topProjMap.values.exists(hasStringPredicate)
       if (!directVortex && !anyStrPred) return None
-    } else if (joins.length < 2 || agg.groupingExpressions.length > 4) {
+    } else if (joins.length < 2 || agg.groupingExpressions.length > maxGkAllowed) {
       return None
     }
 
@@ -290,7 +311,52 @@ object GpuWholeStageCodegenRewrite {
       return None
     }
 
-    // Identify Broadcast-Dim String / Substring(String, pos, len) group keys
+    // If GpuExpandExec is present, map any StringType expand output column whose non-null branch
+    // expressions all reference the same broadcast-dim String attribute to its dict-encoded slot!
+    val expandOutDimStr = mutable.HashMap.empty[ExprId, (Int, Int, Int, Int)] // expandOutExprId -> (dIdx, ord, ss0, ssl)
+    val expandCleanBranches: Option[(Seq[Attribute], Seq[DataType], Seq[Seq[Expression]])] = expandOpt.map { ex =>
+      val cleanProjs = ex.projections.map(_.map(e => rewriteAliases(GpuLencFusedAgg.inlineProjectMap(unwrapJit(e), preExpandProjMap))))
+      val outNativeTypes = new Array[DataType](ex.output.length)
+      for (j <- ex.output.indices) {
+        val oa = ex.output(j)
+        if (oa.dataType == StringType) {
+          var foundRef: Option[(Int, Int, Int, Int)] = None
+          var allMatch = true
+          cleanProjs.foreach { br =>
+            br(j) match {
+              case GpuLiteral(null, _) | Literal(null, _) =>
+              case a: Attribute =>
+                dimIdToLoc.get(a.exprId) match {
+                  case Some((dIdx, ord)) =>
+                    val ref = (dIdx, ord, 0, -1)
+                    if (foundRef.isEmpty) foundRef = Some(ref)
+                    else if (!foundRef.contains(ref)) allMatch = false
+                  case None => allMatch = false
+                }
+              case _ => allMatch = false
+            }
+          }
+          if (!allMatch || foundRef.isEmpty) return None
+          expandOutDimStr.put(oa.exprId, foundRef.get)
+          outNativeTypes(j) = IntegerType
+        } else if (isCodegenLeafType(oa.dataType)) {
+          outNativeTypes(j) = oa.dataType
+        } else {
+          return None
+        }
+      }
+      // Also guard: Expand group keys cannot pull in fact-table high-card keys!
+      ex.output.zipWithIndex.foreach { case (oa, j) =>
+        if (groupExprs.exists(_.references.exists(_.exprId == oa.exprId))) {
+          if (cleanProjs.exists(br => br(j).references.exists(a => factAttrIds.contains(a.exprId)))) {
+            return None
+          }
+        }
+      }
+      (ex.output, outNativeTypes.toSeq, cleanProjs)
+    }
+
+    // Identify Broadcast-Dim String / Substring(String, pos, len) group keys (both direct & via Expand!)
     val groupKeyIsDimStr = new Array[Boolean](groupExprs.length)
     val groupKeyDimStrRef = new Array[(Int, Int, Int, Int)](groupExprs.length)
     val nativeKeyTypes = new Array[DataType](groupExprs.length)
@@ -299,10 +365,10 @@ object GpuWholeStageCodegenRewrite {
       if (ge.dataType == StringType) {
         ge match {
           case a: Attribute =>
-            dimIdToLoc.get(a.exprId) match {
-              case Some((dIdx, ord)) =>
+            expandOutDimStr.get(a.exprId).orElse(dimIdToLoc.get(a.exprId).map { case (d, o) => (d, o, 0, -1) }) match {
+              case Some(ref) =>
                 groupKeyIsDimStr(gi) = true
-                groupKeyDimStrRef(gi) = (dIdx, ord, 0, -1)
+                groupKeyDimStrRef(gi) = ref
                 nativeKeyTypes(gi) = IntegerType
               case None => return None
             }
@@ -336,23 +402,37 @@ object GpuWholeStageCodegenRewrite {
       else allocDimSlot(probeKeySrcTbl(d), probeKeySrcOrd(d), isStrDict = false)
     }
 
-    def collectExprCols(e: Expression, allowDim: Boolean): Boolean = {
+    val expandOutIds: Set[ExprId] = expandOpt.map(_.output.map(_.exprId).toSet).getOrElse(Set.empty)
+    val dimStrOrigAttrSet: Map[ExprId, (Int, Int, Int, Int)] = expandOutDimStr.values.map { case ref @ (dIdx, ord, _, _) =>
+      dimPlans(dIdx).output(ord).exprId -> ref
+    }.toMap
+
+    def collectExprCols(e: Expression, allowDim: Boolean, allowExpandOut: Boolean = false): Boolean = {
       var ok = true
       e.foreach {
         case a: Attribute =>
-          val ra = resolveAttr(a)
-          factIdToOrd.get(ra.exprId) match {
-            case Some(ord) =>
-              if (!isCodegenLeafType(ra.dataType) && ra.dataType != StringType) ok = false
-              else allocFactSlot(ord)
-            case None if allowDim =>
-              dimIdToLoc.get(ra.exprId) match {
-                case Some((dIdx, ord)) =>
-                  if (!isCodegenLeafType(ra.dataType) && ra.dataType != StringType) ok = false
-                  else allocDimSlot(dIdx, ord, isStrDict = false)
-                case None => ok = false
-              }
-            case None => ok = false
+          if (allowExpandOut && expandOutIds.contains(a.exprId)) {
+            // Produced by ExpandOp as RegVal
+          } else {
+            val ra = resolveAttr(a)
+            factIdToOrd.get(ra.exprId) match {
+              case Some(ord) =>
+                if (!isCodegenLeafType(ra.dataType) && ra.dataType != StringType) ok = false
+                else allocFactSlot(ord)
+              case None if allowDim =>
+                dimStrOrigAttrSet.get(ra.exprId) match {
+                  case Some((dIdx, ord, ss0, ssl)) =>
+                    allocDimSlot(dIdx, ord, isStrDict = true, ss0, ssl)
+                  case None =>
+                    dimIdToLoc.get(ra.exprId) match {
+                      case Some((dIdx, ord)) =>
+                        if (!isCodegenLeafType(ra.dataType) && ra.dataType != StringType) ok = false
+                        else allocDimSlot(dIdx, ord, isStrDict = false)
+                      case None => ok = false
+                    }
+                }
+              case None => ok = false
+            }
           }
         case _ =>
       }
@@ -365,16 +445,23 @@ object GpuWholeStageCodegenRewrite {
 
     if (factFilterClean.exists(e => !collectExprCols(e, allowDim = false))) return None
     if (postFilterClean.exists(e => !collectExprCols(e, allowDim = true))) return None
+    expandCleanBranches.foreach { case (_, _, branches) =>
+      branches.foreach { br =>
+        br.foreach { be =>
+          if (!collectExprCols(be, allowDim = true)) return None
+        }
+      }
+    }
     groupExprs.zipWithIndex.foreach { case (ge, gi) =>
       if (groupKeyIsDimStr(gi)) {
         val (dIdx, ord, ss0, ssl) = groupKeyDimStrRef(gi)
         allocDimSlot(dIdx, ord, isStrDict = true, ss0, ssl)
-      } else if (!collectExprCols(ge, allowDim = true)) {
+      } else if (!collectExprCols(ge, allowDim = true, allowExpandOut = expandOpt.isDefined)) {
         return None
       }
     }
     cleanTerms.foreach { t =>
-      if (t.inputExpr.exists(e => !collectExprCols(e, allowDim = true))) return None
+      if (t.inputExpr.exists(e => !collectExprCols(e, allowDim = true, allowExpandOut = expandOpt.isDefined))) return None
     }
     if (factSlotMap.size > MAX_FACT_COLS || dimSlotMap.size > MAX_DIM_COLS) return None
 
@@ -389,13 +476,17 @@ object GpuWholeStageCodegenRewrite {
     for (d <- 0 until k) {
       val keyAttr = resolveAttr(orderedJoins(d).leftKeys.head.asInstanceOf[Attribute])
       val dBindings = dimSlotMap.collect {
-        case ((dIdx, ord, false, _, _), slot) if dIdx == d =>
+        case ((dIdx, ord, isStr, _, _), slot) if dIdx == d =>
           val a = dimPlans(d).output(ord)
-          (a.exprId, slot, a.dataType)
+          val bindDt = if (isStr) IntegerType else a.dataType
+          (a.exprId, slot, bindDt)
       }.toSeq
       ops += HashProbeOp(d, keyAttr, dBindings, JoinInner)
     }
     postFilterClean.foreach(pe => ops += FilterOp(pe))
+    expandCleanBranches.foreach { case (outAttrs, outNativeTypes, branches) =>
+      ops += ExpandOp(outAttrs, outNativeTypes, branches)
+    }
 
     val gkDimStrSlot = Array.tabulate(groupExprs.length) { gi =>
       if (groupKeyIsDimStr(gi)) {
@@ -407,7 +498,9 @@ object GpuWholeStageCodegenRewrite {
       if (groupKeyIsDimStr(gi)) groupKeyDimStrRef(gi)._1 else -1
     }
 
-    val aggSink = HashAggSink(groupExprs, gkDimStrSlot, gkDimIdx, cleanTerms)
+    // Activate Step 2 Block Shared-Mem 256-slot hot-key cache on Expand(ROLLUP) & 1-agg grouped stages!
+    val enableSmemCache = groupExprs.nonEmpty && cleanTerms.length == 1
+    val aggSink = HashAggSink(groupExprs, gkDimStrSlot, gkDimIdx, cleanTerms, useSmemHotCache = enableSmemCache)
     val (cudaBody, kernelName) = StageCompiler.compileAgg(initialEnv, ops.toSeq, aggSink).getOrElse(return None)
 
     val outAttrs = agg.output
@@ -800,7 +893,7 @@ case class GpuWholeStageStarJoinAggExec(
             }
           }
           val probeHandles = probeTables.map(_.getNativeHandle)
-          val initCap = if (numKeys == 0) 1 else 262144
+          val initCap = if (numKeys == 0) 1 else if (numKeys >= 5) 1048576 else 262144
           vortexSplitOpt match {
             case Some((sp, fColNames, fColSlots, pConstSlots, pConstWidths)) =>
               opTime.ns {

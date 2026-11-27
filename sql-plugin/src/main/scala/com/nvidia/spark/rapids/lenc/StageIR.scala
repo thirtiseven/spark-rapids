@@ -22,7 +22,7 @@ import scala.collection.mutable
 
 import com.nvidia.spark.rapids._
 
-import org.apache.spark.sql.catalyst.expressions.{Attribute, ExprId, Expression}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, ExprId, Expression, Literal}
 import org.apache.spark.sql.rapids.{GpuAdd, GpuAnd, GpuContains, GpuDivide, GpuEqualTo, GpuGreaterThan, GpuGreaterThanOrEqual, GpuLessThan, GpuLessThanOrEqual, GpuMultiply, GpuNot, GpuOr, GpuStartsWith, GpuSubtract}
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
@@ -168,9 +168,12 @@ object StageIR {
    * ExpandOp for ROLLUP / CUBE / GROUPING SETS (e.g. TPC-DS Q67 9x row expansion!).
    * Eliminates GpuExpandExec's N-times HBM materialization completely by emitting an inner loop
    * over `eid = 0..branches.length - 1` right in GPU registers!
+   * Supports both fixed-width columns AND broadcast-dim String dict columns (encoded as int32 codes
+   * in `outNativeTypes` where rolled-up NULL branches emit `(int32_t)0, valid=false`).
    */
   final case class ExpandOp(
       outAttrs: Seq[Attribute],
+      outNativeTypes: Seq[DataType],
       branches: Seq[Seq[Expression]]) extends StageOp {
     override def emitConsume(
         ctx: CodegenCtx,
@@ -182,10 +185,9 @@ object StageIR {
       val nBr = branches.length
       val nOut = outAttrs.length
       val ovfCond = if (ctx.isAggKernel && ctx.hasMultiMatch) " && !row_overflow" else ""
-      // Declare shared SSA variables for each expanded output column
       val outVars = new Array[(String, String, DataType)](nOut)
       for (j <- 0 until nOut) {
-        val dt = outAttrs(j).dataType
+        val dt = outNativeTypes(j)
         val ct = StageExprEmitter.cType(dt).getOrElse { ctx.failed = true; return }
         val vn = s"exv_${id}_$j"
         val ok = s"exok_${id}_$j"
@@ -199,15 +201,21 @@ object StageIR {
         sb.append(s"${ind1}  case $bIdx: {\n")
         val ind2 = ind1 + "    "
         for (j <- 0 until nOut) {
-          val (vn, ok, _) = outVars(j)
-          val st = mutable.ArrayBuffer.empty[String]
-          StageExprEmitter.emit(exprs(j), env, st, ctx) match {
-            case Some((ev, eok)) =>
-              st.foreach(s => sb.append(s"$ind2$s\n"))
-              sb.append(s"$ind2$vn = $ev; $ok = $eok;\n")
-            case None =>
-              ctx.failed = true
-              return
+          val (vn, ok, dt) = outVars(j)
+          exprs(j) match {
+            case GpuLiteral(null, _) | Literal(null, _) =>
+              val ct = StageExprEmitter.cType(dt).get
+              sb.append(s"$ind2$vn = ($ct)0; $ok = false;\n")
+            case other =>
+              val st = mutable.ArrayBuffer.empty[String]
+              StageExprEmitter.emit(other, env, st, ctx) match {
+                case Some((ev, eok)) =>
+                  st.foreach(s => sb.append(s"$ind2$s\n"))
+                  sb.append(s"$ind2$vn = $ev; $ok = $eok;\n")
+                case None =>
+                  ctx.failed = true
+                  return
+              }
           }
         }
         sb.append(s"${ind2}break;\n")
@@ -243,8 +251,20 @@ object StageIR {
   /** Compiles a Produce/Consume pipeline into NVRTC CUDA kernel body source(s). */
   object StageCompiler {
 
+    private def smemCacheKind(sink: HashAggSink): Int = {
+      // 0 = none, 1 = I64 sum, 2 = I64 count, 3 = F64 sum
+      if (!sink.useSmemHotCache || sink.aggTerms.length != 1) 0
+      else sink.aggTerms.head.kind match {
+        case GenericJitReduceCodegen.AGG_SUM_I64 => 1
+        case GenericJitReduceCodegen.AGG_COUNT_I64 => 2
+        case GenericJitReduceCodegen.AGG_SUM_F64 => 3
+        case _ => 0
+      }
+    }
+
     private def emitAggUpdateBody(
         sink: HashAggSink,
+        smemMode: Int,
         ctx: CodegenCtx,
         env: VarEnv,
         indent: String,
@@ -257,14 +277,18 @@ object StageIR {
         sb.append(s"${indent}uint64_t dummy_k[1] = {0ULL};\n")
         sb.append(s"${indent}int32_t slot = ws_hash_agg_upsert_n(a, dummy_k, 0u);\n")
       } else {
-        sb.append(s"${indent}uint64_t gkeys[$nk]; uint8_t nbits = 0u;\n")
+        sb.append(s"${indent}uint64_t gkeys[$nk]; uint16_t nbits = 0u;\n")
         sink.groupKeys.zipWithIndex.foreach { case (ge, gi) =>
-          if (sink.groupKeyDimStrSlot(gi) >= 0) {
+          val regBound = ge match {
+            case attr: Attribute => env.get(attr.exprId).exists(_.isInstanceOf[RegVal])
+            case _ => false
+          }
+          if (!regBound && sink.groupKeyDimStrSlot(gi) >= 0) {
             val dSlot = sink.groupKeyDimStrSlot(gi)
             val dIdx = sink.groupKeyDimIdx(gi)
             sb.append(s"${indent}{\n")
             sb.append(s"$indent  bool gok = ws_valid(a->dim_cols[$dSlot], d$dIdx);\n")
-            sb.append(s"$indent  if (gok) { gkeys[$gi] = (uint64_t)(int64_t)ws_load_i32(a->dim_cols[$dSlot], d$dIdx); } else { gkeys[$gi] = 0ULL; nbits |= (uint8_t)(1u << $gi); }\n")
+            sb.append(s"$indent  if (gok) { gkeys[$gi] = (uint64_t)(int64_t)ws_load_i32(a->dim_cols[$dSlot], d$dIdx); } else { gkeys[$gi] = 0ULL; nbits |= (uint16_t)(1u << $gi); }\n")
             sb.append(s"${indent}}\n")
           } else {
             val st = mutable.ArrayBuffer.empty[String]
@@ -272,7 +296,7 @@ object StageIR {
               case Some((gv, gok)) =>
                 sb.append(s"${indent}{\n")
                 st.foreach(s => sb.append(s"$indent  $s\n"))
-                sb.append(s"$indent  if ($gok) { gkeys[$gi] = (uint64_t)(int64_t)($gv); } else { gkeys[$gi] = 0ULL; nbits |= (uint8_t)(1u << $gi); }\n")
+                sb.append(s"$indent  if ($gok) { gkeys[$gi] = (uint64_t)(int64_t)($gv); } else { gkeys[$gi] = 0ULL; nbits |= (uint16_t)(1u << $gi); }\n")
                 sb.append(s"${indent}}\n")
               case None =>
                 ctx.failed = true
@@ -288,7 +312,11 @@ object StageIR {
       sink.aggTerms.zipWithIndex.foreach { case (term, ai) =>
         term.inputExpr match {
           case None =>
-            sb.append(s"${indent}atomicAdd(&a->ht_cnt[base_off + ${ai}u], 1ULL);\n")
+            if (smemMode == 2 && ai == 0) {
+              sb.append(s"${indent}ws_smem_acc_i64(sm_hot, a, slot, 0u, 0LL, false);\n")
+            } else {
+              sb.append(s"${indent}atomicAdd(&a->ht_cnt[base_off + ${ai}u], 1ULL);\n")
+            }
           case Some(ie) =>
             val st = mutable.ArrayBuffer.empty[String]
             StageExprEmitter.emit(ie, env, st, ctx) match {
@@ -299,12 +327,24 @@ object StageIR {
                 term.kind match {
                   case GenericJitReduceCodegen.AGG_SUM_F64 =>
                     sb.append(s"$indent    double dv = (double)($vv);\n")
-                    sb.append(s"$indent    if (!isnan(dv)) { atomicAdd(&a->ht_f64[base_off + ${ai}u], dv); atomicAdd(&a->ht_cnt[base_off + ${ai}u], 1ULL); }\n")
+                    if (smemMode == 3 && ai == 0) {
+                      sb.append(s"$indent    if (!isnan(dv)) { ws_smem_acc_f64(sm_hot, a, slot, 0u, dv); }\n")
+                    } else {
+                      sb.append(s"$indent    if (!isnan(dv)) { atomicAdd(&a->ht_f64[base_off + ${ai}u], dv); atomicAdd(&a->ht_cnt[base_off + ${ai}u], 1ULL); }\n")
+                    }
                   case GenericJitReduceCodegen.AGG_SUM_I64 =>
-                    sb.append(s"$indent    atomicAdd((unsigned long long*)&a->ht_i64[base_off + ${ai}u], (unsigned long long)(int64_t)($vv));\n")
-                    sb.append(s"$indent    atomicAdd(&a->ht_cnt[base_off + ${ai}u], 1ULL);\n")
+                    if (smemMode == 1 && ai == 0) {
+                      sb.append(s"$indent    ws_smem_acc_i64(sm_hot, a, slot, 0u, (int64_t)($vv), true);\n")
+                    } else {
+                      sb.append(s"$indent    atomicAdd((unsigned long long*)&a->ht_i64[base_off + ${ai}u], (unsigned long long)(int64_t)($vv));\n")
+                      sb.append(s"$indent    atomicAdd(&a->ht_cnt[base_off + ${ai}u], 1ULL);\n")
+                    }
                   case GenericJitReduceCodegen.AGG_COUNT_I64 =>
-                    sb.append(s"$indent    atomicAdd(&a->ht_cnt[base_off + ${ai}u], 1ULL);\n")
+                    if (smemMode == 2 && ai == 0) {
+                      sb.append(s"$indent    ws_smem_acc_i64(sm_hot, a, slot, 0u, 0LL, false);\n")
+                    } else {
+                      sb.append(s"$indent    atomicAdd(&a->ht_cnt[base_off + ${ai}u], 1ULL);\n")
+                    }
                   case GenericJitReduceCodegen.AGG_MIN_F64 =>
                     sb.append(s"$indent    double dv = (double)($vv); if (!isnan(dv)) { ws_atomic_min_f64(&a->ht_f64[base_off + ${ai}u], dv); atomicAdd(&a->ht_cnt[base_off + ${ai}u], 1ULL); }\n")
                   case GenericJitReduceCodegen.AGG_MAX_F64 =>
@@ -351,9 +391,17 @@ object StageIR {
         case _: ExpandOp => true
         case _ => false
       }
+      val smMode = smemCacheKind(sink)
       val ctx = new CodegenCtx(isAggKernel = true, hasMultiMatch = hasMultiMatch)
       val sb = new StringBuilder()
       sb.append("extern \"C\" __global__ void " + kname + "(const WsStageArgs* a) {\n")
+      if (smMode == 1 || smMode == 2) {
+        sb.append("  __shared__ WsSmemHotCacheI64 sm_hot;\n")
+        sb.append("  ws_smem_init_i64(sm_hot);\n")
+      } else if (smMode == 3) {
+        sb.append("  __shared__ WsSmemHotCacheF64 sm_hot;\n")
+        sb.append("  ws_smem_init_f64(sm_hot);\n")
+      }
       sb.append("  uint32_t n = a->num_rows;\n")
       sb.append("  for (uint32_t row = blockIdx.x * blockDim.x + threadIdx.x; row < n; row += gridDim.x * blockDim.x) {\n")
       sb.append("    uint32_t prog_cnt = a->row_progress[row];\n")
@@ -361,10 +409,18 @@ object StageIR {
       sb.append("    uint32_t match_idx = 0u;\n")
       sb.append("    bool row_overflow = false;\n")
       chainOps(ops.toList, ctx, initialEnv, "    ", sb, (leafEnv, leafIndent) =>
-        emitAggUpdateBody(sink, ctx, leafEnv, leafIndent, sb))
+        emitAggUpdateBody(sink, smMode, ctx, leafEnv, leafIndent, sb))
       if (ctx.failed) return None
       sb.append("    if (!row_overflow) { a->row_progress[row] = 0xFFFFFFFFu; }\n")
-      sb.append("  }\n}\n")
+      sb.append("  }\n")
+      if (smMode == 1) {
+        sb.append("  ws_smem_flush_i64(sm_hot, a, 0u, true);\n")
+      } else if (smMode == 2) {
+        sb.append("  ws_smem_flush_i64(sm_hot, a, 0u, false);\n")
+      } else if (smMode == 3) {
+        sb.append("  ws_smem_flush_f64(sm_hot, a, 0u);\n")
+      }
+      sb.append("}\n")
       Some((sb.toString(), kname))
     }
 
@@ -589,6 +645,24 @@ object StageExprEmitter {
     }
   }
 
+  private def emitLiteral(v: Any, dt: DataType): Option[(String, String)] = {
+    if (v == null) {
+      cType(dt).map(ct => (s"(($ct)0)", "false"))
+    } else dt match {
+      case BooleanType => Some((if (v.asInstanceOf[Boolean]) "true" else "false", "true"))
+      case ByteType => Some((s"(int32_t)(${v.asInstanceOf[Byte]})", "true"))
+      case ShortType => Some((s"(int32_t)(${v.asInstanceOf[Short]})", "true"))
+      case IntegerType | DateType => Some((s"(int32_t)(${v.asInstanceOf[Int]})", "true"))
+      case LongType => Some((s"(${v.asInstanceOf[Long]}LL)", "true"))
+      case FloatType => Some((s"((float)${v.asInstanceOf[Float]})", "true"))
+      case DoubleType => Some((s"((double)${v.asInstanceOf[Double]})", "true"))
+      case d: DecimalType if d.precision <= 18 =>
+        val unscaled = v.asInstanceOf[Decimal].toUnscaledLong
+        Some((if (d.precision <= 9) s"(int32_t)(${unscaled}LL)" else s"(${unscaled}LL)", "true"))
+      case _ => None
+    }
+  }
+
   def emit(
       e: Expression,
       env: VarEnv,
@@ -598,6 +672,7 @@ object StageExprEmitter {
     case org.apache.spark.sql.catalyst.expressions.Alias(child, _) => emit(child, env, stmts, ctx)
     case j: GpuAstJitExpression => emit(j.child, env, stmts, ctx)
     case p: GpuPromotePrecision => emit(p.child, env, stmts, ctx)
+    case co: GpuCheckOverflow => emit(co.child, env, stmts, ctx)
 
     case a: Attribute =>
       env.get(a.exprId).flatMap {
@@ -624,21 +699,24 @@ object StageExprEmitter {
           }
       }
 
-    case GpuLiteral(v, dt) =>
-      if (v == null) {
-        cType(dt).map(ct => (s"(($ct)0)", "false"))
-      } else dt match {
-        case BooleanType => Some((if (v.asInstanceOf[Boolean]) "true" else "false", "true"))
-        case ByteType => Some((s"(int32_t)(${v.asInstanceOf[Byte]})", "true"))
-        case ShortType => Some((s"(int32_t)(${v.asInstanceOf[Short]})", "true"))
-        case IntegerType | DateType => Some((s"(int32_t)(${v.asInstanceOf[Int]})", "true"))
-        case LongType => Some((s"(${v.asInstanceOf[Long]}LL)", "true"))
-        case FloatType => Some((s"((float)${v.asInstanceOf[Float]})", "true"))
-        case DoubleType => Some((s"((double)${v.asInstanceOf[Double]})", "true"))
-        case d: DecimalType if d.precision <= 18 =>
-          val unscaled = v.asInstanceOf[Decimal].toUnscaledLong
-          Some((if (d.precision <= 9) s"(int32_t)(${unscaled}LL)" else s"(${unscaled}LL)", "true"))
-        case _ => None
+    case GpuLiteral(v, dt) => emitLiteral(v, dt)
+    case Literal(v, dt) => emitLiteral(v, dt)
+
+    case GpuCoalesce(children) if children.nonEmpty && children.length <= 8 =>
+      cType(e.dataType).flatMap { ct =>
+        val id = ctx.nextId()
+        stmts += s"bool ok$id = false; $ct v$id = ($ct)0;"
+        var allOk = true
+        children.foreach { ch =>
+          if (allOk) {
+            emit(ch, env, stmts, ctx) match {
+              case Some((cv, cok)) =>
+                stmts += s"if (!ok$id && ($cok)) { ok$id = true; v$id = ($ct)($cv); }"
+              case None => allOk = false
+            }
+          }
+        }
+        if (allOk) Some((s"v$id", s"ok$id")) else None
       }
 
     case GpuIsNull(child) =>

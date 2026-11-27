@@ -916,10 +916,7 @@ object GpuOverrides extends Logging {
       CSVScanRuleMeta),
     GpuOverrides.scan[JsonScan](
       "Json parsing",
-      JsonScanRuleMeta),
-    GpuOverrides.scan[com.nvidia.spark.rapids.vortex.VortexScan](
-      "Standard Vortex GPU columnar (.vortex) scan via vortex-cuda-ffi",
-      com.nvidia.spark.rapids.vortex.VortexScanRuleMeta))
+      JsonScanRuleMeta))
       .map(r => (r.getClassFor.asSubclass(classOf[Scan]), r)).toMap
 
   lazy val scans: Map[Class[_ <: Scan], ScanRule[_ <: Scan]] =

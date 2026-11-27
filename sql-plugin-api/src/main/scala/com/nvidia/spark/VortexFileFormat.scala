@@ -21,6 +21,7 @@ import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 
+import com.nvidia.spark.rapids.ShimLoader
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.mapreduce.Job
 
@@ -99,5 +100,18 @@ class VortexFileFormat extends FileFormat with DataSourceRegister with Serializa
       options: Map[String, String],
       dataSchema: StructType): OutputWriterFactory = {
     throw new UnsupportedOperationException("VortexFileFormat is read-only; use VortexTools to write")
+  }
+}
+
+object VortexTools {
+  def convertParquetDirToVortex(
+      parquetDir: String,
+      vortexDir: String,
+      schemaJson: String,
+      includeCols: String = "",
+      numThreads: Int = 4): Long = {
+    ShimLoader.newVortexConverter()
+      .apply(Array(parquetDir, vortexDir, schemaJson, includeCols, numThreads.toString))
+      .longValue()
   }
 }

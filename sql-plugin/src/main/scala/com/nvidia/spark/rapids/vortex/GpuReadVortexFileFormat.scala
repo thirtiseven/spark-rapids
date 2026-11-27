@@ -51,6 +51,12 @@ import org.apache.spark.util.SerializableConfiguration
  * ArrowDeviceArray -> cuDF import, and O(1) getLastFileIndex() zero-I/O partition synthesis).
  */
 class GpuReadVortexFileFormat extends VortexFileFormat with GpuReadFileFormatWithMetrics {
+  @transient private var dict32Cols: Set[String] = Set.empty
+
+  def addDict32Cols(cols: Set[String]): Unit = {
+    dict32Cols = dict32Cols ++ cols
+  }
+
   override def buildReaderWithPartitionValuesAndMetrics(
       sparkSession: SparkSession,
       dataSchema: StructType,
@@ -84,6 +90,7 @@ class GpuReadVortexFileFormat extends VortexFileFormat with GpuReadFileFormatWit
       fallbackCountCol,
       coalesceTargetBytes,
       batchRows,
+      dict32Cols,
       fileScan.allMetrics)
   }
 }
@@ -109,6 +116,7 @@ case class GpuVortexMultiFilePartitionReaderFactory(
     fallbackCountCol: String,
     coalesceTargetBytes: Long,
     batchRows: Long,
+    dict32Cols: Set[String],
     metrics: Map[String, GpuMetric]) extends PartitionReaderFactory {
 
   override def supportColumnarReads(partition: InputPartition): Boolean = true
@@ -126,6 +134,7 @@ case class GpuVortexMultiFilePartitionReaderFactory(
       fallbackCountCol,
       coalesceTargetBytes,
       batchRows,
+      dict32Cols,
       metrics)
   }
 }
@@ -138,6 +147,7 @@ class GpuVortexFilePartitionReader(
     fallbackCountCol: String,
     coalesceTargetBytes: Long,
     batchRows: Long,
+    dict32Cols: Set[String],
     metrics: Map[String, GpuMetric]) extends PartitionReader[ColumnarBatch] {
 
   private var currentBatch: ColumnarBatch = _
@@ -151,6 +161,14 @@ class GpuVortexFilePartitionReader(
     else if (fallbackCountCol.nonEmpty) Array(fallbackCountCol)
     else Array.empty[String]
 
+  private val dict32Mask: Array[Byte] =
+    if (dict32Cols.isEmpty) null
+    else {
+      val m = scanCols.map(c => if (dict32Cols.contains(c)) 1.toByte else 0.toByte)
+      if (m.contains(1.toByte)) m else null
+    }
+  private val preserveDict32: Boolean = dict32Mask != null
+
   private val localPaths: Array[String] = partFiles.map { pf =>
     val s = pf.filePath.toString
     if (s.startsWith("file:")) new URI(s).getPath else s
@@ -160,7 +178,7 @@ class GpuVortexFilePartitionReader(
   private val avgProjBytes: Long =
     (avgFileBytes.toDouble * math.max(readDataSchema.defaultSize, 1) / math.max(fullSchemaBytes, 1)).toLong
   private val zeroCopyFastPath: Boolean =
-    outTypes.nonEmpty && (partFiles.length <= 2 || avgProjBytes >= (24L << 20))
+    preserveDict32 || (outTypes.nonEmpty && (partFiles.length <= 2 || avgProjBytes >= (24L << 20)))
   private val targetCoalesceBytes: Long =
     if (coalesceTargetBytes > 0L) coalesceTargetBytes else 128L * 1024L * 1024L
 
@@ -228,10 +246,11 @@ class GpuVortexFilePartitionReader(
     if (eof || localPaths.isEmpty || scanCols.isEmpty) return false
 
     // Start pure-CPU off-GpuSemaphore Tokio host prefetch BEFORE acquiring GpuSemaphore!
-    // Negative prefetch requests VX_CUDA_SCAN_FLAG_DECODE_DICT | VX_CUDA_SCAN_FLAG_LAZY_NULL_COUNT
-    // (fused GPU dict decode + zero per-file DtoH null_count stalls on batched multi-file decode).
+    // Positive prefetch preserves DICTIONARY32 for downstream GpuLencFusedAgg; negative prefetch
+    // requests VX_CUDA_SCAN_FLAG_DECODE_DICT | VX_CUDA_SCAN_FLAG_LAZY_NULL_COUNT (Path A-Deep).
     if (activeScan == null) {
-      activeScan = VortexNative.openMultiScan(localPaths, scanCols, batchRows, -3)
+      val prefetchArg = if (preserveDict32) 3 else -3
+      activeScan = VortexNative.openMultiScan(localPaths, scanCols, batchRows, prefetchArg)
     }
 
     GpuSemaphore.acquireIfNecessary(TaskContext.get())
@@ -239,7 +258,7 @@ class GpuVortexFilePartitionReader(
       if (zeroCopyFastPath) {
         while (true) {
           val cvs = gpuDecodeTime.ns {
-            activeScan.nextZeroCopyBatch(null)
+            activeScan.nextZeroCopyBatch(dict32Mask)
           }
           if (cvs == null) {
             eof = true

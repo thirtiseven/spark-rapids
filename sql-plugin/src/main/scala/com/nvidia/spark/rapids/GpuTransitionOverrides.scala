@@ -994,6 +994,7 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
         if (rapidsConf.shuffledHashJoinOptimizeShuffle || rapidsConf.useShuffledSymmetricHashJoin) {
           updatedPlan = shuffledHashJoinOptimizeShuffle(updatedPlan)
         }
+        updatedPlan = com.nvidia.spark.rapids.lenc.GpuWholeStageCodegenRewrite(updatedPlan)
         updatedPlan = com.nvidia.spark.rapids.lenc.GpuFusedStarJoinRewrite(updatedPlan)
         updatedPlan = GpuDriverlessBroadcastHashJoinExec.rewrite(updatedPlan, rapidsConf)
         if (rapidsConf.exportColumnarRdd) {

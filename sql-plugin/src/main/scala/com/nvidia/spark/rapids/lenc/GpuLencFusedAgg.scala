@@ -1234,13 +1234,13 @@ object GpuLencFusedAgg {
   val BUF_COUNT_NON_NULL: Byte = 3
   val BUF_F64_SUM_NON_NULL: Byte = 4
 
-  private def inlineProjectMap(e: Expression, projMap: Map[ExprId, Expression]): Expression = {
+  private[lenc] def inlineProjectMap(e: Expression, projMap: Map[ExprId, Expression]): Expression = {
     e.transformDown {
       case a: Attribute if projMap.contains(a.exprId) => projMap(a.exprId)
     }
   }
 
-  private def extractAggTermsAndBufferMap(
+  private[lenc] def extractAggTermsAndBufferMap(
       gpuAggs: Seq[GpuAggregateExpression],
       projMap: Map[ExprId, Expression]): Option[(Seq[GenericAggTerm], Array[Int], Array[Byte])] = {
     // Each Spark partial aggregate may emit 1 (SUM/COUNT/MIN/MAX) or 2 (AVG: sum+count, DecimalSum: sum+isEmpty) buffer cols
@@ -1612,7 +1612,52 @@ object GpuLencFusedAgg {
   }
 }
 
-private object GenericReduceBatchBuilder {
+private[lenc] object GenericReduceBatchBuilder {
+  def projectSingleColumn(
+      rawTbl: CudfTable,
+      i: Int,
+      numGroupKeys: Int,
+      outBufToTerm: Array[Int],
+      outBufModes: Array[Byte],
+      outTypes: Array[DataType]): org.apache.spark.sql.vectorized.ColumnVector = {
+    val nativeIdx = if (i < numGroupKeys) i else (numGroupKeys + outBufToTerm(i - numGroupKeys))
+    val mode = if (i < numGroupKeys) GpuLencFusedAgg.BUF_NORMAL else outBufModes(i - numGroupKeys)
+    val cv = rawTbl.getColumn(nativeIdx)
+    val expectedDType = GpuColumnVector.getNonNestedRapidsType(outTypes(i))
+    val typedCol = mode match {
+      case GpuLencFusedAgg.BUF_DEC_SUM =>
+        val scale = outTypes(i).asInstanceOf[DecimalType].scale
+        val dec64Type = DType.create(DType.DTypeEnum.DECIMAL64, -scale)
+        withResource(Scalar.fromLong(0L)) { zero =>
+          withResource(cv.replaceNulls(zero)) { nonNullI64 =>
+            withResource(nonNullI64.bitCastTo(dec64Type)) { dec64 =>
+              if (expectedDType != dec64Type) dec64.castTo(expectedDType)
+              else dec64.copyToColumnVector()
+            }
+          }
+        }
+      case GpuLencFusedAgg.BUF_DEC_IS_EMPTY =>
+        cv.isNull()
+      case GpuLencFusedAgg.BUF_COUNT_NON_NULL =>
+        withResource(Scalar.fromLong(0L)) { zero =>
+          withResource(cv.replaceNulls(zero)) { nonNullI64 =>
+            if (nonNullI64.getType != expectedDType) nonNullI64.castTo(expectedDType)
+            else nonNullI64.incRefCount()
+          }
+        }
+      case GpuLencFusedAgg.BUF_F64_SUM_NON_NULL =>
+        withResource(Scalar.fromDouble(0.0)) { zero =>
+          withResource(cv.replaceNulls(zero)) { nonNullF64 =>
+            if (nonNullF64.getType != expectedDType) nonNullF64.castTo(expectedDType)
+            else nonNullF64.incRefCount()
+          }
+        }
+      case _ =>
+        if (cv.getType != expectedDType) cv.castTo(expectedDType) else cv.incRefCount()
+    }
+    GpuColumnVector.from(typedCol, outTypes(i))
+  }
+
   def projectBuffers(
       rawTbl: CudfTable,
       numGroupKeys: Int,
@@ -1621,46 +1666,9 @@ private object GenericReduceBatchBuilder {
       outTypes: Array[DataType]): ColumnarBatch = {
     val totalOut = numGroupKeys + outBufToTerm.length
     val cols = (0 until totalOut).safeMap { i =>
-      val nativeIdx = if (i < numGroupKeys) i else (numGroupKeys + outBufToTerm(i - numGroupKeys))
-      val mode = if (i < numGroupKeys) GpuLencFusedAgg.BUF_NORMAL else outBufModes(i - numGroupKeys)
-      val cv = rawTbl.getColumn(nativeIdx)
-      val expectedDType = GpuColumnVector.getNonNestedRapidsType(outTypes(i))
-      val typedCol = mode match {
-        case GpuLencFusedAgg.BUF_DEC_SUM =>
-          val scale = outTypes(i).asInstanceOf[DecimalType].scale
-          val dec64Type = DType.create(DType.DTypeEnum.DECIMAL64, -scale)
-          withResource(Scalar.fromLong(0L)) { zero =>
-            withResource(cv.replaceNulls(zero)) { nonNullI64 =>
-              withResource(nonNullI64.bitCastTo(dec64Type)) { dec64 =>
-                if (expectedDType != dec64Type) dec64.castTo(expectedDType)
-                else dec64.copyToColumnVector()
-              }
-            }
-          }
-        case GpuLencFusedAgg.BUF_DEC_IS_EMPTY =>
-          cv.isNull()
-        case GpuLencFusedAgg.BUF_COUNT_NON_NULL =>
-          withResource(Scalar.fromLong(0L)) { zero =>
-            withResource(cv.replaceNulls(zero)) { nonNullI64 =>
-              if (nonNullI64.getType != expectedDType) nonNullI64.castTo(expectedDType)
-              else nonNullI64.incRefCount()
-            }
-          }
-        case GpuLencFusedAgg.BUF_F64_SUM_NON_NULL =>
-          withResource(Scalar.fromDouble(0.0)) { zero =>
-            withResource(cv.replaceNulls(zero)) { nonNullF64 =>
-              if (nonNullF64.getType != expectedDType) nonNullF64.castTo(expectedDType)
-              else nonNullF64.incRefCount()
-            }
-          }
-        case _ =>
-          if (cv.getType != expectedDType) cv.castTo(expectedDType) else cv.incRefCount()
-      }
-      GpuColumnVector.from(typedCol, outTypes(i))
+      projectSingleColumn(rawTbl, i, numGroupKeys, outBufToTerm, outBufModes, outTypes)
     }
-    new ColumnarBatch(
-      cols.map(_.asInstanceOf[org.apache.spark.sql.vectorized.ColumnVector]).toArray,
-      rawTbl.getRowCount.toInt)
+    new ColumnarBatch(cols.toArray, rawTbl.getRowCount.toInt)
   }
 }
 

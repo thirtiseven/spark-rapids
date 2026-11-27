@@ -20,7 +20,7 @@ import java.net.URI
 
 import scala.collection.mutable.ArrayBuffer
 
-import ai.rapids.cudf.{ColumnVector, Scalar, Table => CudfTable}
+import ai.rapids.cudf.{ColumnVector, Scalar}
 import com.nvidia.spark.VortexFileFormat
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.withResource
@@ -220,32 +220,6 @@ class GpuVortexFilePartitionReader(
     }
   }
 
-  private def buildTableFromZeroCopy(cvs: Array[ColumnVector], pRow: InternalRow): CudfTable = {
-    val nRows = if (cvs.nonEmpty) cvs(0).getRowCount.toInt else 0
-    val nData = dataTypes.length
-    val nPart = partTypes.length
-    val cols = new Array[ColumnVector](nData + nPart)
-    try {
-      var i = 0
-      while (i < nData) {
-        cols(i) = cvs(i)
-        cvs(i) = null
-        i += 1
-      }
-      var p = 0
-      while (p < nPart) {
-        withResource(makePartScalar(pRow, p, partTypes(p))) { s =>
-          cols(nData + p) = ColumnVector.fromScalar(s, nRows)
-        }
-        p += 1
-      }
-      new CudfTable(cols: _*)
-    } finally {
-      cvs.foreach(c => if (c != null) c.close())
-      cols.foreach(c => if (c != null) c.close())
-    }
-  }
-
   override def next(): Boolean = {
     if (currentBatch != null) {
       currentBatch.close()
@@ -254,9 +228,10 @@ class GpuVortexFilePartitionReader(
     if (eof || localPaths.isEmpty || scanCols.isEmpty) return false
 
     // Start pure-CPU off-GpuSemaphore Tokio host prefetch BEFORE acquiring GpuSemaphore!
-    // Negative prefetch requests VX_CUDA_SCAN_FLAG_DECODE_DICT (fused GPU dict decode in 1 pass).
+    // Negative prefetch requests VX_CUDA_SCAN_FLAG_DECODE_DICT | VX_CUDA_SCAN_FLAG_LAZY_NULL_COUNT
+    // (fused GPU dict decode + zero per-file DtoH null_count stalls on batched multi-file decode).
     if (activeScan == null) {
-      activeScan = VortexNative.openMultiScan(localPaths, scanCols, batchRows, -2)
+      activeScan = VortexNative.openMultiScan(localPaths, scanCols, batchRows, -3)
     }
 
     GpuSemaphore.acquireIfNecessary(TaskContext.get())
@@ -285,65 +260,87 @@ class GpuVortexFilePartitionReader(
         }
       }
 
-      val pending = new ArrayBuffer[CudfTable]()
-      var accBytes = 0L
-      var accRows = 0L
-      var emptyColRows = 0L
-      val canCoalesce = outTypes.nonEmpty
-      try {
-        while ((pending.isEmpty && emptyColRows == 0L) ||
-            (canCoalesce && accBytes < targetCoalesceBytes && accRows < 32000000L)) {
-          val cvs = gpuDecodeTime.ns {
-            activeScan.nextZeroCopyBatch(null)
+      // Path A2: Batched Multi-File GPU Decode — pops up to 64 small daily files in ONE JNI call,
+      // concatenates data columns in ONE fused GPU kernel (with exact __popc null_count & async
+      // zero-sync input release), and synthesizes any requested partition columns from RLE runs!
+      val bt = gpuDecodeTime.ns {
+        activeScan.nextBatchedMultiFile(64, 32000000L, targetCoalesceBytes)
+      }
+      if (bt == null) {
+        eof = true
+        activeScan.safeClose()
+        activeScan = null
+        return false
+      }
+      withResource(bt.table) { dataTbl =>
+        val totalRows = dataTbl.getRowCount.toInt
+        if (totalRows <= 0) return next()
+        if (outTypes.isEmpty) {
+          currentBatch = new ColumnarBatch(Array.empty, totalRows)
+          numOutputBatches += 1
+          return true
+        }
+        if (partTypes.isEmpty) {
+          currentBatch = GpuColumnVector.from(dataTbl, dataTypes)
+          numOutputBatches += 1
+          outputBytes += GpuColumnVector.getTotalDeviceMemoryUsed(currentBatch)
+          return true
+        }
+        val nData = dataTypes.length
+        val nPart = partTypes.length
+        val gpuCols = new Array[org.apache.spark.sql.vectorized.ColumnVector](nData + nPart)
+        var ok = false
+        try {
+          var i = 0
+          while (i < nData) {
+            gpuCols(i) = GpuColumnVector.from(dataTbl.getColumn(i).incRefCount(), dataTypes(i))
+            i += 1
           }
-          if (cvs == null) {
-            eof = true
-            activeScan.safeClose()
-            activeScan = null
-            return emitPending(pending, emptyColRows)
+          var p = 0
+          while (p < nPart) {
+            val pCol = buildPartitionColFromRuns(p, partTypes(p), bt.fileIndices, bt.rowCounts)
+            gpuCols(nData + p) = GpuColumnVector.from(pCol, partTypes(p))
+            p += 1
           }
-          val nr = if (cvs.nonEmpty) cvs(0).getRowCount else 0L
-          if (nr <= 0L) {
-            cvs.safeClose()
-          } else if (outTypes.isEmpty) {
-            cvs.safeClose()
-            emptyColRows += nr
-          } else {
-            val fIdx = math.min(math.max(activeScan.getLastFileIndex(), 0), partFiles.length - 1)
-            val fullT = buildTableFromZeroCopy(cvs, partFiles(fIdx).partitionValues)
-            pending += fullT
-            accBytes += fullT.getDeviceMemorySize
-            accRows += nr
+          currentBatch = new ColumnarBatch(gpuCols, totalRows)
+          numOutputBatches += 1
+          outputBytes += GpuColumnVector.getTotalDeviceMemoryUsed(currentBatch)
+          ok = true
+          true
+        } finally {
+          if (!ok) {
+            gpuCols.foreach(c => if (c != null) c.close())
           }
         }
-        emitPending(pending, emptyColRows)
-      } finally {
-        pending.safeClose()
       }
     }
   }
 
-  private def emitPending(pending: ArrayBuffer[CudfTable], emptyColRows: Long): Boolean = {
-    if (outTypes.isEmpty) {
-      if (emptyColRows <= 0L) return false
-      currentBatch = new ColumnarBatch(Array.empty, emptyColRows.toInt)
-      numOutputBatches += 1
-      return true
+  private def buildPartitionColFromRuns(
+      partIdx: Int,
+      dt: DataType,
+      fileIndices: Array[Int],
+      rowCounts: Array[Int]): ColumnVector = {
+    if (fileIndices.length == 1) {
+      val fIdx = math.min(math.max(fileIndices(0), 0), partFiles.length - 1)
+      withResource(makePartScalar(partFiles(fIdx).partitionValues, partIdx, dt)) { s =>
+        return ColumnVector.fromScalar(s, rowCounts(0))
+      }
     }
-    if (pending.isEmpty) return false
-    val finalTbl = if (pending.length == 1) {
-      pending.remove(0)
-    } else {
-      val arr = pending.toArray
-      pending.clear()
-      withResource(arr)(tbls => CudfTable.concatenate(tbls: _*))
+    val segs = new ArrayBuffer[ColumnVector](fileIndices.length)
+    try {
+      var i = 0
+      while (i < fileIndices.length) {
+        val fIdx = math.min(math.max(fileIndices(i), 0), partFiles.length - 1)
+        withResource(makePartScalar(partFiles(fIdx).partitionValues, partIdx, dt)) { s =>
+          segs += ColumnVector.fromScalar(s, rowCounts(i))
+        }
+        i += 1
+      }
+      ColumnVector.concatenate(segs.toArray: _*)
+    } finally {
+      segs.safeClose()
     }
-    withResource(finalTbl) { t =>
-      currentBatch = GpuColumnVector.from(t, outTypes)
-      numOutputBatches += 1
-      outputBytes += GpuColumnVector.getTotalDeviceMemoryUsed(currentBatch)
-    }
-    true
   }
 
   override def get(): ColumnarBatch = {

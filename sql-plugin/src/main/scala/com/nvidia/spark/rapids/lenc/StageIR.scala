@@ -461,9 +461,13 @@ object StageIR {
         outExprs: Seq[Expression]): Option[(String, String)] = {
       def emitOne(isScatter: Boolean): Option[String] = {
         val kname = if (isScatter) "ws_part_scatter" else "ws_part_count"
+        val isMat = partExprsOpt.isEmpty
         val ctx = new CodegenCtx(isAggKernel = false, hasMultiMatch = false)
         val sb = new StringBuilder()
         sb.append("extern \"C\" __global__ void " + kname + "(const WsPartScatterArgs* a) {\n")
+        if (isMat && !isScatter) {
+          sb.append("  uint32_t local_cnt = 0u;\n")
+        }
         sb.append("  uint32_t n = a->num_rows;\n")
         sb.append("  for (uint32_t row = blockIdx.x * blockDim.x + threadIdx.x; row < n; row += gridDim.x * blockDim.x) {\n")
         chainOps(ops.toList, ctx, initialEnv, "    ", sb, (leafEnv, leafIndent) => {
@@ -491,9 +495,11 @@ object StageIR {
           }
           if (!ctx.failed) {
             if (!isScatter) {
-              sb.append(s"${leafIndent}atomicAdd(&a->part_counts[$pidExpr], 1u);\n")
+              if (isMat) sb.append(s"${leafIndent}++local_cnt;\n")
+              else sb.append(s"${leafIndent}atomicAdd(&a->part_counts[$pidExpr], 1u);\n")
             } else {
-              sb.append(s"${leafIndent}uint32_t dst = atomicAdd(&a->part_counts[$pidExpr], 1u);\n")
+              if (isMat) sb.append(s"${leafIndent}uint32_t dst = ws_warp_alloc_slot(&a->part_counts[0]);\n")
+              else sb.append(s"${leafIndent}uint32_t dst = atomicAdd(&a->part_counts[$pidExpr], 1u);\n")
               outExprs.zipWithIndex.foreach { case (oe, ci) =>
                 if (!ctx.failed) emitStoreCol(oe, ci, ctx, leafEnv, leafIndent, sb)
               }
@@ -501,7 +507,11 @@ object StageIR {
           }
         })
         if (ctx.failed) return None
-        sb.append("  }\n}\n")
+        sb.append("  }\n")
+        if (isMat && !isScatter) {
+          sb.append("  ws_warp_add_count(&a->part_counts[0], local_cnt);\n")
+        }
+        sb.append("}\n")
         Some(sb.toString())
       }
       for {

@@ -32,7 +32,8 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, ExprId, Expression, Literal, NamedExpression}
 import org.apache.spark.sql.catalyst.expressions.aggregate.Partial
-import org.apache.spark.sql.catalyst.plans.Inner
+import org.apache.spark.sql.catalyst.plans.{Inner, JoinType, LeftAnti, LeftSemi}
+import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.datasources.FilePartition
 import org.apache.spark.sql.execution.rapids.shims.FilePartitionShims
@@ -117,6 +118,13 @@ object GpuWholeStageCodegenRewrite {
     Some(m.toMap)
   }
 
+  private def toStageJoinMode(jt: JoinType): Option[StageJoinMode] = jt match {
+    case Inner => Some(JoinInner)
+    case LeftSemi => Some(JoinLeftSemi)
+    case LeftAnti => Some(JoinLeftAnti)
+    case _ => None
+  }
+
   def apply(plan: SparkPlan): SparkPlan = {
     if (!SQLConf.get.getConfString(GpuLencFusedAgg.FUSED_AGG_CONF, "false").toBoolean) {
       return plan
@@ -124,6 +132,10 @@ object GpuWholeStageCodegenRewrite {
     plan.transformUp {
       case agg: GpuHashAggregateExec =>
         tryFuseWholeStageAgg(agg).getOrElse(agg)
+      case p: GpuProjectExec =>
+        tryFuseShuffledJoinMaterialize(p).getOrElse(p)
+      case f: GpuFilterExec =>
+        tryFuseShuffledJoinMaterialize(f).getOrElse(f)
       case shuf: GpuShuffleExchangeExecBase =>
         tryFuseWholeStageShuffle(shuf).getOrElse(shuf)
     }
@@ -204,7 +216,7 @@ object GpuWholeStageCodegenRewrite {
     while (keep && joins.length < MAX_DIMS) {
       cur match {
         case bhj: GpuBroadcastHashJoinExecBase
-            if bhj.joinType == Inner &&
+            if toStageJoinMode(bhj.joinType).isDefined &&
                bhj.buildSide == GpuBuildRight &&
                bhj.condition.isEmpty &&
                bhj.leftKeys.length == 1 &&
@@ -475,13 +487,16 @@ object GpuWholeStageCodegenRewrite {
     factFilterClean.foreach(fe => ops += FilterOp(fe))
     for (d <- 0 until k) {
       val keyAttr = resolveAttr(orderedJoins(d).leftKeys.head.asInstanceOf[Attribute])
-      val dBindings = dimSlotMap.collect {
-        case ((dIdx, ord, isStr, _, _), slot) if dIdx == d =>
-          val a = dimPlans(d).output(ord)
-          val bindDt = if (isStr) IntegerType else a.dataType
-          (a.exprId, slot, bindDt)
-      }.toSeq
-      ops += HashProbeOp(d, keyAttr, dBindings, JoinInner)
+      val jMode = toStageJoinMode(orderedJoins(d).joinType).get
+      val dBindings = if (jMode == JoinInner) {
+        dimSlotMap.collect {
+          case ((dIdx, ord, isStr, _, _), slot) if dIdx == d =>
+            val a = dimPlans(d).output(ord)
+            val bindDt = if (isStr) IntegerType else a.dataType
+            (a.exprId, slot, bindDt)
+        }.toSeq
+      } else Seq.empty
+      ops += HashProbeOp(d, keyAttr, dBindings, jMode)
     }
     postFilterClean.foreach(pe => ops += FilterOp(pe))
     expandCleanBranches.foreach { case (outAttrs, outNativeTypes, branches) =>
@@ -507,12 +522,15 @@ object GpuWholeStageCodegenRewrite {
     val outTypes = outAttrs.map(_.dataType).toArray
     val dimSpecs = dimSlotMap.keys.toArray
 
+    val dimIsAnti = orderedJoins.map(_.joinType == LeftAnti)
+
     Some(GpuWholeStageStarJoinAggExec(
       output = outAttrs,
       factPlan = factPlan,
       dimPlans = dimPlans.toSeq,
       factOrds = factSlotMap.keys.toArray,
       dimKeyOrds = dimKeyOrds,
+      dimIsAnti = dimIsAnti,
       dimColTableIdx = dimSpecs.map(_._1),
       dimColOrd = dimSpecs.map(_._2),
       dimColIsStrDict = dimSpecs.map(_._3),
@@ -612,6 +630,138 @@ object GpuWholeStageCodegenRewrite {
 
     Some(shuf.withNewChildren(Seq(fusedChild)))
   }
+
+  /**
+   * Stage 3: Fuses (optional GpuProjectExec -> optional GpuFilterExec ->
+   * GpuShuffledHashJoinExec | GpuShuffledSymmetricHashJoinExec [Inner|LeftSemi|LeftAnti])
+   * into ONE single-pass StageIR MaterializeSink kernel (`GpuWholeStageShuffledJoinExec`),
+   * eliminating intermediate join gather_map, cudf::gather wide-table write, and Filter/Project HBM!
+   */
+  private def tryFuseShuffledJoinMaterialize(top: SparkPlan): Option[SparkPlan] = {
+    if (top.output.isEmpty || top.output.length > MAX_FACT_COLS ||
+        !top.output.forall(a => isCodegenLeafType(a.dataType))) {
+      return None
+    }
+    var cur = top
+    var topProjMap = Map.empty[ExprId, Expression]
+    var hadPostOp = false
+    cur match {
+      case p: GpuProjectExec =>
+        topProjMap = extractProjectMap(p.projectList)
+        cur = peelCoalesce(p.child)
+        hadPostOp = true
+      case _ =>
+    }
+    var postFilterOpt: Option[Expression] = None
+    cur match {
+      case f: GpuFilterExec =>
+        postFilterOpt = Some(GpuLencFusedAgg.inlineProjectMap(unwrapJit(f.condition), topProjMap))
+        cur = peelCoalesce(f.child)
+        hadPostOp = true
+      case _ =>
+    }
+    if (!hadPostOp) return None
+
+    // Match GpuShuffledHashJoinExec (BuildRight, where Spark already selected the small build side;
+    // LeftSemi/LeftAnti never have 1:N blowup, and Inner requires a selective postFilter so 2-pass
+    // materialize beats cudf::gather; skip GpuShuffledSymmetricHashJoinExec which handles large-to-large
+    // many-to-many joins like Q95 self-join with dynamic smaller-side selection!).
+    val shjInfoOpt: Option[(SparkPlan, SparkPlan, Attribute, Attribute, JoinType, Partitioning)] = cur match {
+      case shj: GpuShuffledHashJoinExec
+          if !shj.isSkewJoin &&
+             shj.buildSide == GpuBuildRight &&
+             (shj.joinType == LeftSemi || shj.joinType == LeftAnti ||
+               (shj.joinType == Inner && postFilterOpt.isDefined)) &&
+             shj.condition.isEmpty &&
+             shj.leftKeys.length == 1 && shj.rightKeys.length == 1 &&
+             isJoinKeyType(shj.leftKeys.head.dataType) &&
+             shj.leftKeys.head.dataType == shj.rightKeys.head.dataType &&
+             shj.leftKeys.head.isInstanceOf[Attribute] &&
+             shj.rightKeys.head.isInstanceOf[Attribute] =>
+        Some((shj.left, shj.right, shj.leftKeys.head.asInstanceOf[Attribute],
+          shj.rightKeys.head.asInstanceOf[Attribute], shj.joinType, shj.outputPartitioning))
+
+      case _ => None
+    }
+    if (shjInfoOpt.isEmpty) return None
+    val (leftPlan, rightPlan, leftKey, rightKey, joinType, joinPart) = shjInfoOpt.get
+    val jMode = toStageJoinMode(joinType).get
+
+    val leftIdToOrd = leftPlan.output.zipWithIndex.map { case (a, i) => a.exprId -> i }.toMap
+    val rightIdToOrd = rightPlan.output.zipWithIndex.map { case (a, i) => a.exprId -> i }.toMap
+    val leftKeyOrd = leftIdToOrd.getOrElse(leftKey.exprId, return None)
+    val rightKeyOrd = rightIdToOrd.getOrElse(rightKey.exprId, return None)
+
+    val leftSlotMap = mutable.LinkedHashMap.empty[Int, Int]
+    val rightSlotMap = mutable.LinkedHashMap.empty[Int, Int]
+    def allocLeft(ord: Int): Int = leftSlotMap.getOrElseUpdate(ord, leftSlotMap.size)
+    def allocRight(ord: Int): Int = rightSlotMap.getOrElseUpdate(ord, rightSlotMap.size)
+    allocLeft(leftKeyOrd)
+
+    val outExprs = top.output.map(a => GpuLencFusedAgg.inlineProjectMap(a, topProjMap))
+    def collectCols(e: Expression): Boolean = {
+      var ok = true
+      e.foreach {
+        case a: Attribute =>
+          leftIdToOrd.get(a.exprId) match {
+            case Some(ord) if isCodegenLeafType(a.dataType) || a.dataType == StringType => allocLeft(ord)
+            case Some(_) => ok = false
+            case None if jMode == JoinInner =>
+              rightIdToOrd.get(a.exprId) match {
+                case Some(ord) if isCodegenLeafType(a.dataType) || a.dataType == StringType => allocRight(ord)
+                case _ => ok = false
+              }
+            case None => ok = false
+          }
+        case _ =>
+      }
+      ok
+    }
+    if (postFilterOpt.exists(e => !collectCols(e))) return None
+    if (outExprs.exists(e => !collectCols(e))) return None
+    if (leftSlotMap.size > MAX_FACT_COLS || rightSlotMap.size > MAX_DIM_COLS) return None
+
+    val initialEnv: VarEnv = leftSlotMap.map { case (ord, slot) =>
+      val a = leftPlan.output(ord)
+      a.exprId -> FactCol(slot, a.dataType)
+    }.toMap
+    val rightBindings = if (jMode == JoinInner) {
+      rightSlotMap.map { case (ord, slot) =>
+        val a = rightPlan.output(ord)
+        (a.exprId, slot, a.dataType)
+      }.toSeq
+    } else Seq.empty
+
+    val ops = mutable.ArrayBuffer[StageOp](HashProbeOp(0, leftKey, rightBindings, jMode))
+    postFilterOpt.foreach(pe => ops += FilterOp(pe))
+
+    val (countBody, scatterBody) = StageCompiler.compileTwoPass(
+      initialEnv, ops.toSeq, partExprsOpt = None, outExprs).getOrElse(return None)
+
+    val targetBatchBytes = new RapidsConf(SQLConf.get).gpuTargetBatchSizeBytes
+    def isRawShuffleOutput(p: SparkPlan): Boolean = p match {
+      case _: GpuShuffleExchangeExecBase => true
+      case _: org.apache.spark.sql.execution.adaptive.ShuffleQueryStageExec => true
+      case _: org.apache.spark.sql.execution.adaptive.AQEShuffleReadExec => true
+      case _: org.apache.spark.sql.rapids.execution.GpuCustomShuffleReaderExec => true
+      case _ => false
+    }
+    val gpuLeft = if (isRawShuffleOutput(leftPlan)) GpuShuffleCoalesceExec(leftPlan, targetBatchBytes) else leftPlan
+    val gpuRight = if (isRawShuffleOutput(rightPlan)) GpuShuffleCoalesceExec(rightPlan, targetBatchBytes) else rightPlan
+
+    Some(GpuWholeStageShuffledJoinExec(
+      output = top.output,
+      left = gpuLeft,
+      right = gpuRight,
+      leftOrds = leftSlotMap.keys.toArray,
+      rightKeyOrd = rightKeyOrd,
+      rightPayloadOrds = rightSlotMap.keys.toArray,
+      isAnti = joinType == LeftAnti,
+      outTypes = top.output.map(_.dataType).toArray,
+      preservedPartitioning = joinPart,
+      countCudaBody = countBody,
+      scatterCudaBody = scatterBody))
+  }
 }
 
 private object WholeStageProgramPool {
@@ -654,6 +804,7 @@ case class GpuWholeStageStarJoinAggExec(
     dimPlans: Seq[SparkPlan],
     factOrds: Array[Int],
     dimKeyOrds: Array[Int],
+    dimIsAnti: Array[Boolean],
     dimColTableIdx: Array[Int],
     dimColOrd: Array[Int],
     dimColIsStrDict: Array[Boolean],
@@ -816,6 +967,7 @@ case class GpuWholeStageStarJoinAggExec(
     val dimSchemas = dimPlans.map(_.schema).toArray
     val fOrds = factOrds
     val dKeyOrds = dimKeyOrds
+    val dIsAnti = dimIsAnti
     val dColTbl = dimColTableIdx
     val dColOrd = dimColOrd
     val dColIsStr = dimColIsStrDict
@@ -855,7 +1007,7 @@ case class GpuWholeStageStarJoinAggExec(
             while (d < k && !anyDimEmpty) {
               val db = GpuBroadcastHelper.getBroadcastBatch(bcasts(d), dimSchemas(d))
               dimBatches(d) = db
-              if (db.numRows() == 0) anyDimEmpty = true
+              if (db.numRows() == 0 && !dIsAnti(d)) anyDimEmpty = true
               else {
                 val keyCv = db.column(dKeyOrds(d)).asInstanceOf[GpuColumnVector].getBase
                 probeTables(d) = WholeStageNative.buildProbeTable(keyCv)
@@ -1163,4 +1315,176 @@ case class GpuWholeStageFusedPartitionExec(
 
   override def simpleString(maxFields: Int): String =
     s"GpuWholeStageFusedPartition(dims=${dimPlans.length}, parts=$numPartitions)"
+}
+
+/**
+ * Stage 3: Fused ShuffledHashJoin / ShuffledSymmetricHashJoin (Inner|LeftSemi|LeftAnti) +
+ * Filter + Project MaterializeSink compiled via `StageIR` and executed via libcudf
+ * `run_whole_stage_materialize` (zero intermediate gather_map / cudf::gather / Filter / Project HBM!).
+ */
+case class GpuWholeStageShuffledJoinExec(
+    output: Seq[Attribute],
+    left: SparkPlan,
+    right: SparkPlan,
+    leftOrds: Array[Int],
+    rightKeyOrd: Int,
+    rightPayloadOrds: Array[Int],
+    isAnti: Boolean,
+    outTypes: Array[DataType],
+    preservedPartitioning: Partitioning,
+    countCudaBody: String,
+    scatterCudaBody: String) extends SparkPlan with GpuExec {
+
+  override def children: Seq[SparkPlan] = Seq(left, right)
+
+  override protected def withNewChildrenInternal(newChildren: IndexedSeq[SparkPlan]): SparkPlan =
+    copy(left = newChildren(0), right = newChildren(1))
+
+  override def outputPartitioning: Partitioning = preservedPartitioning
+
+  override def supportsColumnar: Boolean = true
+
+  override protected def doExecute(): RDD[InternalRow] =
+    throw new IllegalStateException("GpuWholeStageShuffledJoinExec executes columnar on GPU only")
+
+  override lazy val additionalMetrics: Map[String, GpuMetric] = Map(
+    OP_TIME_LEGACY -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME_LEGACY)
+  )
+
+  override def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
+    val opTime = allMetrics.getOrElse(OP_TIME_LEGACY, NoopMetric)
+    val numOutputRows = allMetrics.getOrElse(NUM_OUTPUT_ROWS, NoopMetric)
+    val numOutputBatches = allMetrics.getOrElse(NUM_OUTPUT_BATCHES, NoopMetric)
+    val lOrds = leftOrds
+    val rKeyOrd = rightKeyOrd
+    val rPayOrds = rightPayloadOrds
+    val anti = isAnti
+    val oTypes = outTypes
+    val rightTypes = right.output.map(_.dataType).toArray
+    val cBody = countCudaBody
+    val sBody = scatterCudaBody
+
+    left.executeColumnar().zipPartitions(right.executeColumnar()) { (leftIter, rightIter) =>
+      new Iterator[ColumnarBatch] {
+        private var initialized = false
+        private var closed = false
+        private var shortCircuitEmpty = false
+        private var buildBatch: ColumnarBatch = _
+        private var probeTable: WholeStageNative.ProbeTable = _
+        private var probeHandles: Array[Long] = Array.empty
+        private var rightViews: Array[ColumnView] = Array.empty
+        private var nextBatch: ColumnarBatch = _
+
+        Option(TaskContext.get()).foreach { tc =>
+          tc.addTaskCompletionListener[Unit](_ => {
+            if (nextBatch != null) { nextBatch.safeClose(); nextBatch = null }
+            cleanup()
+          })
+        }
+
+        private def cleanup(): Unit = {
+          if (!closed) {
+            closed = true
+            if (probeTable != null) { probeTable.safeClose(); probeTable = null }
+            if (buildBatch != null) { buildBatch.safeClose(); buildBatch = null }
+          }
+        }
+
+        private def initBuildSide(): Unit = {
+          initialized = true
+          GpuSemaphore.acquireIfNecessary(TaskContext.get())
+          opTime.ns {
+            val collected = mutable.ArrayBuffer.empty[ColumnarBatch]
+            try {
+              while (rightIter.hasNext) {
+                val rb = rightIter.next()
+                if (rb.numRows() > 0) collected += rb else rb.close()
+              }
+              if (collected.isEmpty) {
+                if (!anti) {
+                  shortCircuitEmpty = true
+                } else {
+                  buildBatch = GpuColumnVector.emptyBatchFromTypes(rightTypes)
+                  val keyCv = buildBatch.column(rKeyOrd).asInstanceOf[GpuColumnVector].getBase
+                  probeTable = WholeStageNative.buildProbeTable(keyCv)
+                  probeHandles = Array(probeTable.getNativeHandle)
+                  rightViews = Array.empty
+                }
+              } else {
+                buildBatch = if (collected.length == 1) {
+                  val single = collected.head
+                  collected.clear()
+                  single
+                } else {
+                  val tables = collected.map(GpuColumnVector.from)
+                  try {
+                    withResource(CudfTable.concatenate(tables: _*)) { cat =>
+                      GpuColumnVector.from(cat, rightTypes)
+                    }
+                  } finally {
+                    tables.foreach(_.safeClose())
+                    collected.foreach(_.safeClose())
+                    collected.clear()
+                  }
+                }
+                val keyCv = buildBatch.column(rKeyOrd).asInstanceOf[GpuColumnVector].getBase
+                probeTable = WholeStageNative.buildProbeTable(keyCv)
+                probeHandles = Array(probeTable.getNativeHandle)
+                rightViews = rPayOrds.map(o =>
+                  buildBatch.column(o).asInstanceOf[GpuColumnVector].getBase.asInstanceOf[ColumnView])
+              }
+            } finally {
+              collected.foreach(_.safeClose())
+            }
+          }
+          if (shortCircuitEmpty) {
+            while (leftIter.hasNext) { withResource(leftIter.next()) { _ => } }
+            cleanup()
+          }
+        }
+
+        private def advance(): Unit = {
+          if (!initialized) initBuildSide()
+          if (shortCircuitEmpty || closed) return
+          val outDTypes = oTypes.map(GpuColumnVector.getNonNestedRapidsType)
+          val cProg = WholeStageProgramPool.getProgram(cBody, "ws_part_count")
+          val sProg = WholeStageProgramPool.getProgram(sBody, "ws_part_scatter")
+          while (nextBatch == null && leftIter.hasNext) {
+            withResource(leftIter.next()) { lb =>
+              if (lb.numRows() > 0) {
+                opTime.ns {
+                  val lViews = lOrds.map(o =>
+                    lb.column(o).asInstanceOf[GpuColumnVector].getBase.asInstanceOf[ColumnView])
+                  withResource(WholeStageNative.runStageMaterialize(
+                    cProg, sProg, lViews, lb.numRows(), probeHandles, rightViews, outDTypes)) { tbl =>
+                    if (tbl.getRowCount > 0) {
+                      numOutputRows += tbl.getRowCount
+                      numOutputBatches += 1
+                      nextBatch = GpuColumnVector.from(tbl, oTypes)
+                    }
+                  }
+                }
+              }
+            }
+          }
+          if (nextBatch == null) cleanup()
+        }
+
+        override def hasNext: Boolean = {
+          if (nextBatch == null && !closed) advance()
+          nextBatch != null
+        }
+
+        override def next(): ColumnarBatch = {
+          if (!hasNext) throw new NoSuchElementException("empty whole-stage shuffled join")
+          val out = nextBatch
+          nextBatch = null
+          out
+        }
+      }
+    }
+  }
+
+  override def simpleString(maxFields: Int): String =
+    s"GpuWholeStageShuffledJoin(anti=$isAnti, outCols=${output.length})"
 }

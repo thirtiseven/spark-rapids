@@ -169,11 +169,13 @@ object GenericJitReduceCodegen {
       |    int32_t code = (int32_t)unpack_for(c, row);
       |    return (c.dict_remap != nullptr) ? c.dict_remap[code] : code;
       |  }
-      |  if (c.mode == 4) return (int32_t)((const unsigned char*)c.raw_ptr)[row];
-      |  if (c.mode == 5) return (int32_t)((const unsigned short*)c.raw_ptr)[row];
-      |  if (c.mode == 6) return (int32_t)((const signed char*)c.raw_ptr)[row];
-      |  if (c.mode == 7) return (int32_t)((const short*)c.raw_ptr)[row];
-      |  return ((const int32_t*)c.raw_ptr)[row];
+      |  int32_t v;
+      |  if (c.mode == 4) v = (int32_t)((const unsigned char*)c.raw_ptr)[row];
+      |  else if (c.mode == 5) v = (int32_t)((const unsigned short*)c.raw_ptr)[row];
+      |  else if (c.mode == 6) v = (int32_t)((const signed char*)c.raw_ptr)[row];
+      |  else if (c.mode == 7) v = (int32_t)((const short*)c.raw_ptr)[row];
+      |  else v = ((const int32_t*)c.raw_ptr)[row];
+      |  return (c.dict_remap != nullptr) ? c.dict_remap[v] : v;
       |}
       |__device__ __forceinline__ float read_f32(const JitColDesc& c, uint32_t row) {
       |  if (c.mode == 1) return (float)((double)unpack_for(c, row) * c.inv_scale);
@@ -1700,26 +1702,58 @@ case class GpuGenericTableJitReduceExec(
     val kn = kernelName
 
     child.executeColumnar().mapPartitions { iter =>
-      iter.flatMap { batch =>
-        opTime.ns {
-          withResource(batch) { b =>
-            if (b.numRows() == 0) None
-            else {
-              val cols = ords.map(o => b.column(o).asInstanceOf[GpuColumnVector].getBase)
-              withResource(new CudfTable(cols: _*)) { t =>
-                val res = GpuJitReducePool.withProgram(src, kn) { prog =>
-                  prog.runOnTable(t, dlits, gks, mg, ak)
-                }
-                withResource(res) { r =>
-                  if (r.getRowCount > 0) {
-                    numOutputRows += r.getRowCount
-                    numOutputBatches += 1
-                    Some(GenericReduceBatchBuilder.projectBuffers(r, gks.length, obm, obModes, oTypes))
-                  } else None
+      new Iterator[ColumnarBatch] {
+        private var finished = false
+        private var pending: ColumnarBatch = _
+
+        private def computeOnce(): Unit = {
+          finished = true
+          if (!iter.hasNext) return
+          GpuJitReducePool.withProgram(src, kn) { prog =>
+            var acc: com.nvidia.spark.rapids.jni.LencNative.JitReduceTaskAccumulator = null
+            try {
+              while (iter.hasNext) {
+                withResource(iter.next()) { b =>
+                  if (b.numRows() > 0) {
+                    opTime.ns {
+                      if (acc == null) {
+                        acc = prog.openTaskAccumulator(dlits, gks, mg, ak)
+                      }
+                      val cols = ords.map(o => b.column(o).asInstanceOf[GpuColumnVector].getBase)
+                      withResource(new CudfTable(cols: _*)) { t =>
+                        acc.addBatch(t)
+                      }
+                    }
+                  }
                 }
               }
+              if (acc != null) {
+                opTime.ns {
+                  withResource(acc.finish()) { r =>
+                    if (r.getRowCount > 0) {
+                      numOutputRows += r.getRowCount
+                      numOutputBatches += 1
+                      pending = GenericReduceBatchBuilder.projectBuffers(r, gks.length, obm, obModes, oTypes)
+                    }
+                  }
+                }
+              }
+            } finally {
+              if (acc != null) acc.close()
             }
           }
+        }
+
+        override def hasNext: Boolean = {
+          if (!finished) computeOnce()
+          pending != null
+        }
+
+        override def next(): ColumnarBatch = {
+          if (!hasNext) throw new NoSuchElementException("empty reduce result")
+          val out = pending
+          pending = null
+          out
         }
       }
     }

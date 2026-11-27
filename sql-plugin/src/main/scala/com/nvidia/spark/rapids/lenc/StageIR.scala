@@ -467,6 +467,14 @@ object StageIR {
         sb.append("extern \"C\" __global__ void " + kname + "(const WsPartScatterArgs* a) {\n")
         if (isMat && !isScatter) {
           sb.append("  uint32_t local_cnt = 0u;\n")
+        } else if (!isMat && !isScatter) {
+          // Stage 4: Block-Private 256-bin Shared-Mem Histogram (~1 KiB SRAM) eliminating global atomic contention!
+          sb.append("  __shared__ uint32_t s_hist[256];\n")
+          sb.append("  bool use_smem_hist = (a->num_parts <= 256u);\n")
+          sb.append("  if (use_smem_hist) {\n")
+          sb.append("    for (uint32_t i = threadIdx.x; i < a->num_parts; i += blockDim.x) s_hist[i] = 0u;\n")
+          sb.append("    __syncthreads();\n")
+          sb.append("  }\n")
         }
         sb.append("  uint32_t n = a->num_rows;\n")
         sb.append("  for (uint32_t row = blockIdx.x * blockDim.x + threadIdx.x; row < n; row += gridDim.x * blockDim.x) {\n")
@@ -496,7 +504,7 @@ object StageIR {
           if (!ctx.failed) {
             if (!isScatter) {
               if (isMat) sb.append(s"${leafIndent}++local_cnt;\n")
-              else sb.append(s"${leafIndent}atomicAdd(&a->part_counts[$pidExpr], 1u);\n")
+              else sb.append(s"${leafIndent}if (use_smem_hist) atomicAdd(&s_hist[$pidExpr], 1u); else atomicAdd(&a->part_counts[$pidExpr], 1u);\n")
             } else {
               if (isMat) sb.append(s"${leafIndent}uint32_t dst = ws_warp_alloc_slot(&a->part_counts[0]);\n")
               else sb.append(s"${leafIndent}uint32_t dst = atomicAdd(&a->part_counts[$pidExpr], 1u);\n")
@@ -510,6 +518,13 @@ object StageIR {
         sb.append("  }\n")
         if (isMat && !isScatter) {
           sb.append("  ws_warp_add_count(&a->part_counts[0], local_cnt);\n")
+        } else if (!isMat && !isScatter) {
+          sb.append("  if (use_smem_hist) {\n")
+          sb.append("    __syncthreads();\n")
+          sb.append("    for (uint32_t i = threadIdx.x; i < a->num_parts; i += blockDim.x) {\n")
+          sb.append("      if (s_hist[i] > 0u) atomicAdd(&a->part_counts[i], s_hist[i]);\n")
+          sb.append("    }\n")
+          sb.append("  }\n")
         }
         sb.append("}\n")
         Some(sb.toString())

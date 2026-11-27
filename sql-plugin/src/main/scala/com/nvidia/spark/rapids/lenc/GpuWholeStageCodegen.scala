@@ -20,7 +20,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 import scala.collection.mutable
 
-import ai.rapids.cudf.{ColumnVector, ColumnView, DType, OutOfBoundsPolicy, Scalar, Table => CudfTable}
+import ai.rapids.cudf.{ColumnVector, ColumnView, DeviceMemoryBuffer, DType, HostMemoryBuffer, OutOfBoundsPolicy, Scalar, Table => CudfTable}
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.GpuMetric._
@@ -988,6 +988,21 @@ case class GpuWholeStageStarJoinAggExec(
         buildCompressedVortexPlan(factPlan.asInstanceOf[GpuFileSourceScanExec], fOrds)
       } else None
 
+    // Stage 4 (LshfShuffleSource): When factPlan is GpuShuffleCoalesceExec and LSHF shuffle is on,
+    // consume raw KudoSerializedTableColumn ("LSHF" magic) frames directly in registers via
+    // WholeStageNative.tryAddLshfFrameToAgg (zero HBM shuffle unpack!), falling back transparently
+    // to KudoGpuTableOperator for non-LSHF/LZ4/String frames!
+    val factOutTypes = factPlan.output.map(_.dataType).toArray
+    val directLshfChildOpt: Option[SparkPlan] =
+      if (directVortexOpt.isEmpty &&
+          SQLConf.get.getConfString("spark.rapids.sql.lenc.shuffleEnabled", "false").toBoolean &&
+          fOrds.forall(o => factOutTypes(o) != StringType)) {
+        factPlan match {
+          case sce: GpuShuffleCoalesceExec => Some(sce.child)
+          case _ => None
+        }
+      } else None
+
     def runTask(
         vortexSplitOpt: Option[(CompressedVortexSplitSpec, Array[String], Array[Int], Array[Int], Array[Int])],
         batchIter: Iterator[ColumnarBatch]): Option[ColumnarBatch] = {
@@ -1063,6 +1078,7 @@ case class GpuWholeStageStarJoinAggExec(
                 }
               }
             case None =>
+              lazy val fallbackKudoOp = new KudoGpuTableOperator(factOutTypes)
               while (batchIter.hasNext) {
                 withResource(batchIter.next()) { b =>
                   if (b.numRows() > 0) {
@@ -1070,8 +1086,34 @@ case class GpuWholeStageStarJoinAggExec(
                       if (taskState == null) {
                         taskState = prog.openHashAggTask(nKeyDTypes, aKinds, initCap)
                       }
-                      val factViews = fOrds.map(o => b.column(o).asInstanceOf[GpuColumnVector].getBase.asInstanceOf[ColumnView])
-                      taskState.addBatch(factViews, b.numRows(), probeHandles, dimViews)
+                      if (b.numCols() == 1 && b.column(0).isInstanceOf[KudoSerializedTableColumn]) {
+                        val kudoCol = b.column(0).asInstanceOf[KudoSerializedTableColumn]
+                        val skt = kudoCol.spillableKudoTable
+                        var consumedZeroUnpack = false
+                        if (skt.header.getTotalDataLen >= 16L && skt.peekMagicInt() == 0x4648534C) {
+                          val len = skt.header.getTotalDataLen
+                          withResource(HostMemoryBuffer.allocate(math.max(len, 8L))) { hBuf =>
+                            skt.materializeInto(hBuf, 0L)
+                            withResource(DeviceMemoryBuffer.allocate(hBuf.getLength)) { dBuf =>
+                              dBuf.copyFromHostBuffer(hBuf)
+                              consumedZeroUnpack = WholeStageNative.tryAddLshfFrameToAgg(
+                                taskState, hBuf.getAddress, len, dBuf.getAddress, len,
+                                fOrds, probeHandles, dimViews)
+                            }
+                          }
+                        }
+                        if (!consumedZeroUnpack) {
+                          withResource(fallbackKudoOp.concat(Array(kudoCol))) { decoded =>
+                            if (decoded.numRows() > 0) {
+                              val fv = fOrds.map(o => decoded.column(o).asInstanceOf[GpuColumnVector].getBase.asInstanceOf[ColumnView])
+                              taskState.addBatch(fv, decoded.numRows(), probeHandles, dimViews)
+                            }
+                          }
+                        }
+                      } else {
+                        val factViews = fOrds.map(o => b.column(o).asInstanceOf[GpuColumnVector].getBase.asInstanceOf[ColumnView])
+                        taskState.addBatch(factViews, b.numRows(), probeHandles, dimViews)
+                      }
                     }
                   }
                 }
@@ -1129,7 +1171,8 @@ case class GpuWholeStageStarJoinAggExec(
         }
 
       case None =>
-        factPlan.executeColumnar().mapPartitions { iter =>
+        val inputRdd = directLshfChildOpt.map(_.executeColumnar()).getOrElse(factPlan.executeColumnar())
+        inputRdd.mapPartitions { iter =>
           new Iterator[ColumnarBatch] {
             private var finished = false
             private var pending: ColumnarBatch = _

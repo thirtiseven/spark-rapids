@@ -260,9 +260,9 @@ class GpuVortexFilePartitionReader(
         }
       }
 
-      // Path A2: Batched Multi-File GPU Decode — pops up to 64 small daily files in ONE JNI call,
-      // concatenates data columns in ONE fused GPU kernel (with exact __popc null_count & async
-      // zero-sync input release), and synthesizes any requested partition columns from RLE runs!
+      // Path A-Deep: Multi-stream pre-allocated direct-into-output multi-file GPU decode!
+      // Pops up to 64 small files, decodes concurrently across up to 8 CUDA streams into ONE
+      // pre-allocated zero-copy ArrowDeviceArray, and wraps columns with ZERO cudf::concatenate!
       val bt = gpuDecodeTime.ns {
         activeScan.nextBatchedMultiFile(64, 32000000L, targetCoalesceBytes)
       }
@@ -272,45 +272,44 @@ class GpuVortexFilePartitionReader(
         activeScan = null
         return false
       }
-      withResource(bt.table) { dataTbl =>
-        val totalRows = dataTbl.getRowCount.toInt
-        if (totalRows <= 0) return next()
-        if (outTypes.isEmpty) {
-          currentBatch = new ColumnarBatch(Array.empty, totalRows)
-          numOutputBatches += 1
-          return true
+      val cvs = bt.columns
+      val totalRows = if (cvs.nonEmpty) cvs(0).getRowCount.toInt else 0
+      if (totalRows <= 0) {
+        cvs.safeClose()
+        return next()
+      }
+      if (outTypes.isEmpty) {
+        cvs.safeClose()
+        currentBatch = new ColumnarBatch(Array.empty, totalRows)
+        numOutputBatches += 1
+        return true
+      }
+      val nData = dataTypes.length
+      val nPart = partTypes.length
+      val gpuCols = new Array[org.apache.spark.sql.vectorized.ColumnVector](nData + nPart)
+      var ok = false
+      try {
+        var i = 0
+        while (i < nData) {
+          gpuCols(i) = GpuColumnVector.from(cvs(i), dataTypes(i))
+          cvs(i) = null
+          i += 1
         }
-        if (partTypes.isEmpty) {
-          currentBatch = GpuColumnVector.from(dataTbl, dataTypes)
-          numOutputBatches += 1
-          outputBytes += GpuColumnVector.getTotalDeviceMemoryUsed(currentBatch)
-          return true
+        var p = 0
+        while (p < nPart) {
+          val pCol = buildPartitionColFromRuns(p, partTypes(p), bt.fileIndices, bt.rowCounts)
+          gpuCols(nData + p) = GpuColumnVector.from(pCol, partTypes(p))
+          p += 1
         }
-        val nData = dataTypes.length
-        val nPart = partTypes.length
-        val gpuCols = new Array[org.apache.spark.sql.vectorized.ColumnVector](nData + nPart)
-        var ok = false
-        try {
-          var i = 0
-          while (i < nData) {
-            gpuCols(i) = GpuColumnVector.from(dataTbl.getColumn(i).incRefCount(), dataTypes(i))
-            i += 1
-          }
-          var p = 0
-          while (p < nPart) {
-            val pCol = buildPartitionColFromRuns(p, partTypes(p), bt.fileIndices, bt.rowCounts)
-            gpuCols(nData + p) = GpuColumnVector.from(pCol, partTypes(p))
-            p += 1
-          }
-          currentBatch = new ColumnarBatch(gpuCols, totalRows)
-          numOutputBatches += 1
-          outputBytes += GpuColumnVector.getTotalDeviceMemoryUsed(currentBatch)
-          ok = true
-          true
-        } finally {
-          if (!ok) {
-            gpuCols.foreach(c => if (c != null) c.close())
-          }
+        currentBatch = new ColumnarBatch(gpuCols, totalRows)
+        numOutputBatches += 1
+        outputBytes += GpuColumnVector.getTotalDeviceMemoryUsed(currentBatch)
+        ok = true
+        true
+      } finally {
+        cvs.foreach(c => if (c != null) c.close())
+        if (!ok) {
+          gpuCols.foreach(c => if (c != null) c.close())
         }
       }
     }

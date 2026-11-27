@@ -738,7 +738,6 @@ object GpuWholeStageCodegenRewrite {
     val (countBody, scatterBody) = StageCompiler.compileTwoPass(
       initialEnv, ops.toSeq, partExprsOpt = None, outExprs).getOrElse(return None)
 
-    val targetBatchBytes = new RapidsConf(SQLConf.get).gpuTargetBatchSizeBytes
     def isRawShuffleOutput(p: SparkPlan): Boolean = p match {
       case _: GpuShuffleExchangeExecBase => true
       case _: org.apache.spark.sql.execution.adaptive.ShuffleQueryStageExec => true
@@ -746,13 +745,16 @@ object GpuWholeStageCodegenRewrite {
       case _: org.apache.spark.sql.rapids.execution.GpuCustomShuffleReaderExec => true
       case _ => false
     }
-    val gpuLeft = if (isRawShuffleOutput(leftPlan)) GpuShuffleCoalesceExec(leftPlan, targetBatchBytes) else leftPlan
-    val gpuRight = if (isRawShuffleOutput(rightPlan)) GpuShuffleCoalesceExec(rightPlan, targetBatchBytes) else rightPlan
+    // Preserve RAPIDS pipelined shuffle-join streaming and AQE dynamic broadcast conversion
+    // when either side is a raw serialized shuffle output.
+    if (isRawShuffleOutput(leftPlan) || isRawShuffleOutput(rightPlan)) {
+      return None
+    }
 
     Some(GpuWholeStageShuffledJoinExec(
       output = top.output,
-      left = gpuLeft,
-      right = gpuRight,
+      left = leftPlan,
+      right = rightPlan,
       leftOrds = leftSlotMap.keys.toArray,
       rightKeyOrd = rightKeyOrd,
       rightPayloadOrds = rightSlotMap.keys.toArray,

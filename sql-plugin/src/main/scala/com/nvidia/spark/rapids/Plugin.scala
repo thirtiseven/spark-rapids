@@ -748,6 +748,36 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
         logInfo("Initializing memory from Executor Plugin")
         GpuDeviceManager.initializeGpuAndMemory(pluginContext.resources().asScala.toMap, conf,
           numCores)
+        // Milestone 4: Async background libnvcxx PCH pre-warm at Executor startup (zero disk persistence,
+        // overlaps 18 MiB PCH creation with Executor registration & Driver 12,080-file listing!).
+        val warmupJit = conf.isProjectAstJitEnabled ||
+          sparkConf.getBoolean("spark.rapids.sql.joinAstJitEnabled", false)
+        if (warmupJit) {
+          val warmupThread = new Thread(new Runnable {
+            override def run(): Unit = {
+              try {
+                import ai.rapids.cudf.{ColumnVector, Table => CudfTable}
+                import ai.rapids.cudf.ast.{AstJitProgram, BinaryOperation, BinaryOperator, ColumnReference, TableReference}
+                import com.nvidia.spark.rapids.Arm.withResource
+                withResource(ColumnVector.fromInts(1)) { c0 =>
+                  withResource(new CudfTable(c0)) { t =>
+                    val expr = new BinaryOperation(
+                      BinaryOperator.ADD,
+                      new ColumnReference(0, TableReference.LEFT),
+                      new ColumnReference(0, TableReference.LEFT))
+                    withResource(expr.compileJit()) { compiled =>
+                      withResource(AstJitProgram.compile(t, compiled)) { _ => }
+                    }
+                  }
+                }
+              } catch {
+                case _: Throwable => // best-effort background warmup
+              }
+            }
+          }, "rapids-libnvcxx-pch-warmup")
+          warmupThread.setDaemon(true)
+          warmupThread.start()
+        }
         if (GpuShuffleEnv.isRapidsShuffleAvailable(conf)) {
           GpuShuffleEnv.initShuffleManager()
         }

@@ -367,6 +367,9 @@ object StageIR {
                     sb.append(s"$indent    ws_atomic_min_i64(&a->ht_i64[base_off + ${ai}u], (int64_t)($vv)); atomicAdd(&a->ht_cnt[base_off + ${ai}u], 1ULL);\n")
                   case GenericJitReduceCodegen.AGG_MAX_I64 =>
                     sb.append(s"$indent    ws_atomic_max_i64(&a->ht_i64[base_off + ${ai}u], (int64_t)($vv)); atomicAdd(&a->ht_cnt[base_off + ${ai}u], 1ULL);\n")
+                  case GenericJitReduceCodegen.AGG_SUM_DEC128 =>
+                    sb.append(s"$indent    ws_atomic_add_i128(a, base_off + ${ai}u, (int64_t)($vv));\n")
+                    sb.append(s"$indent    atomicAdd(&a->ht_cnt[base_off + ${ai}u], 1ULL);\n")
                 }
                 sb.append(s"$indent  }\n")
                 sb.append(s"${indent}}\n")

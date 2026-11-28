@@ -96,6 +96,7 @@ object GenericJitReduceCodegen {
   val AGG_MAX_F64: Byte = 4
   val AGG_MIN_I64: Byte = 5
   val AGG_MAX_I64: Byte = 6
+  val AGG_SUM_DEC128: Byte = 7
 
   private val CUDA_PREAMBLE: String =
     """typedef unsigned char uint8_t;
@@ -1250,7 +1251,8 @@ object GpuLencFusedAgg {
 
   private[lenc] def extractAggTermsAndBufferMap(
       gpuAggs: Seq[GpuAggregateExpression],
-      projMap: Map[ExprId, Expression]): Option[(Seq[GenericAggTerm], Array[Int], Array[Byte])] = {
+      projMap: Map[ExprId, Expression],
+      allowDec128: Boolean = false): Option[(Seq[GenericAggTerm], Array[Int], Array[Byte])] = {
     // Each Spark partial aggregate may emit 1 (SUM/COUNT/MIN/MAX) or 2 (AVG: sum+count, DecimalSum: sum+isEmpty) buffer cols
     val terms = mutable.ArrayBuffer.empty[GenericAggTerm]
     val outBufToTerm = mutable.ArrayBuffer.empty[Int]
@@ -1287,20 +1289,21 @@ object GpuLencFusedAgg {
             case d: DecimalType => d
             case _ => return None
           }
-          // Safe for int64_t per-batch accumulation when output expression has scale == bufDt.scale
-          // and all leaf decimal input columns fit in DECIMAL32 (p <= 9, e.g. NDS DECIMAL(7,2))!
+          val maxLeafPrec = if (allowDec128 && ds.isInstanceOf[GpuDecimal128Sum]) 18 else 9
           val leafDecimalsSafe = rawCh.collect {
             case a: Attribute => a.dataType
           }.forall {
-            case d: DecimalType => d.precision <= 9
+            case d: DecimalType => d.precision <= maxLeafPrec
             case _ => true
           }
+          val useDec128 = allowDec128 && ds.isInstanceOf[GpuDecimal128Sum]
           rawCh.dataType match {
-            case d: DecimalType if d.precision <= 38 && d.scale == bufDt.scale && leafDecimalsSafe =>
+            case d: DecimalType if d.precision <= (if (useDec128) 18 else 38) && d.scale == bufDt.scale && leafDecimalsSafe =>
             case _ => return None
           }
           val ch = applyFilter(rawCh, fOpt)
-          val tid = addTerm(GenericAggTerm(GenericJitReduceCodegen.AGG_SUM_I64, Some(ch)))
+          val kind = if (useDec128) GenericJitReduceCodegen.AGG_SUM_DEC128 else GenericJitReduceCodegen.AGG_SUM_I64
+          val tid = addTerm(GenericAggTerm(kind, Some(ch)))
           outBufToTerm += tid; outBufModes += BUF_DEC_SUM
           outBufToTerm += tid; outBufModes += BUF_DEC_IS_EMPTY
 
@@ -1653,12 +1656,24 @@ private[lenc] object GenericReduceBatchBuilder {
     val typedCol = mode match {
       case GpuLencFusedAgg.BUF_DEC_SUM =>
         val scale = outTypes(i).asInstanceOf[DecimalType].scale
-        val dec64Type = DType.create(DType.DTypeEnum.DECIMAL64, -scale)
-        withResource(Scalar.fromLong(0L)) { zero =>
-          withResource(cv.replaceNulls(zero)) { nonNullI64 =>
-            withResource(nonNullI64.bitCastTo(dec64Type)) { dec64 =>
-              if (expectedDType != dec64Type) dec64.castTo(expectedDType)
-              else dec64.copyToColumnVector()
+        if (cv.getType.getTypeId == DType.DTypeEnum.DECIMAL128) {
+          val dec128Type = DType.create(DType.DTypeEnum.DECIMAL128, -scale)
+          withResource(Scalar.fromDecimal(0, java.math.BigInteger.ZERO)) { zero =>
+            withResource(cv.replaceNulls(zero)) { nonNull128 =>
+              withResource(nonNull128.bitCastTo(dec128Type)) { dec128 =>
+                if (expectedDType != dec128Type) dec128.castTo(expectedDType)
+                else dec128.copyToColumnVector()
+              }
+            }
+          }
+        } else {
+          val dec64Type = DType.create(DType.DTypeEnum.DECIMAL64, -scale)
+          withResource(Scalar.fromLong(0L)) { zero =>
+            withResource(cv.replaceNulls(zero)) { nonNullI64 =>
+              withResource(nonNullI64.bitCastTo(dec64Type)) { dec64 =>
+                if (expectedDType != dec64Type) dec64.castTo(expectedDType)
+                else dec64.copyToColumnVector()
+              }
             }
           }
         }

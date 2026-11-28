@@ -868,6 +868,36 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
    * the DPP-side broadcast is rewritten to ReusedExchangeExec referencing the join-side
    * instance.
    */
+  /**
+   * Milestone 3 (Shared Multi-Consumer GPU Exchange Reuse): Deduplicates identical main-plan
+   * GpuShuffleExchangeExecBase instances whose canonical child matches after stripping
+   * GpuCoalesceBatches wrappers (e.g. multi-branch CTEs in Q23/Q4/Q11/Q14/Q24/Q64).
+   */
+  private def fixupDuplicateGpuShuffleReuse(p: SparkPlan): SparkPlan = {
+    def stripCoalesce(plan: SparkPlan): SparkPlan = plan match {
+      case g: GpuCoalesceBatches => stripCoalesce(g.child)
+      case other => other.withNewChildren(other.children.map(stripCoalesce))
+    }
+    def sig(g: GpuShuffleExchangeExecBase): (SparkPlan, Seq[org.apache.spark.sql.types.DataType]) =
+      (stripCoalesce(g).canonicalized, g.output.map(_.dataType))
+
+    val seen = mutable.HashMap.empty[(SparkPlan, Seq[org.apache.spark.sql.types.DataType]), GpuShuffleExchangeExecBase]
+    def dedup(plan: SparkPlan): SparkPlan = plan.transformUp {
+      case g: GpuShuffleExchangeExecBase =>
+        val key = sig(g)
+        seen.get(key) match {
+          case Some(first) if !(first eq g) => ReusedExchangeExec(g.output, first)
+          case _ =>
+            seen.put(key, g)
+            g
+        }
+    }
+    p match {
+      case e: Exchange => e.mapChildren(dedup)
+      case _ => dedup(p)
+    }
+  }
+
   private[rapids] def fixupNonAdaptiveBroadcastReuse(p: SparkPlan): SparkPlan = {
     // Normalize a plan for signature matching by removing GpuCoalesceBatches wraps. The main-plan
     // broadcast picks these up from insertCoalesce / optimizeCoalesce but the DPP-side broadcast
@@ -1017,6 +1047,9 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
         if (rapidsConf.isAqeExchangeReuseFixupEnabled &&
             plan.conf.adaptiveExecutionEnabled && plan.conf.exchangeReuseEnabled) {
           updatedPlan = fixupAdaptiveExchangeReuse(updatedPlan)
+        }
+        if (plan.conf.exchangeReuseEnabled) {
+          updatedPlan = fixupDuplicateGpuShuffleReuse(updatedPlan)
         }
         if (rapidsConf.isNonAqeBroadcastReuseFixupEnabled &&
             !plan.conf.adaptiveExecutionEnabled && plan.conf.exchangeReuseEnabled) {

@@ -327,7 +327,7 @@ object GpuWholeStageCodegenRewrite {
     }
 
     val (rawTerms, outBufToTerm, outBufModes) =
-      GpuLencFusedAgg.extractAggTermsAndBufferMap(agg.aggregateExpressions, topProjMap).getOrElse(return None)
+      GpuLencFusedAgg.extractAggTermsAndBufferMap(agg.aggregateExpressions, topProjMap, allowDec128 = true).getOrElse(return None)
     if (rawTerms.isEmpty || rawTerms.length > MAX_AGGS) return None
 
     val groupExprs = agg.groupingExpressions.map(g => rewriteAliases(GpuLencFusedAgg.inlineProjectMap(g, topProjMap)))

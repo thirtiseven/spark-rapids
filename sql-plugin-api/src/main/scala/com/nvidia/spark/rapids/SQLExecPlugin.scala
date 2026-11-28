@@ -30,6 +30,12 @@ class SQLExecPlugin extends (SparkSessionExtensions => Unit) {
     extensions.injectColumnar(columnarOverrides)
     extensions.injectQueryStagePrepRule(queryStagePrepOverrides)
     extensions.injectPlannerStrategy(_ => strategyRules)
+    extensions.injectOptimizerRule(runtimeBloomFilterRule)
+  }
+
+  private def runtimeBloomFilterRule(
+      sparkSession: SparkSession): Rule[org.apache.spark.sql.catalyst.plans.logical.LogicalPlan] = {
+    ShimLoader.newGpuRuntimeBloomFilterRule(sparkSession)
   }
 
   private def columnarOverrides(sparkSession: SparkSession): ColumnarRule = {

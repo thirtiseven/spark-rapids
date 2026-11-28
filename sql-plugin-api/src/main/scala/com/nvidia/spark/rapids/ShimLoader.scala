@@ -352,6 +352,15 @@ object ShimLoader {
     constructor.newInstance(ss).asInstanceOf[Rule[SparkPlan]]
   }
 
+  def newGpuRuntimeBloomFilterRule(
+      ss: SparkSession): Rule[org.apache.spark.sql.catalyst.plans.logical.LogicalPlan] = {
+    val clz = ShimReflectionUtils.loadClass(
+      "com.nvidia.spark.rapids.lenc.GpuInjectRuntimeBloomFilter")
+    val constructor = clz.getConstructor(classOf[SparkSession])
+    constructor.newInstance(ss)
+      .asInstanceOf[Rule[org.apache.spark.sql.catalyst.plans.logical.LogicalPlan]]
+  }
+
   def newUdfLogicalPlanRules(): Rule[LogicalPlan] = {
     ShimReflectionUtils.newInstanceOf("com.nvidia.spark.udf.LogicalPlanRules")
   }

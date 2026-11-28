@@ -62,14 +62,22 @@ object GpuJitReducePool {
 
   def withProgram[T](
       cudaSrc: String,
-      kernelName: String)(body: LencNative.JitReduceProgram => T): T = {
+      kernelName: String,
+      precompiledPtx: Array[Byte] = null)(body: LencNative.JitReduceProgram => T): T = {
+    def createProg(): LencNative.JitReduceProgram = {
+      if (precompiledPtx != null && precompiledPtx.nonEmpty) {
+        LencNative.loadJitReduceFromPtx(precompiledPtx, kernelName)
+      } else {
+        LencNative.compileJitReduce(cudaSrc, kernelName)
+      }
+    }
     val existing = programs.get(cudaSrc)
     if (existing != null) {
       body(existing)
     } else if (programs.size() >= MAX_KEYS) {
-      withResource(LencNative.compileJitReduce(cudaSrc, kernelName))(body)
+      withResource(createProg())(body)
     } else {
-      val prog = programs.computeIfAbsent(cudaSrc, _ => LencNative.compileJitReduce(cudaSrc, kernelName))
+      val prog = programs.computeIfAbsent(cudaSrc, _ => createProg())
       body(prog)
     }
   }
@@ -1490,6 +1498,14 @@ object GpuLencFusedAgg {
         case other => (other, None)
       }
 
+    // Tiny-input skip gate: avoid paying per-Executor NVRTC compile latency on <16 MiB tables
+    basePlan match {
+      case fsse: org.apache.spark.sql.rapids.GpuFileSourceScanExec =>
+        val sz = try { fsse.relation.location.sizeInBytes } catch { case _: Throwable => -1L }
+        if (sz > 0L && sz < 16L * 1024L * 1024L) return None
+      case _ =>
+    }
+
     // Mode 0: Global Conditional Reduce (0 group keys)
     if (gpuGrouping.isEmpty) {
       // Let GpuWholeStageCodegenRewrite fuse direct non-partitioned V1 Vortex global aggs so
@@ -1613,9 +1629,10 @@ object GpuLencFusedAgg {
               case _ =>
             }
             val aggKinds = boundTerms.map(_.kind).toArray
+            val ptx = LencNative.tryCompileJitReduceToPtxCpuOnly(cudaSrc, kname)
             GpuGenericTableJitReduceExec(
               outAttrs, basePlan, inputOrds, dictLits, gkSlots, maxGroups,
-              aggKinds, outBufToTerm, outBufModes, outTypes, cudaSrc, kname)
+              aggKinds, outBufToTerm, outBufModes, outTypes, cudaSrc, kname, ptx)
         }
     }
   }
@@ -1693,7 +1710,8 @@ case class GpuGenericTableJitReduceExec(
     outBufModes: Array[Byte],
     outTypes: Array[DataType],
     cudaSrc: String,
-    kernelName: String) extends UnaryExecNode with GpuExec {
+    kernelName: String,
+    precompiledPtx: Array[Byte] = null) extends UnaryExecNode with GpuExec {
 
   override def supportsColumnar: Boolean = true
 
@@ -1718,6 +1736,7 @@ case class GpuGenericTableJitReduceExec(
     val oTypes = outTypes
     val src = cudaSrc
     val kn = kernelName
+    val ptx = precompiledPtx
 
     child.executeColumnar().mapPartitions { iter =>
       new Iterator[ColumnarBatch] {
@@ -1727,7 +1746,7 @@ case class GpuGenericTableJitReduceExec(
         private def computeOnce(): Unit = {
           finished = true
           if (!iter.hasNext) return
-          GpuJitReducePool.withProgram(src, kn) { prog =>
+          GpuJitReducePool.withProgram(src, kn, ptx) { prog =>
             var acc: com.nvidia.spark.rapids.jni.LencNative.JitReduceTaskAccumulator = null
             try {
               while (iter.hasNext) {
@@ -1795,7 +1814,8 @@ case class GpuGenericHighCardJitAggExec(
     outBufModes: Array[Byte],
     outTypes: Array[DataType],
     cudaSrc: String,
-    kernelName: String) extends UnaryExecNode with GpuExec {
+    kernelName: String,
+    precompiledPtx: Array[Byte] = null) extends UnaryExecNode with GpuExec {
 
   override def supportsColumnar: Boolean = true
 

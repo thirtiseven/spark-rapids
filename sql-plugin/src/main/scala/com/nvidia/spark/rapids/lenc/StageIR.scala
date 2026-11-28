@@ -59,6 +59,20 @@ object StageIR {
       idSeq
     }
     var failed: Boolean = false
+    var usesFsst: Boolean = false
+    val constBits: mutable.ArrayBuffer[Long] = mutable.ArrayBuffer.empty[Long]
+    private val constIndexMap = mutable.HashMap.empty[Long, Int]
+    def allocConst(bits: Long): Option[Int] = {
+      constIndexMap.get(bits) match {
+        case Some(idx) => Some(idx)
+        case None if constBits.length < 64 =>
+          val idx = constBits.length
+          constBits += bits
+          constIndexMap.put(bits, idx)
+          Some(idx)
+        case None => None
+      }
+    }
   }
 
   /** Composable register-level pipeline operator (Neumann Produce/Consume). */
@@ -384,7 +398,8 @@ object StageIR {
     def compileAgg(
         initialEnv: VarEnv,
         ops: Seq[StageOp],
-        sink: HashAggSink): Option[(String, String)] = {
+        sink: HashAggSink,
+        extraPreambleFlags: Int = 0): Option[(String, String, Array[Long], Int)] = {
       val kname = "ws_stage_agg"
       val hasMultiMatch = ops.exists {
         case HashProbeOp(_, _, _, JoinInner) => true
@@ -421,7 +436,10 @@ object StageIR {
         sb.append("  ws_smem_flush_f64(sm_hot, a, 0u);\n")
       }
       sb.append("}\n")
-      Some((sb.toString(), kname))
+      var pFlags = extraPreambleFlags
+      if (ctx.usesFsst) pFlags |= com.nvidia.spark.rapids.jni.WholeStageNative.PREAMBLE_FSST
+      if (smMode > 0) pFlags |= com.nvidia.spark.rapids.jni.WholeStageNative.PREAMBLE_SMEM
+      Some((sb.toString(), kname, ctx.constBits.toArray, pFlags))
     }
 
     private def emitStoreCol(
@@ -458,11 +476,13 @@ object StageIR {
         initialEnv: VarEnv,
         ops: Seq[StageOp],
         partExprsOpt: Option[Seq[Expression]],
-        outExprs: Seq[Expression]): Option[(String, String)] = {
-      def emitOne(isScatter: Boolean): Option[String] = {
+        outExprs: Seq[Expression]): Option[(String, String, Array[Long], Int)] = {
+      val sharedConstCtx = new CodegenCtx(isAggKernel = false, hasMultiMatch = false)
+      def emitOne(isScatter: Boolean): Option[(String, Boolean)] = {
         val kname = if (isScatter) "ws_part_scatter" else "ws_part_count"
         val isMat = partExprsOpt.isEmpty
-        val ctx = new CodegenCtx(isAggKernel = false, hasMultiMatch = false)
+        val ctx = sharedConstCtx
+        ctx.failed = false
         val sb = new StringBuilder()
         sb.append("extern \"C\" __global__ void " + kname + "(const WsPartScatterArgs* a) {\n")
         if (isMat && !isScatter) {
@@ -527,12 +547,17 @@ object StageIR {
           sb.append("  }\n")
         }
         sb.append("}\n")
-        Some(sb.toString())
+        Some((sb.toString(), ctx.usesFsst))
       }
       for {
-        c <- emitOne(isScatter = false)
-        s <- emitOne(isScatter = true)
-      } yield (c, s)
+        (c, fsst1) <- emitOne(isScatter = false)
+        (s, fsst2) <- emitOne(isScatter = true)
+      } yield {
+        var pFlags = 0
+        if (fsst1 || fsst2) pFlags |= com.nvidia.spark.rapids.jni.WholeStageNative.PREAMBLE_FSST
+        if (partExprsOpt.isDefined) pFlags |= com.nvidia.spark.rapids.jni.WholeStageNative.PREAMBLE_MURMUR3
+        (c, s, sharedConstCtx.constBits.toArray, pFlags)
+      }
     }
   }
 }
@@ -586,6 +611,7 @@ object StageExprEmitter {
       case DimCol(dimIdx, slot, StringType) => Some((s"a->dim_cols[$slot]", s"d$dimIdx"))
       case _ => None
     }.map { case (srcExpr, rowVar) =>
+      ctx.usesFsst = true
       val id = ctx.nextId()
       val ok = s"sok$id"
       val vn = s"sv$id"
@@ -670,20 +696,34 @@ object StageExprEmitter {
     }
   }
 
-  private def emitLiteral(v: Any, dt: DataType): Option[(String, String)] = {
+  private def emitLiteral(v: Any, dt: DataType, ctx: CodegenCtx): Option[(String, String)] = {
     if (v == null) {
       cType(dt).map(ct => (s"(($ct)0)", "false"))
     } else dt match {
       case BooleanType => Some((if (v.asInstanceOf[Boolean]) "true" else "false", "true"))
-      case ByteType => Some((s"(int32_t)(${v.asInstanceOf[Byte]})", "true"))
-      case ShortType => Some((s"(int32_t)(${v.asInstanceOf[Short]})", "true"))
-      case IntegerType | DateType => Some((s"(int32_t)(${v.asInstanceOf[Int]})", "true"))
-      case LongType => Some((s"(${v.asInstanceOf[Long]}LL)", "true"))
-      case FloatType => Some((s"((float)${v.asInstanceOf[Float]})", "true"))
-      case DoubleType => Some((s"((double)${v.asInstanceOf[Double]})", "true"))
+      case ByteType =>
+        val raw = v.asInstanceOf[Byte].toLong
+        Some((ctx.allocConst(raw).map(i => s"ws_const_i32(a->const_bits, ${i}u)").getOrElse(s"(int32_t)($raw)"), "true"))
+      case ShortType =>
+        val raw = v.asInstanceOf[Short].toLong
+        Some((ctx.allocConst(raw).map(i => s"ws_const_i32(a->const_bits, ${i}u)").getOrElse(s"(int32_t)($raw)"), "true"))
+      case IntegerType | DateType =>
+        val raw = v.asInstanceOf[Int].toLong
+        Some((ctx.allocConst(raw).map(i => s"ws_const_i32(a->const_bits, ${i}u)").getOrElse(s"(int32_t)($raw)"), "true"))
+      case LongType =>
+        val raw = v.asInstanceOf[Long]
+        Some((ctx.allocConst(raw).map(i => s"ws_const_i64(a->const_bits, ${i}u)").getOrElse(s"(${raw}LL)"), "true"))
+      case FloatType =>
+        val bits = java.lang.Double.doubleToRawLongBits(v.asInstanceOf[Float].toDouble)
+        Some((ctx.allocConst(bits).map(i => s"ws_const_f32(a->const_bits, ${i}u)").getOrElse(s"((float)${v.asInstanceOf[Float]})"), "true"))
+      case DoubleType =>
+        val bits = java.lang.Double.doubleToRawLongBits(v.asInstanceOf[Double])
+        Some((ctx.allocConst(bits).map(i => s"ws_const_f64(a->const_bits, ${i}u)").getOrElse(s"((double)${v.asInstanceOf[Double]})"), "true"))
       case d: DecimalType if d.precision <= 18 =>
         val unscaled = v.asInstanceOf[Decimal].toUnscaledLong
-        Some((if (d.precision <= 9) s"(int32_t)(${unscaled}LL)" else s"(${unscaled}LL)", "true"))
+        val fn = if (d.precision <= 9) "ws_const_i32" else "ws_const_i64"
+        val fb = if (d.precision <= 9) s"(int32_t)(${unscaled}LL)" else s"(${unscaled}LL)"
+        Some((ctx.allocConst(unscaled).map(i => s"$fn(a->const_bits, ${i}u)").getOrElse(fb), "true"))
       case _ => None
     }
   }
@@ -724,8 +764,8 @@ object StageExprEmitter {
           }
       }
 
-    case GpuLiteral(v, dt) => emitLiteral(v, dt)
-    case Literal(v, dt) => emitLiteral(v, dt)
+    case GpuLiteral(v, dt) => emitLiteral(v, dt, ctx)
+    case Literal(v, dt) => emitLiteral(v, dt, ctx)
 
     case GpuCoalesce(children) if children.nonEmpty && children.length <= 8 =>
       cType(e.dataType).flatMap { ct =>

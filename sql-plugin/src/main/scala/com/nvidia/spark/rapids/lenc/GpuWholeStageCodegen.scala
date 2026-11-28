@@ -164,6 +164,19 @@ object GpuWholeStageCodegenRewrite {
   }
 
   /** Unwinds a star-join + optional filter/project chain into clean StageIR operators! */
+  private def isTinyPlanForJit(plan: SparkPlan): Boolean = {
+    try {
+      plan match {
+        case fsse: GpuFileSourceScanExec =>
+          val sz = fsse.relation.location.sizeInBytes
+          sz > 0L && sz < 16L * 1024L * 1024L
+        case _ => false
+      }
+    } catch {
+      case _: Throwable => false
+    }
+  }
+
   private def tryFuseWholeStageAgg(agg: GpuHashAggregateExec): Option[SparkPlan] = {
     if (agg.aggregateExpressions.isEmpty ||
         !agg.aggregateExpressions.forall(_.mode == Partial) ||
@@ -513,10 +526,20 @@ object GpuWholeStageCodegenRewrite {
       if (groupKeyIsDimStr(gi)) groupKeyDimStrRef(gi)._1 else -1
     }
 
+    val directVortexScan = isDirectCompressedVortexScan(factPlan)
+    if (!directVortexScan && isTinyPlanForJit(factPlan)) {
+      return None
+    }
+    var extraPFlags = 0
+    if (directVortexScan) extraPFlags |= WholeStageNative.PREAMBLE_VORTEX_BP
+    if (factPlan.isInstanceOf[GpuShuffleCoalesceExec]) extraPFlags |= WholeStageNative.PREAMBLE_FOR256
+
     // Activate Step 2 Block Shared-Mem 256-slot hot-key cache on Expand(ROLLUP) & 1-agg grouped stages!
     val enableSmemCache = groupExprs.nonEmpty && cleanTerms.length == 1
     val aggSink = HashAggSink(groupExprs, gkDimStrSlot, gkDimIdx, cleanTerms, useSmemHotCache = enableSmemCache)
-    val (cudaBody, kernelName) = StageCompiler.compileAgg(initialEnv, ops.toSeq, aggSink).getOrElse(return None)
+    val (cudaBody, kernelName, constBits, preambleFlags) =
+      StageCompiler.compileAgg(initialEnv, ops.toSeq, aggSink, extraPFlags).getOrElse(return None)
+    val precompiledPtx = WholeStageNative.tryCompileToPtxCpuOnly(cudaBody, kernelName, preambleFlags)
 
     val outAttrs = agg.output
     val outTypes = outAttrs.map(_.dataType).toArray
@@ -543,7 +566,10 @@ object GpuWholeStageCodegenRewrite {
       outBufModes = outBufModes,
       outTypes = outTypes,
       cudaBody = cudaBody,
-      kernelName = kernelName))
+      kernelName = kernelName,
+      constBits = constBits,
+      preambleFlags = preambleFlags,
+      precompiledPtx = precompiledPtx))
   }
 
   /**
@@ -612,8 +638,10 @@ object GpuWholeStageCodegenRewrite {
       a.exprId -> FactCol(slot, a.dataType)
     }.toMap
     val ops = Seq(FilterOp(factFilterOpt.get))
-    val (countBody, scatterBody) = StageCompiler.compileTwoPass(
+    val (countBody, scatterBody, constBits, preambleFlags) = StageCompiler.compileTwoPass(
       initialEnv, ops, Some(partExprs), outExprs).getOrElse(return None)
+    val countPtx = WholeStageNative.tryCompileToPtxCpuOnly(countBody, "ws_part_count", preambleFlags)
+    val scatterPtx = WholeStageNative.tryCompileToPtxCpuOnly(scatterBody, "ws_part_scatter", preambleFlags)
 
     val fusedChild = GpuWholeStageFusedPartitionExec(
       output = shuf.output,
@@ -626,7 +654,11 @@ object GpuWholeStageCodegenRewrite {
       outTypes = shuf.output.map(_.dataType).toArray,
       numPartitions = hp.numPartitions,
       countCudaBody = countBody,
-      scatterCudaBody = scatterBody)
+      scatterCudaBody = scatterBody,
+      constBits = constBits,
+      preambleFlags = preambleFlags,
+      countPtx = countPtx,
+      scatterPtx = scatterPtx)
 
     Some(shuf.withNewChildren(Seq(fusedChild)))
   }
@@ -735,7 +767,7 @@ object GpuWholeStageCodegenRewrite {
     val ops = mutable.ArrayBuffer[StageOp](HashProbeOp(0, leftKey, rightBindings, jMode))
     postFilterOpt.foreach(pe => ops += FilterOp(pe))
 
-    val (countBody, scatterBody) = StageCompiler.compileTwoPass(
+    val (countBody, scatterBody, constBits, preambleFlags) = StageCompiler.compileTwoPass(
       initialEnv, ops.toSeq, partExprsOpt = None, outExprs).getOrElse(return None)
 
     def isRawShuffleOutput(p: SparkPlan): Boolean = p match {
@@ -750,6 +782,8 @@ object GpuWholeStageCodegenRewrite {
     if (isRawShuffleOutput(leftPlan) || isRawShuffleOutput(rightPlan)) {
       return None
     }
+    val countPtx = WholeStageNative.tryCompileToPtxCpuOnly(countBody, "ws_part_count", preambleFlags)
+    val scatterPtx = WholeStageNative.tryCompileToPtxCpuOnly(scatterBody, "ws_part_scatter", preambleFlags)
 
     Some(GpuWholeStageShuffledJoinExec(
       output = top.output,
@@ -762,18 +796,30 @@ object GpuWholeStageCodegenRewrite {
       outTypes = top.output.map(_.dataType).toArray,
       preservedPartitioning = joinPart,
       countCudaBody = countBody,
-      scatterCudaBody = scatterBody))
+      scatterCudaBody = scatterBody,
+      constBits = constBits,
+      preambleFlags = preambleFlags,
+      countPtx = countPtx,
+      scatterPtx = scatterPtx))
   }
 }
 
 private object WholeStageProgramPool {
   private val cache = new ConcurrentHashMap[String, WholeStageNative.Program]()
 
-  def getProgram(cudaBody: String, kernelName: String): WholeStageNative.Program = {
-    val key = kernelName + ":" + cudaBody
+  def getProgram(
+      cudaBody: String,
+      kernelName: String,
+      preambleFlags: Int = WholeStageNative.PREAMBLE_ALL,
+      precompiledPtx: Array[Byte] = null): WholeStageNative.Program = {
+    val key = preambleFlags.toString + ":" + kernelName + ":" + cudaBody
     var p = cache.get(key)
     if (p == null) {
-      val created = WholeStageNative.compileProgram(cudaBody, kernelName)
+      val created = if (precompiledPtx != null && precompiledPtx.nonEmpty) {
+        WholeStageNative.loadProgramFromPtx(precompiledPtx, kernelName)
+      } else {
+        WholeStageNative.compileProgram(cudaBody, kernelName, preambleFlags)
+      }
       val existing = cache.putIfAbsent(key, created)
       if (existing != null) {
         created.close()
@@ -819,7 +865,10 @@ case class GpuWholeStageStarJoinAggExec(
     outBufModes: Array[Byte],
     outTypes: Array[DataType],
     cudaBody: String,
-    kernelName: String) extends SparkPlan with GpuExec {
+    kernelName: String,
+    constBits: Array[Long] = Array.empty,
+    preambleFlags: Int = WholeStageNative.PREAMBLE_ALL,
+    precompiledPtx: Array[Byte] = null) extends SparkPlan with GpuExec {
 
   override def children: Seq[SparkPlan] = factPlan +: dimPlans
 
@@ -988,6 +1037,9 @@ case class GpuWholeStageStarJoinAggExec(
     val oTypes = outTypes
     val srcBody = cudaBody
     val kName = kernelName
+    val cBits = constBits
+    val pFlags = preambleFlags
+    val prePtx = precompiledPtx
     val numKeys = nativeKeyTypes.length
 
     val directVortexOpt =
@@ -1038,7 +1090,7 @@ case class GpuWholeStageStarJoinAggExec(
             }
           }
         }
-        val prog = WholeStageProgramPool.getProgram(srcBody, kName)
+        val prog = WholeStageProgramPool.getProgram(srcBody, kName, pFlags, prePtx)
         if (anyDimEmpty) {
           while (batchIter.hasNext) { withResource(batchIter.next()) { _ => } }
           if (numKeys == 0) {
@@ -1071,7 +1123,7 @@ case class GpuWholeStageStarJoinAggExec(
           vortexSplitOpt match {
             case Some((sp, fColNames, fColSlots, pConstSlots, pConstWidths)) =>
               opTime.ns {
-                taskState = prog.openHashAggTask(nKeyDTypes, aKinds, initCap)
+                taskState = prog.openHashAggTask(nKeyDTypes, aKinds, initCap, cBits)
                 VortexNative.streamCompressedPathsToWholeStageAgg(
                   sp.paths, fColNames, fOrds.length, fColSlots, pConstSlots, pConstWidths,
                   sp.partConstVals, sp.partConstNulls, taskState, probeHandles, dimViews)
@@ -1091,7 +1143,7 @@ case class GpuWholeStageStarJoinAggExec(
                   if (b.numRows() > 0) {
                     opTime.ns {
                       if (taskState == null) {
-                        taskState = prog.openHashAggTask(nKeyDTypes, aKinds, initCap)
+                        taskState = prog.openHashAggTask(nKeyDTypes, aKinds, initCap, cBits)
                       }
                       if (b.numCols() == 1 && b.column(0).isInstanceOf[KudoSerializedTableColumn]) {
                         val kudoCol = b.column(0).asInstanceOf[KudoSerializedTableColumn]
@@ -1126,7 +1178,7 @@ case class GpuWholeStageStarJoinAggExec(
                 }
               }
               if (taskState == null && numKeys == 0) {
-                taskState = prog.openHashAggTask(nKeyDTypes, aKinds, 1)
+                taskState = prog.openHashAggTask(nKeyDTypes, aKinds, 1, cBits)
               }
               if (taskState != null) {
                 opTime.ns {
@@ -1222,7 +1274,11 @@ case class GpuWholeStageFusedPartitionExec(
     outTypes: Array[DataType],
     numPartitions: Int,
     countCudaBody: String,
-    scatterCudaBody: String) extends SparkPlan with GpuExec {
+    scatterCudaBody: String,
+    constBits: Array[Long] = Array.empty,
+    preambleFlags: Int = WholeStageNative.PREAMBLE_ALL,
+    countPtx: Array[Byte] = null,
+    scatterPtx: Array[Byte] = null) extends SparkPlan with GpuExec {
 
   override def children: Seq[SparkPlan] = factPlan +: dimPlans
 
@@ -1257,6 +1313,10 @@ case class GpuWholeStageFusedPartitionExec(
     val nParts = numPartitions
     val cBody = countCudaBody
     val sBody = scatterCudaBody
+    val cBits = constBits
+    val pFlags = preambleFlags
+    val cPtx = countPtx
+    val sPtx = scatterPtx
 
     factPlan.executeColumnar().mapPartitions { iter =>
       new Iterator[(ColumnarBatch, Array[Int])] {
@@ -1318,8 +1378,8 @@ case class GpuWholeStageFusedPartitionExec(
           if (!initialized) initDims()
           if (anyEmpty || closed) return
           val outDTypes = oTypes.map(GpuColumnVector.getNonNestedRapidsType)
-          val cProg = WholeStageProgramPool.getProgram(cBody, "ws_part_count")
-          val sProg = WholeStageProgramPool.getProgram(sBody, "ws_part_scatter")
+          val cProg = WholeStageProgramPool.getProgram(cBody, "ws_part_count", pFlags, cPtx)
+          val sProg = WholeStageProgramPool.getProgram(sBody, "ws_part_scatter", pFlags, sPtx)
           while (nextItem == null && iter.hasNext) {
             withResource(iter.next()) { b =>
               if (b.numRows() > 0) {
@@ -1327,7 +1387,7 @@ case class GpuWholeStageFusedPartitionExec(
                   val fViews = fOrds.map(o => b.column(o).asInstanceOf[GpuColumnVector].getBase.asInstanceOf[ColumnView])
                   val splits = new Array[Int](nParts)
                   withResource(WholeStageNative.runStagePartitionScatter(
-                    cProg, sProg, fViews, b.numRows(), probeHandles, dimViews, outDTypes, nParts, splits)) { tbl =>
+                    cProg, sProg, fViews, b.numRows(), probeHandles, dimViews, outDTypes, nParts, splits, cBits)) { tbl =>
                     if (tbl.getRowCount > 0) {
                       numOutputRows += tbl.getRowCount
                       numOutputBatches += 1
@@ -1383,7 +1443,11 @@ case class GpuWholeStageShuffledJoinExec(
     outTypes: Array[DataType],
     preservedPartitioning: Partitioning,
     countCudaBody: String,
-    scatterCudaBody: String) extends SparkPlan with GpuExec {
+    scatterCudaBody: String,
+    constBits: Array[Long] = Array.empty,
+    preambleFlags: Int = WholeStageNative.PREAMBLE_ALL,
+    countPtx: Array[Byte] = null,
+    scatterPtx: Array[Byte] = null) extends SparkPlan with GpuExec {
 
   override def children: Seq[SparkPlan] = Seq(left, right)
 
@@ -1413,6 +1477,10 @@ case class GpuWholeStageShuffledJoinExec(
     val rightTypes = right.output.map(_.dataType).toArray
     val cBody = countCudaBody
     val sBody = scatterCudaBody
+    val cBits = constBits
+    val pFlags = preambleFlags
+    val cPtx = countPtx
+    val sPtx = scatterPtx
 
     left.executeColumnar().zipPartitions(right.executeColumnar()) { (leftIter, rightIter) =>
       new Iterator[ColumnarBatch] {
@@ -1497,8 +1565,8 @@ case class GpuWholeStageShuffledJoinExec(
           if (!initialized) initBuildSide()
           if (shortCircuitEmpty || closed) return
           val outDTypes = oTypes.map(GpuColumnVector.getNonNestedRapidsType)
-          val cProg = WholeStageProgramPool.getProgram(cBody, "ws_part_count")
-          val sProg = WholeStageProgramPool.getProgram(sBody, "ws_part_scatter")
+          val cProg = WholeStageProgramPool.getProgram(cBody, "ws_part_count", pFlags, cPtx)
+          val sProg = WholeStageProgramPool.getProgram(sBody, "ws_part_scatter", pFlags, sPtx)
           while (nextBatch == null && leftIter.hasNext) {
             withResource(leftIter.next()) { lb =>
               if (lb.numRows() > 0) {
@@ -1506,7 +1574,7 @@ case class GpuWholeStageShuffledJoinExec(
                   val lViews = lOrds.map(o =>
                     lb.column(o).asInstanceOf[GpuColumnVector].getBase.asInstanceOf[ColumnView])
                   withResource(WholeStageNative.runStageMaterialize(
-                    cProg, sProg, lViews, lb.numRows(), probeHandles, rightViews, outDTypes)) { tbl =>
+                    cProg, sProg, lViews, lb.numRows(), probeHandles, rightViews, outDTypes, cBits)) { tbl =>
                     if (tbl.getRowCount > 0) {
                       numOutputRows += tbl.getRowCount
                       numOutputBatches += 1

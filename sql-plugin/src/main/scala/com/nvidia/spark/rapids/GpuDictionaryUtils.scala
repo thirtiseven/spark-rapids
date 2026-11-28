@@ -124,7 +124,10 @@ object GpuDictionaryUtils {
     }
 
     // Track hash partitioning keys (never keep as DICTIONARY32 so hash_partition hashes UTF-8!)
-    // and String columns carried as non-key shuffle payload below an Aggregate (e.g. o_orderpriority in Q04).
+    // and String columns carried as non-key shuffle payload below compact low-key Aggregates
+    // (<= 2 group keys, e.g. o_orderpriority in TPC-H Q04; never wide high-card / ROLLUP aggs
+    // like TPC-DS Q67 i_product_name or Q23 i_item_desc!).
+    val hasExpandInPlan = plan.find(_.nodeName.contains("Expand")).isDefined
     plan.foreach {
       case shuf: ShuffleExchangeLike =>
         shuf.outputPartitioning match {
@@ -136,9 +139,11 @@ object GpuDictionaryUtils {
         }
       case agg: BaseAggregateExec =>
         val hasShuffleBelow = agg.children.exists(_.find(_.isInstanceOf[ShuffleExchangeLike]).isDefined)
+        val allowShuffleDictGroup =
+          lencShufOn && hasShuffleBelow && !hasExpandInPlan && agg.groupingExpressions.length <= 2
         agg.groupingExpressions.foreach {
           case a: Attribute if a.dataType == StringType =>
-            if (lencShufOn && hasShuffleBelow) {
+            if (allowShuffleDictGroup) {
               shuffleNonKeyGroupCols += a.name
             } else {
               pureGroupCols += a.name

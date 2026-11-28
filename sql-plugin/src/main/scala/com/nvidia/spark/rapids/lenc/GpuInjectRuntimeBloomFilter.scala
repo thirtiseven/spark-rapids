@@ -52,7 +52,9 @@ class GpuInjectRuntimeBloomFilter(spark: SparkSession)
     if (!conf.getConfString(CONF_ENABLED, "false").toBoolean) {
       return plan
     }
-    if (!conf.getConfString("spark.rapids.sql.enabled", "true").toBoolean) {
+    if (!conf.getConfString("spark.rapids.sql.enabled", "true").toBoolean ||
+        !conf.getConfString("spark.rapids.sql.expression.BloomFilterMightContain", "true").toBoolean ||
+        !conf.getConfString("spark.rapids.sql.expression.BloomFilterAggregate", "true").toBoolean) {
       return plan
     }
     val minProbeBytes = conf.getConfString(CONF_MIN_PROBE_BYTES, DEFAULT_MIN_PROBE_BYTES.toString).toLong

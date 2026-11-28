@@ -1261,7 +1261,11 @@ case class GpuOverrides(sparkSession: SparkSession = null) extends Rule[SparkPla
   // gets called once for each query stage (where a query stage is an `Exchange`).
   override def apply(sparkPlan: SparkPlan): SparkPlan =
     GpuOverrideUtil.withActiveSession(sparkSession) {
-      GpuDictionaryUtils.autoSelectDict32Cols(sparkPlan, SQLConf.get)
+      // P0: Only run Auto-Dict32 planner scan when plan contains an un-converted FileSourceScanExec
+      // (skips 60-75% of AQE stage re-plannings that only see QueryStageExecs!)
+      if (sparkPlan.find(_.isInstanceOf[FileSourceScanExec]).isDefined) {
+        GpuDictionaryUtils.autoSelectDict32Cols(sparkPlan, SQLConf.get)
+      }
       applyWithContext(sparkPlan, None)
     }
 

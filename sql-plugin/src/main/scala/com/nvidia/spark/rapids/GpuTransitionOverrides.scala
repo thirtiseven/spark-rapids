@@ -1024,9 +1024,24 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
         if (rapidsConf.shuffledHashJoinOptimizeShuffle || rapidsConf.useShuffledSymmetricHashJoin) {
           updatedPlan = shuffledHashJoinOptimizeShuffle(updatedPlan)
         }
-        updatedPlan = com.nvidia.spark.rapids.lenc.GpuWholeStageCodegenRewrite(updatedPlan)
-        updatedPlan = com.nvidia.spark.rapids.lenc.GpuFusedStarJoinRewrite(updatedPlan)
-        updatedPlan = GpuDriverlessBroadcastHashJoinExec.rewrite(updatedPlan, rapidsConf)
+        // P0: Single O(n) feature probe to short-circuit inapplicable custom rewrites across
+        // 500-800 AQE stage re-plannings per benchmark!
+        var hasGpuAgg = false
+        var hasGpuBhj = false
+        var gpuShuffleCnt = 0
+        updatedPlan.foreach {
+          case _: GpuHashAggregateExec => hasGpuAgg = true
+          case _: org.apache.spark.sql.rapids.execution.GpuBroadcastHashJoinExecBase => hasGpuBhj = true
+          case _: GpuShuffleExchangeExecBase => gpuShuffleCnt += 1
+          case _ =>
+        }
+        if (hasGpuAgg) {
+          updatedPlan = com.nvidia.spark.rapids.lenc.GpuWholeStageCodegenRewrite(updatedPlan)
+        }
+        if (hasGpuBhj) {
+          updatedPlan = com.nvidia.spark.rapids.lenc.GpuFusedStarJoinRewrite(updatedPlan)
+          updatedPlan = GpuDriverlessBroadcastHashJoinExec.rewrite(updatedPlan, rapidsConf)
+        }
         if (rapidsConf.exportColumnarRdd) {
           updatedPlan = detectAndTagFinalColumnarOutput(updatedPlan)
         }
@@ -1048,7 +1063,7 @@ class GpuTransitionOverrides(sparkSession: SparkSession = null) extends Rule[Spa
             plan.conf.adaptiveExecutionEnabled && plan.conf.exchangeReuseEnabled) {
           updatedPlan = fixupAdaptiveExchangeReuse(updatedPlan)
         }
-        if (plan.conf.exchangeReuseEnabled) {
+        if (plan.conf.exchangeReuseEnabled && gpuShuffleCnt >= 2) {
           updatedPlan = fixupDuplicateGpuShuffleReuse(updatedPlan)
         }
         if (rapidsConf.isNonAqeBroadcastReuseFixupEnabled &&

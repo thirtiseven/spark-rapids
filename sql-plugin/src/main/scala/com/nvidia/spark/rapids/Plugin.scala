@@ -748,15 +748,15 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
         logInfo("Initializing memory from Executor Plugin")
         GpuDeviceManager.initializeGpuAndMemory(pluginContext.resources().asScala.toMap, conf,
           numCores)
-        // Milestone 4: Async background libnvcxx PCH pre-warm at Executor startup (zero disk persistence,
-        // overlaps 18 MiB PCH creation with Executor registration & Driver 12,080-file listing!).
+        // P0: Async background libnvcxx PCH pre-warm (BOTH transform/jit + filter_join_kernel!)
+        // + Vortex FFI preload at Executor startup (zero disk persistence!).
         val warmupJit = conf.isProjectAstJitEnabled ||
           sparkConf.getBoolean("spark.rapids.sql.joinAstJitEnabled", false)
         if (warmupJit) {
           val warmupThread = new Thread(new Runnable {
             override def run(): Unit = {
               try {
-                import ai.rapids.cudf.{ColumnVector, Table => CudfTable}
+                import ai.rapids.cudf.{ColumnVector, NullEquality, Table => CudfTable}
                 import ai.rapids.cudf.ast.{AstJitProgram, BinaryOperation, BinaryOperator, ColumnReference, TableReference}
                 import com.nvidia.spark.rapids.Arm.withResource
                 withResource(ColumnVector.fromInts(1)) { c0 =>
@@ -768,10 +768,32 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
                     withResource(expr.compileJit()) { compiled =>
                       withResource(AstJitProgram.compile(t, compiled)) { _ => }
                     }
+                    // Also pre-warm join/jit/filter_join_kernel.cu PCH for JoinAstJit (non-empty 1-row match!)
+                    val joinPred = new BinaryOperation(
+                      BinaryOperator.EQUAL,
+                      new ColumnReference(0, TableReference.LEFT),
+                      new ColumnReference(0, TableReference.RIGHT))
+                    withResource(joinPred.compileJit()) { compiledJoin =>
+                      withResource(CudfTable.mixedInnerJoinGatherMaps(t, t, t, t, compiledJoin, NullEquality.EQUAL)) { eqMaps =>
+                        withResource(CudfTable.filterJoinGatherMapsJit(
+                          eqMaps(0), eqMaps(1), t, t, compiledJoin, ai.rapids.cudf.JoinKind.INNER)) { outMaps =>
+                          outMaps.foreach(_.close())
+                        }
+                        eqMaps.foreach(_.close())
+                      }
+                    }
                   }
                 }
               } catch {
                 case _: Throwable => // best-effort background warmup
+              }
+              try {
+                val vxLib = System.getenv("VORTEX_CUDA_FFI_LIB")
+                if (vxLib != null && vxLib.nonEmpty) {
+                  Class.forName("com.nvidia.spark.rapids.jni.VortexNative")
+                }
+              } catch {
+                case _: Throwable =>
               }
             }
           }, "rapids-libnvcxx-pch-warmup")

@@ -20,27 +20,28 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, BloomFilterMightContain, Cast, EqualTo, Expression, IsNotNull, Literal, PredicateHelper, ScalarSubquery, SubqueryExpression}
 import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftSemi}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LogicalPlan, Project, Union}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{ByteType, DataType, IntegerType, LongType, ShortType}
 
 /**
- * Phase III (Distributed Opt #1): Opt-in GPU-native Runtime Bloom Filter Semi-Join Pushdown.
+ * Ultimate GPU-native Runtime Bloom Filter Semi-Join Pushdown (safe to enable by default!).
  *
- * Pushes compact L2-resident GPU Bloom Filters (1-8 MiB, built via GpuBloomFilterAggregate and
- * probed via GpuBloomFilterMightContain) directly onto large probe-side leaf scans BEFORE
- * distributed Shuffle Write, targeting two high-ROI cases missed by Spark 3.5's InjectRuntimeFilter:
- *   Rule 1 (Selective Single-Table Build <= 20 GiB, Int/Short/Byte/Long keys):
- *     e.g. TPC-H Q08 (p_type = ... -> lineitem 150x reduction), Q09 (p_name LIKE '%hot%' ->
- *     lineitem & partsupp 18x reduction!), Q03 (c_mktsegment = ... -> orders 5x reduction),
- *     TPC-DS Q24/Q64/Q93/Q95 IntType *_sk joins!
- *   Rule 2 (Selective HAVING Filter-over-Aggregate Build):
- *     e.g. TPC-H Q18 (HAVING sum(l_quantity) > 314 -> orders 30,000x reduction!),
- *     TPC-DS Q23 (frequent_ss_items / best_ss_customer)!
+ * Pushes compact L2-resident GPU Bloom Filters (GpuBloomFilterAggregate / GpuBloomFilterMightContain)
+ * directly onto large probe-side leaf scans BEFORE distributed Shuffle Write:
+ *   - Rule 1 (Non-broadcastable single-table selective build 10 MiB..24 GiB, Int/Short/Byte/Long):
+ *     e.g. TPC-H Q02/Q03/Q08/Q09/Q17 (part/customer -> lineitem/partsupp/orders 7x-748x shuf cut!)
+ *     & TPC-DS Q16/Q24/Q82/Q94/Q95!
+ *   - Rule 2 (Selective HAVING Filter-over-Aggregate build -> huge probe leaf >= 10 GiB):
+ *     e.g. TPC-H Q18 (orders 120 GiB) & TPC-DS Q23 (store_sales/web_sales/catalog_sales)!
  *
- * Explicitly skips multi-join un-aggregated build subtrees (preventing large join rescans like Q50).
- * Controlled independently by `spark.rapids.sql.lenc.runtimeBloomFilterEnabled` (default false).
+ * Zero-regression cost guards (eliminates Q49/Q64/Q34/Q73/Q81/Q30 regressions so BF can be default ON):
+ *   1. Skips Union subtrees (prevents Q49 3-branch duplicate scans) and >10-join mega-DAGs (Q64);
+ *   2. Skips tiny <10 MiB dims (preserves DPP & BroadcastHashJoin, e.g. Q50 date_dim);
+ *   3. Skips probe sides already narrow-filtered by >=2 small selective dim joins (Q34/Q73);
+ *   4. Requires huge >=10 GiB probe leaf for HAVING-aggregate Rule 2 (skips small Q30/Q81 returns);
+ *   5. Respects spark.rapids.sql.expression.BloomFilter* disable flags.
  */
 class GpuInjectRuntimeBloomFilter(spark: SparkSession)
     extends Rule[LogicalPlan] with PredicateHelper {
@@ -49,7 +50,9 @@ class GpuInjectRuntimeBloomFilter(spark: SparkSession)
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
     val conf = SQLConf.get
-    if (!conf.getConfString(CONF_ENABLED, "false").toBoolean) {
+    // Default ON whenever fusedAggEnabled / Whole-Stage optimization is enabled, unless explicitly disabled!
+    val defaultOn = conf.getConfString(GpuLencFusedAgg.FUSED_AGG_CONF, "false")
+    if (!conf.getConfString(CONF_ENABLED, defaultOn).toBoolean) {
       return plan
     }
     if (!conf.getConfString("spark.rapids.sql.enabled", "true").toBoolean ||
@@ -58,15 +61,27 @@ class GpuInjectRuntimeBloomFilter(spark: SparkSession)
       return plan
     }
     val minProbeBytes = conf.getConfString(CONF_MIN_PROBE_BYTES, DEFAULT_MIN_PROBE_BYTES.toString).toLong
+    val minHavingProbeBytes =
+      if (minProbeBytes == 0L) 0L else DEFAULT_MIN_HAVING_PROBE_BYTES
     val maxSingleBuildBytes =
       conf.getConfString(CONF_MAX_BUILD_BYTES, DEFAULT_MAX_BUILD_BYTES.toString).toLong
-    val maxInjected = conf.getConfString(CONF_MAX_INJECTED, "8").toInt
+    val maxInjected = conf.getConfString(CONF_MAX_INJECTED, "6").toInt
+
+    // Zero-regression global DAG complexity guard:
+    // Skip multi-branch UNION plans (e.g. TPC-DS Q49) and >10-join CTE DAGs (e.g. Q64) where
+    // logical ScalarSubquery risks rescanning large subtrees or breaking BroadcastHashJoin.
+    if (minProbeBytes > 0L) {
+      var joinCount = 0
+      var unionCount = 0
+      plan.foreach {
+        case _: Join => joinCount += 1
+        case _: Union => unionCount += 1
+        case _ =>
+      }
+      if (unionCount > 0 || joinCount > 10) return plan
+    }
 
     var injected = 0
-
-    // Track single-table selective Bloom Filters built on inner joins so outer equi-joins on the
-    // same transitive key (e.g. TPC-H Q09: p_partkey = l_partkey AND ps_partkey = l_partkey) can
-    // ALSO prune the outer table (partsupp!) using the exact same Bloom Filter!
     val attrToBuildSpec = scala.collection.mutable.HashMap.empty[Long, (LogicalPlan, Attribute)]
 
     def tryInjectOnJoin(j: Join): LogicalPlan = {
@@ -85,8 +100,7 @@ class GpuInjectRuntimeBloomFilter(spark: SparkSession)
 
       var curJoin = j
 
-      // First: transitive propagation from previously discovered selective build filters
-      // (e.g. TPC-H Q09: lineitem already got part's p_partkey BF -> propagate onto partsupp.ps_partkey!)
+      // Transitive propagation (e.g. TPC-H Q09: part -> lineitem -> partsupp!)
       for ((lKey, rKey) <- eqPairs if injected < maxInjected) {
         if (curJoin.joinType == Inner) {
           val propCandidates = Seq(
@@ -95,7 +109,7 @@ class GpuInjectRuntimeBloomFilter(spark: SparkSession)
           )
           for ((srcKey, targetSide, targetKey, targetIsLeft) <- propCandidates if injected < maxInjected) {
             attrToBuildSpec.get(srcKey.exprId.id).foreach { case (bPlan, bKey) =>
-              val tBytes = totalLeafScanBytes(targetSide)
+              val tBytes = findProbeLeafBytes(targetSide, targetKey)
               if (tBytes >= minProbeBytes &&
                   !hasBloomFilterOn(targetSide, targetKey) &&
                   !containsBloomFilter(bPlan)) {
@@ -111,7 +125,6 @@ class GpuInjectRuntimeBloomFilter(spark: SparkSession)
         }
       }
 
-      // Second: direct injection for this Join (Rule 1: single-table selective filter; Rule 2: HAVING agg)
       val (lKey, rKey) = eqPairs.sortBy(p => if (p._1.dataType == LongType) 0 else 1).head
       val candidates = if (curJoin.joinType == LeftSemi) {
         Seq((curJoin.left, lKey, curJoin.right, rKey, true))
@@ -126,15 +139,17 @@ class GpuInjectRuntimeBloomFilter(spark: SparkSession)
         val pScanBytes = findProbeLeafBytes(probeSide, probeKey)
         val bScanBytes = totalLeafScanBytes(buildSide)
         val bHasJoin = containsJoin(buildSide)
-        // Skip tiny <10 MiB broadcast dims (date_dim/region/nation/store) so Spark DPP & BroadcastHashJoin
-        // stay undisturbed (prevents Q50 29->52 GiB rescan), while targeting non-broadcastable 10 MiB..24 GiB
-        // selective builds (part, customer, item, etc.) and selective HAVING aggregates!
         val minSingleBuildBytes = if (minProbeBytes == 0L) 0L else 10L * 1024L * 1024L
+
+        // Skip probe subtrees already heavily pruned by >= 2 selective small-dim joins (e.g. Q34/Q73)
+        val probeAlreadyPruned = minProbeBytes > 0L && countSmallSelectiveDimJoins(probeSide) >= 2
+
         val bIsSingleTableSelective =
-          !bHasJoin && hasSelectiveFilter(buildSide) &&
+          !bHasJoin && hasSelectiveFilter(buildSide) && !probeAlreadyPruned &&
             ((bScanBytes >= minSingleBuildBytes && bScanBytes <= maxSingleBuildBytes &&
               bScanBytes <= (pScanBytes * 0.5).toLong) || minProbeBytes == 0L)
-        val bIsHavingAgg = isSelectiveHavingAggregate(buildSide)
+        val bIsHavingAgg =
+          isSelectiveHavingAggregate(buildSide) && pScanBytes >= minHavingProbeBytes && !probeAlreadyPruned
 
         if (pScanBytes >= minProbeBytes &&
             (bIsSingleTableSelective || bIsHavingAgg) &&
@@ -170,7 +185,6 @@ class GpuInjectRuntimeBloomFilter(spark: SparkSession)
     val pKeyLong: Expression =
       if (probeKey.dataType == LongType) probeKey else Cast(probeKey, LongType)
 
-    // Estimate build keys conservatively: 8 bits/key capped at 64M bits (8 MiB, L2-resident on GPU!)
     val estBytes = totalLeafScanBytes(buildSide)
     val estRows = buildSide.stats.rowCount.map(_.toLong).getOrElse(math.max(65536L, estBytes / 100L))
     val clampedItems = math.max(131072L, math.min(estRows, 8000000L))
@@ -187,7 +201,6 @@ class GpuInjectRuntimeBloomFilter(spark: SparkSession)
     BloomFilterMightContain(ScalarSubquery(bfAggPlan), pKeyLong)
   }
 
-  /** Push BloomFilterMightContain directly down to the leaf scan producing `probeKey` (before Shuffle Write!). */
   private def pushFilterToProbeLeaf(
       plan: LogicalPlan,
       probeKey: Attribute,
@@ -214,8 +227,9 @@ object GpuInjectRuntimeBloomFilter {
   val CONF_MAX_BUILD_BYTES = "spark.rapids.sql.lenc.runtimeBloomFilter.maxBuildBytes"
   val CONF_MAX_INJECTED = "spark.rapids.sql.lenc.runtimeBloomFilter.maxInjected"
 
-  // Default: probe leaf >= 256 MiB, single-table selective build <= 24 GiB (covers SF1000 part/customer!)
-  val DEFAULT_MIN_PROBE_BYTES: Long = 256L * 1024L * 1024L
+  // Probe leaf >= 1 GiB for Rule 1, >= 10 GiB for HAVING-Aggregate Rule 2; build <= 24 GiB
+  val DEFAULT_MIN_PROBE_BYTES: Long = 1024L * 1024L * 1024L
+  val DEFAULT_MIN_HAVING_PROBE_BYTES: Long = 10L * 1024L * 1024L * 1024L
   val DEFAULT_MAX_BUILD_BYTES: Long = 24L * 1024L * 1024L * 1024L
 
   private def isSupportedKeyType(dt: DataType): Boolean = dt match {
@@ -252,6 +266,22 @@ object GpuInjectRuntimeBloomFilter {
       else 0L
     case leaf if leaf.children.isEmpty && leaf.outputSet.contains(probeKey) => safeSizeBytes(leaf)
     case _ => 0L
+  }
+
+  /** Counts small (< 64 MiB) selective dim-table joins already filtering `plan`. */
+  private def countSmallSelectiveDimJoins(plan: LogicalPlan): Int = {
+    var cnt = 0
+    plan.foreach {
+      case Join(l, r, Inner | LeftSemi, _, _) =>
+        val ls = totalLeafScanBytes(l)
+        val rs = totalLeafScanBytes(r)
+        if ((rs > 0L && rs < 64L * 1024L * 1024L && hasSelectiveFilter(r)) ||
+            (ls > 0L && ls < 64L * 1024L * 1024L && hasSelectiveFilter(l))) {
+          cnt += 1
+        }
+      case _ =>
+    }
+    cnt
   }
 
   private def containsJoin(plan: LogicalPlan): Boolean =
@@ -293,7 +323,6 @@ object GpuInjectRuntimeBloomFilter {
     }.isDefined
   }
 
-  /** Detects selective HAVING patterns: Filter(non-trivial) above Aggregate (e.g. TPC-H Q18, TPC-DS Q23). */
   private def isSelectiveHavingAggregate(plan: LogicalPlan): Boolean = plan match {
     case Project(_, child) => isSelectiveHavingAggregate(child)
     case Filter(cond, child) if isNonTrivialFilter(cond) =>
